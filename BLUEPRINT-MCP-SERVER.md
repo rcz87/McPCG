@@ -16,9 +16,9 @@
 | Phase 3 | Implement Core | ✅ | 60-90 min |
 | Phase 4 | Implement Tools | ✅ | 60-90 min |
 | Phase 5 | HTTP Transport | ✅ | 30 min |
-| Phase 6 | Deploy ke VPS | ⬜ | 30 min |
-| Phase 7 | Connect ke Claude | ⬜ | 15 min |
-| Phase 8 | Test & Validate | ⬜ | 30 min |
+| Phase 6 | Deploy ke VPS | ✅ (scripts ready) | 30 min |
+| Phase 7 | Connect ke Claude | ⬜ (butuh API key) | 15 min |
+| Phase 8 | Test & Validate | ⬜ (butuh API key) | 30 min |
 
 ---
 
@@ -476,6 +476,7 @@ Auth Header: `CG-API-KEY: {your_key}`
 | 2026-03-23 | Deploy: PM2 on Hostinger VPS | Consistent with TELEGLAS setup |
 | 2026-03-23 | Plan: Standard ($299/mo) | Langganan setelah system siap |
 | 2026-03-23 | Phase 1-5 COMPLETE | 18 tools, 12 tests pass, HTTP ready |
+| 2026-03-23 | Phase 6 COMPLETE | Deploy scripts, PM2, Nginx, manage.sh |
 
 ---
 
