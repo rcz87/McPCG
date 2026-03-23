@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -16,6 +17,8 @@ from tenacity import (
 
 from .config import BASE_URL, DEFAULT_TIMEOUT, Config
 from .storage import Storage
+
+logger = logging.getLogger("coinglass-mcp")
 
 
 class APIError(Exception):
@@ -69,9 +72,12 @@ class CoinGlassClient:
 
     @staticmethod
     def _params_hash(endpoint: str, params: dict[str, Any]) -> str:
-        """Generate a hash from endpoint + params."""
+        """Generate a hash from endpoint + params.
+
+        Uses SHA256 instead of MD5 to eliminate collision risk.
+        """
         raw = f"{endpoint}:{json.dumps(params, sort_keys=True)}"
-        return hashlib.md5(raw.encode()).hexdigest()
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     @retry(
         stop=stop_after_attempt(3),
@@ -83,6 +89,7 @@ class CoinGlassClient:
         """Make a GET request with persistent caching and retry.
 
         Every successful response is stored in SQLite for historical queries.
+        Cache is NEVER returned without explicit [CACHED] label in logs.
         """
         if not self._http:
             raise RuntimeError("Client not started. Call start() first.")
@@ -94,6 +101,7 @@ class CoinGlassClient:
         phash = self._params_hash(endpoint, params)
         cached = self.storage.get_cached(phash, ttl=self.config.cache_ttl)
         if cached is not None:
+            logger.debug("[CACHED] %s %s", endpoint, params.get("symbol", ""))
             return cached
 
         # Make request
@@ -114,20 +122,47 @@ class CoinGlassClient:
         if response.status_code >= 400:
             raise APIError(response.status_code, response.text)
 
-        data = response.json()
+        # FIX #1: Validate response is valid JSON
+        try:
+            data = response.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            raise APIError(
+                response.status_code,
+                f"Invalid JSON response from CoinGlass: {e}. "
+                f"Raw response: {response.text[:200]}"
+            )
 
-        # CoinGlass wraps responses: {"code": "0", "msg": "success", "data": ...}
+        # FIX #2: Strict response validation
         if isinstance(data, dict):
             code = data.get("code", "0")
             if str(code) != "0":
-                raise APIError(response.status_code, data.get("msg", "Unknown error"))
-            result = data.get("data", data)
+                raise APIError(
+                    response.status_code,
+                    f"CoinGlass returned error code {code}: {data.get('msg', 'Unknown error')}"
+                )
+            result = data.get("data")
+            # FIX #3: Reject if "data" key is missing (malformed response)
+            if result is None:
+                raise APIError(
+                    response.status_code,
+                    f"CoinGlass response missing 'data' field. "
+                    f"Full response: {json.dumps(data)[:300]}"
+                )
         else:
             result = data
+
+        # FIX #4: Validate result is not empty when we expect data
+        if result is None:
+            raise APIError(
+                response.status_code,
+                "CoinGlass returned null data. The symbol may not exist or "
+                "the endpoint may not support this parameter combination."
+            )
 
         # Store in persistent cache + historical storage
         symbol = params.get("symbol", "")
         interval = params.get("interval", "")
         self.storage.store(endpoint, phash, result, symbol=symbol, interval=interval)
+        logger.debug("[FRESH] %s %s", endpoint, params.get("symbol", ""))
 
         return result

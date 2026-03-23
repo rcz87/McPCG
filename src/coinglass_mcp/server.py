@@ -52,13 +52,18 @@ def fmt(data: Any, title: str = "") -> str:
     else:
         header = ""
 
+    # FIX #9: Validate data type before formatting
+    if data is None:
+        return f"{header}**WARNING: No data returned.** The symbol may not exist or the API returned empty."
+
     if isinstance(data, list):
         if len(data) == 0:
-            return f"{header}No data available."
+            return f"{header}**WARNING: Empty dataset.** No data points returned for this query."
         # Show last N entries for time series
         if len(data) > 20:
+            total = len(data)
             data = data[-20:]
-            header += f"*(showing last 20 of many entries)*\n\n"
+            header += f"*(showing last 20 of {total} entries)*\n\n"
         return header + json.dumps(data, indent=2, default=str)
     elif isinstance(data, dict):
         return header + json.dumps(data, indent=2, default=str)
@@ -580,18 +585,37 @@ async def coinglass_full_scan(
         "Taker Buy/Sell", "Long/Short Ratio",
     ]
 
+    # FIX #12: Track errors explicitly — don't hide failures
     output = f"# FULL SCAN — {symbol} ({interval})\n\n"
     output += "**Ricoz Scalping Framework — Complete Analysis**\n\n"
 
+    error_count = 0
     for label, result in zip(labels, results):
         output += f"---\n\n## {label}\n\n"
         if isinstance(result, Exception):
-            output += f"*Error: {result}*\n\n"
-        elif isinstance(result, list) and len(result) > 10:
-            # Show only last 10 entries for time series in full scan
-            output += json.dumps(result[-10:], indent=2, default=str) + "\n\n"
+            error_count += 1
+            output += f"**⚠ FAILED:** {result}\n\n"
+        elif result is None:
+            error_count += 1
+            output += "**⚠ FAILED:** No data returned\n\n"
+        elif isinstance(result, list):
+            if len(result) == 0:
+                output += "**WARNING:** Empty dataset returned\n\n"
+            elif len(result) > 10:
+                output += json.dumps(result[-10:], indent=2, default=str) + "\n\n"
+            else:
+                output += json.dumps(result, indent=2, default=str) + "\n\n"
         else:
             output += json.dumps(result, indent=2, default=str) + "\n\n"
+
+    # FIX #13: Show error summary at top level
+    if error_count > 0:
+        output += (
+            f"---\n\n"
+            f"## ⚠ DATA INTEGRITY WARNING\n\n"
+            f"**{error_count} of 9 metrics FAILED to load.** "
+            f"Analysis below may be INCOMPLETE. Do NOT trade based on partial data.\n\n"
+        )
 
     output += (
         "---\n\n"
@@ -649,44 +673,64 @@ async def coinglass_compare(
     endpoint = ENDPOINT_MAP.get(metric)
     if not endpoint:
         available = ", ".join(ENDPOINT_MAP.keys())
-        return f"Unknown metric '{metric}'. Available: {available}"
+        return f"**ERROR:** Unknown metric '{metric}'. Available: {available}"
 
-    # Get current data
+    # Get current data (fresh from API)
     params = {"symbol": symbol, "interval": interval, "limit": 20}
     if metric == "funding_rate":
         params = {"symbol": symbol}
+
+    current = None
+    current_err = ""
     try:
         current = await client.get(endpoint, params)
     except Exception as e:
-        current = None
         current_err = str(e)
 
-    # Get historical from storage
+    # Get historical from storage (returns dict with age metadata)
     historical = client.storage.get_historical(endpoint, symbol, hours_ago, interval)
 
     output = f"## Compare {metric.upper()} — {symbol}\n"
     output += f"**Now vs {hours_ago}h ago**\n\n"
 
+    # FIX #10: Always show data source and freshness
     if current is not None:
-        output += "### Current\n"
+        output += "### Current (LIVE from API)\n"
         if isinstance(current, list) and len(current) > 5:
             output += json.dumps(current[-5:], indent=2, default=str) + "\n\n"
         else:
             output += json.dumps(current, indent=2, default=str) + "\n\n"
     else:
-        output += f"### Current\n*Error fetching: {current_err}*\n\n"
+        output += f"### Current\n**ERROR fetching live data:** {current_err}\n\n"
 
     if historical is not None:
-        output += f"### {hours_ago}h Ago (from storage)\n"
-        if isinstance(historical, list) and len(historical) > 5:
-            output += json.dumps(historical[-5:], indent=2, default=str) + "\n\n"
+        age = historical["age_minutes"]
+        hist_data = historical["data"]
+        from datetime import datetime
+        ts = datetime.fromtimestamp(historical["fetched_at"]).strftime("%Y-%m-%d %H:%M:%S")
+        output += f"### Historical (from storage)\n"
+        output += f"**Stored at:** {ts} ({age:.0f} minutes ago)\n\n"
+
+        # FIX #11: Warn if stored data age doesn't match requested hours_ago
+        expected_age_min = hours_ago * 60
+        drift = abs(age - expected_age_min)
+        if drift > 30:
+            output += (
+                f"**⚠ DATA AGE WARNING:** You requested {hours_ago}h ago, "
+                f"but closest stored data is {age:.0f} min ago "
+                f"(drift: {drift:.0f} min). Interpret with caution.\n\n"
+            )
+
+        if isinstance(hist_data, list) and len(hist_data) > 5:
+            output += json.dumps(hist_data[-5:], indent=2, default=str) + "\n\n"
         else:
-            output += json.dumps(historical, indent=2, default=str) + "\n\n"
+            output += json.dumps(hist_data, indent=2, default=str) + "\n\n"
     else:
         output += (
-            f"### {hours_ago}h Ago\n"
-            f"*No stored data from {hours_ago}h ago. Data is stored each time you "
-            f"query a metric. Keep querying periodically to build history.*\n\n"
+            f"### Historical\n"
+            f"**NO DATA** from ~{hours_ago}h ago in storage.\n\n"
+            f"Data is stored automatically each time you query a metric. "
+            f"Keep querying periodically to build history for comparison.\n\n"
         )
 
     return output
@@ -735,15 +779,17 @@ async def coinglass_trend(
 
     for i, snap in enumerate(snapshots):
         ts = datetime.fromtimestamp(snap["fetched_at"]).strftime("%H:%M:%S")
+        age = snap["age_minutes"]
         data = snap["data"]
-        # Show summary for each snapshot
+        # Show summary for each snapshot with age
+        age_label = f"{age:.0f}min ago"
         if isinstance(data, list) and len(data) > 0:
             last = data[-1] if isinstance(data[-1], dict) else data[-1]
-            output += f"**{ts}** — last entry: {json.dumps(last, default=str)}\n\n"
+            output += f"**{ts}** ({age_label}) — last entry: {json.dumps(last, default=str)}\n\n"
         elif isinstance(data, dict):
-            output += f"**{ts}** — {json.dumps(data, default=str)[:200]}\n\n"
+            output += f"**{ts}** ({age_label}) — {json.dumps(data, default=str)[:200]}\n\n"
         else:
-            output += f"**{ts}** — {str(data)[:200]}\n\n"
+            output += f"**{ts}** ({age_label}) — {str(data)[:200]}\n\n"
 
     return output
 
