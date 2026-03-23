@@ -23,7 +23,7 @@ client = CoinGlassClient(config)
 
 @asynccontextmanager
 async def lifespan(app):
-    """Manage shared httpx client lifecycle."""
+    """Manage shared httpx client + SQLite storage lifecycle."""
     await client.start()
     try:
         yield
@@ -604,6 +604,167 @@ async def coinglass_full_scan(
         "6. **Liq Map**: Set TP near liquidation clusters\n"
         "7. **Taker**: Confirm aggressor side\n"
         "8. **L/S Ratio**: Contrarian indicator\n"
+    )
+    return output
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HISTORICAL & TREND TOOLS (19-22) — Persistent Storage
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# Endpoint mapping for historical lookups
+ENDPOINT_MAP = {
+    "spot_cvd": "/api/spot/aggregated-cvd-history",
+    "futures_cvd": "/api/futures/aggregated-cvd-history",
+    "funding_rate": "/api/futures/funding-rate/exchange-list",
+    "open_interest": "/api/futures/openInterest/ohlc-aggregated-history",
+    "orderbook": "/api/futures/aggregated-orderbook-history",
+    "liquidation": "/api/futures/liquidation/aggregated-history",
+    "price": "/api/futures/price/ohlc-history",
+    "taker": "/api/futures/taker-buysell-volume",
+    "long_short": "/api/futures/global-longshort-account-ratio",
+}
+
+
+@mcp.tool()
+async def coinglass_compare(
+    symbol: str = "BTC",
+    metric: str = "spot_cvd",
+    hours_ago: float = 1.0,
+    interval: str = "5m",
+) -> str:
+    """Compare current data with historical data — see if metric went UP or DOWN.
+
+    Example: "Compare SOL spot_cvd now vs 2 hours ago"
+    This requires the metric to have been fetched before (stored in local DB).
+
+    Args:
+        symbol: Coin symbol (BTC, ETH, SOL, etc.)
+        metric: One of: spot_cvd, futures_cvd, funding_rate, open_interest,
+                orderbook, liquidation, price, taker, long_short
+        hours_ago: How many hours back to compare (e.g., 0.5, 1, 2, 4, 8, 24)
+        interval: Candle interval for time-series metrics
+    """
+    endpoint = ENDPOINT_MAP.get(metric)
+    if not endpoint:
+        available = ", ".join(ENDPOINT_MAP.keys())
+        return f"Unknown metric '{metric}'. Available: {available}"
+
+    # Get current data
+    params = {"symbol": symbol, "interval": interval, "limit": 20}
+    if metric == "funding_rate":
+        params = {"symbol": symbol}
+    try:
+        current = await client.get(endpoint, params)
+    except Exception as e:
+        current = None
+        current_err = str(e)
+
+    # Get historical from storage
+    historical = client.storage.get_historical(endpoint, symbol, hours_ago, interval)
+
+    output = f"## Compare {metric.upper()} — {symbol}\n"
+    output += f"**Now vs {hours_ago}h ago**\n\n"
+
+    if current is not None:
+        output += "### Current\n"
+        if isinstance(current, list) and len(current) > 5:
+            output += json.dumps(current[-5:], indent=2, default=str) + "\n\n"
+        else:
+            output += json.dumps(current, indent=2, default=str) + "\n\n"
+    else:
+        output += f"### Current\n*Error fetching: {current_err}*\n\n"
+
+    if historical is not None:
+        output += f"### {hours_ago}h Ago (from storage)\n"
+        if isinstance(historical, list) and len(historical) > 5:
+            output += json.dumps(historical[-5:], indent=2, default=str) + "\n\n"
+        else:
+            output += json.dumps(historical, indent=2, default=str) + "\n\n"
+    else:
+        output += (
+            f"### {hours_ago}h Ago\n"
+            f"*No stored data from {hours_ago}h ago. Data is stored each time you "
+            f"query a metric. Keep querying periodically to build history.*\n\n"
+        )
+
+    return output
+
+
+@mcp.tool()
+async def coinglass_trend(
+    symbol: str = "BTC",
+    metric: str = "spot_cvd",
+    hours: float = 4.0,
+    interval: str = "5m",
+) -> str:
+    """Show trend of a metric over time — all stored snapshots.
+
+    Shows how a metric changed over the past N hours based on stored data.
+    Useful for: "Is OI for SOL trending up or down over last 4 hours?"
+
+    Args:
+        symbol: Coin symbol (BTC, ETH, SOL, etc.)
+        metric: One of: spot_cvd, futures_cvd, funding_rate, open_interest,
+                orderbook, liquidation, price, taker, long_short
+        hours: How many hours of history to show (e.g., 1, 2, 4, 8, 24)
+        interval: Candle interval filter
+    """
+    endpoint = ENDPOINT_MAP.get(metric)
+    if not endpoint:
+        available = ", ".join(ENDPOINT_MAP.keys())
+        return f"Unknown metric '{metric}'. Available: {available}"
+
+    snapshots = client.storage.get_trend(endpoint, symbol, hours, interval)
+
+    output = f"## Trend {metric.upper()} — {symbol} (last {hours}h)\n\n"
+
+    if not snapshots:
+        output += (
+            f"*No stored snapshots found for {symbol} {metric} in the last {hours}h.*\n\n"
+            "**Tip:** Data is stored automatically each time you query a metric. "
+            "Use `coinglass_spot_cvd`, `coinglass_open_interest`, etc. periodically "
+            "to build up historical snapshots for trend analysis.\n"
+        )
+        return output
+
+    output += f"**{len(snapshots)} snapshots found**\n\n"
+
+    from datetime import datetime
+
+    for i, snap in enumerate(snapshots):
+        ts = datetime.fromtimestamp(snap["fetched_at"]).strftime("%H:%M:%S")
+        data = snap["data"]
+        # Show summary for each snapshot
+        if isinstance(data, list) and len(data) > 0:
+            last = data[-1] if isinstance(data[-1], dict) else data[-1]
+            output += f"**{ts}** — last entry: {json.dumps(last, default=str)}\n\n"
+        elif isinstance(data, dict):
+            output += f"**{ts}** — {json.dumps(data, default=str)[:200]}\n\n"
+        else:
+            output += f"**{ts}** — {str(data)[:200]}\n\n"
+
+    return output
+
+
+@mcp.tool()
+async def coinglass_storage_stats() -> str:
+    """Show storage statistics — how much historical data is stored.
+
+    Shows total records, oldest/newest data, top symbols tracked.
+    Use this to check if historical data is available for trend analysis.
+    """
+    stats = client.storage.get_stats()
+    output = "## Storage Statistics\n\n"
+    output += json.dumps(stats, indent=2, default=str) + "\n\n"
+    output += (
+        "**How it works:**\n"
+        "- Every API call is automatically stored in SQLite\n"
+        "- Data is kept for 48 hours, then auto-cleaned\n"
+        "- Use `coinglass_compare` to compare now vs X hours ago\n"
+        "- Use `coinglass_trend` to see how a metric changed over time\n"
+        "- More queries = more history = better trend analysis\n"
     )
     return output
 

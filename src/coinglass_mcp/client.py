@@ -1,10 +1,9 @@
-"""CoinGlass API Client with caching, retry, and rate limit handling."""
+"""CoinGlass API Client with persistent caching, retry, and rate limit handling."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import time
 from typing import Any
 
 import httpx
@@ -16,6 +15,7 @@ from tenacity import (
 )
 
 from .config import BASE_URL, DEFAULT_TIMEOUT, Config
+from .storage import Storage
 
 
 class APIError(Exception):
@@ -41,15 +41,15 @@ class PlanLimitError(APIError):
 
 
 class CoinGlassClient:
-    """Async HTTP client for CoinGlass API V4."""
+    """Async HTTP client for CoinGlass API V4 with persistent storage."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, storage: Storage | None = None):
         self.config = config
         self._http: httpx.AsyncClient | None = None
-        self._cache: dict[str, tuple[float, Any]] = {}
+        self.storage = storage or Storage()
 
     async def start(self) -> None:
-        """Initialize the HTTP client."""
+        """Initialize the HTTP client and storage."""
         self._http = httpx.AsyncClient(
             base_url=BASE_URL,
             headers={
@@ -58,36 +58,20 @@ class CoinGlassClient:
             },
             timeout=httpx.Timeout(DEFAULT_TIMEOUT),
         )
+        self.storage.start()
 
     async def close(self) -> None:
-        """Close the HTTP client."""
+        """Close the HTTP client and storage."""
         if self._http:
             await self._http.aclose()
             self._http = None
+        self.storage.close()
 
-    def _cache_key(self, endpoint: str, params: dict[str, Any]) -> str:
-        """Generate a cache key from endpoint + params."""
+    @staticmethod
+    def _params_hash(endpoint: str, params: dict[str, Any]) -> str:
+        """Generate a hash from endpoint + params."""
         raw = f"{endpoint}:{json.dumps(params, sort_keys=True)}"
         return hashlib.md5(raw.encode()).hexdigest()
-
-    def _get_cached(self, key: str) -> Any | None:
-        """Return cached data if still valid."""
-        if key in self._cache:
-            ts, data = self._cache[key]
-            if time.time() - ts < self.config.cache_ttl:
-                return data
-            del self._cache[key]
-        return None
-
-    def _set_cache(self, key: str, data: Any) -> None:
-        """Store data in cache."""
-        self._cache[key] = (time.time(), data)
-        # Evict old entries if cache grows too large
-        if len(self._cache) > 500:
-            cutoff = time.time() - self.config.cache_ttl
-            self._cache = {
-                k: (ts, d) for k, (ts, d) in self._cache.items() if ts > cutoff
-            }
 
     @retry(
         stop=stop_after_attempt(3),
@@ -96,30 +80,19 @@ class CoinGlassClient:
         reraise=True,
     )
     async def get(self, endpoint: str, params: dict[str, Any] | None = None) -> Any:
-        """Make a GET request to CoinGlass API with caching and retry.
+        """Make a GET request with persistent caching and retry.
 
-        Args:
-            endpoint: API endpoint path (e.g., '/api/spot/cvd-history')
-            params: Query parameters
-
-        Returns:
-            Parsed JSON response data
-
-        Raises:
-            APIError: On API errors
-            RateLimitError: When rate limit is exceeded
-            PlanLimitError: When endpoint requires higher plan
+        Every successful response is stored in SQLite for historical queries.
         """
         if not self._http:
             raise RuntimeError("Client not started. Call start() first.")
 
         params = params or {}
-        # Remove None values
         params = {k: v for k, v in params.items() if v is not None}
 
-        # Check cache
-        cache_key = self._cache_key(endpoint, params)
-        cached = self._get_cached(cache_key)
+        # Check persistent cache (60s TTL)
+        phash = self._params_hash(endpoint, params)
+        cached = self.storage.get_cached(phash, ttl=self.config.cache_ttl)
         if cached is not None:
             return cached
 
@@ -152,6 +125,9 @@ class CoinGlassClient:
         else:
             result = data
 
-        # Cache successful response
-        self._set_cache(cache_key, result)
+        # Store in persistent cache + historical storage
+        symbol = params.get("symbol", "")
+        interval = params.get("interval", "")
+        self.storage.store(endpoint, phash, result, symbol=symbol, interval=interval)
+
         return result

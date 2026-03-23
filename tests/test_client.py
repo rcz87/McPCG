@@ -1,41 +1,44 @@
 """Tests for CoinGlass API client."""
 
+import os
+import tempfile
+
 import pytest
+
 from coinglass_mcp.client import CoinGlassClient, APIError, RateLimitError, PlanLimitError
 from coinglass_mcp.config import Config
+from coinglass_mcp.storage import Storage
 
 
-def test_cache_key_deterministic():
-    """Same endpoint + params should produce same cache key."""
+@pytest.fixture
+def client_with_storage():
+    """Create a client with temporary storage."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    storage = Storage(db_path=db_path)
     cfg = Config(api_key="test")
-    c = CoinGlassClient(cfg)
-    key1 = c._cache_key("/api/test", {"symbol": "BTC", "interval": "5m"})
-    key2 = c._cache_key("/api/test", {"interval": "5m", "symbol": "BTC"})
-    assert key1 == key2  # sorted keys
+    c = CoinGlassClient(cfg, storage=storage)
+    yield c
+    os.unlink(db_path)
 
 
-def test_cache_key_different_params():
-    """Different params should produce different cache keys."""
-    cfg = Config(api_key="test")
-    c = CoinGlassClient(cfg)
-    key1 = c._cache_key("/api/test", {"symbol": "BTC"})
-    key2 = c._cache_key("/api/test", {"symbol": "ETH"})
-    assert key1 != key2
+def test_params_hash_deterministic():
+    """Same endpoint + params should produce same hash."""
+    hash1 = CoinGlassClient._params_hash("/api/test", {"symbol": "BTC", "interval": "5m"})
+    hash2 = CoinGlassClient._params_hash("/api/test", {"interval": "5m", "symbol": "BTC"})
+    assert hash1 == hash2
 
 
-def test_cache_set_and_get():
-    """Cache should store and retrieve data within TTL."""
-    cfg = Config(api_key="test", cache_ttl=60)
-    c = CoinGlassClient(cfg)
-    c._set_cache("key1", {"data": "test"})
-    assert c._get_cached("key1") == {"data": "test"}
+def test_params_hash_different():
+    """Different params should produce different hash."""
+    hash1 = CoinGlassClient._params_hash("/api/test", {"symbol": "BTC"})
+    hash2 = CoinGlassClient._params_hash("/api/test", {"symbol": "ETH"})
+    assert hash1 != hash2
 
 
-def test_cache_miss():
-    """Cache miss should return None."""
-    cfg = Config(api_key="test")
-    c = CoinGlassClient(cfg)
-    assert c._get_cached("nonexistent") is None
+def test_client_has_storage(client_with_storage):
+    """Client should have storage attached."""
+    assert client_with_storage.storage is not None
 
 
 def test_error_classes():
