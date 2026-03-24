@@ -1,17 +1,36 @@
-"""CoinGlass MCP Server — all tools for Ricoz Scalping Framework."""
+"""CoinGlass MCP Server — hardened for trading-critical data integrity.
+
+AUDIT COMPLIANCE:
+- Every response includes data_age + staleness warnings
+- full_scan blocks analysis if critical metrics fail
+- Symbol normalization prevents silent mismatches
+- Rate-limited requests prevent 429 errors
+- API key never appears in any output
+- Interpretation hints for every metric
+"""
 
 from __future__ import annotations
 
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
+
+WIB = timezone(timedelta(hours=7))
 from typing import Any
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-from .client import CoinGlassClient
-from .config import Config
+from .client import CoinGlassClient, FetchResult
+from .config import (
+    DEFAULT_EXCHANGE,
+    STALE_EXPIRED_THRESHOLD,
+    STALE_WARNING_THRESHOLD,
+    Config,
+    normalize_symbol,
+    to_pair,
+)
 
 load_dotenv()
 
@@ -36,30 +55,53 @@ mcp = FastMCP(
     instructions=(
         "CoinGlass crypto derivatives analytics for order flow trading. "
         "Provides SpotCVD, FuturesCVD, Funding Rate, Open Interest, "
-        "Liquidation, Orderbook, and more — optimized for Ricoz Scalping Framework."
+        "Liquidation, Orderbook, and more — optimized for Ricoz Scalping Framework. "
+        "IMPORTANT: Always check data_age in responses. "
+        "Data older than 2 minutes has WARNING. Data older than 5 minutes must NOT be used for entries."
     ),
     lifespan=lifespan,
 )
 
 
-# ─── Helper Functions ─────────────────────────────────────────────────────────
+# ─── Formatting Helpers ──────────────────────────────────────────────────────
 
 
-def fmt(data: Any, title: str = "") -> str:
-    """Format API response for Claude consumption."""
+def _age_banner(result: FetchResult) -> str:
+    """Generate age/staleness banner for a FetchResult."""
+    src = "CACHED" if result.is_cached else "LIVE"
+    ts = datetime.fromtimestamp(result.fetched_at, tz=WIB).strftime(
+        "%H:%M:%S WIB"
+    )
+    age = result.age_seconds
+
+    if result.is_expired:
+        return (
+            f"**DATA EXPIRED ({age:.0f}s old) — DO NOT USE FOR ENTRY** | "
+            f"Source: {src} | Fetched: {ts}\n\n"
+        )
+    elif result.is_stale:
+        return (
+            f"**WARNING: DATA STALE ({age:.0f}s old)** | "
+            f"Source: {src} | Fetched: {ts}\n\n"
+        )
+    else:
+        return f"Data: {result.age_label} | Source: {src} | {ts}\n\n"
+
+
+def fmt(result: FetchResult, title: str = "") -> str:
+    """Format API response with age banner and staleness warnings."""
+    data = result.data
+    header = ""
     if title:
         header = f"## {title}\n\n"
-    else:
-        header = ""
+    header += _age_banner(result)
 
-    # FIX #9: Validate data type before formatting
     if data is None:
-        return f"{header}**WARNING: No data returned.** The symbol may not exist or the API returned empty."
+        return f"{header}**ERROR: No data returned.** The symbol may not exist."
 
     if isinstance(data, list):
         if len(data) == 0:
-            return f"{header}**WARNING: Empty dataset.** No data points returned for this query."
-        # Show last N entries for time series
+            return f"{header}**WARNING: Empty dataset.** No data points returned."
         if len(data) > 20:
             total = len(data)
             data = data[-20:]
@@ -71,27 +113,82 @@ def fmt(data: Any, title: str = "") -> str:
         return header + str(data)
 
 
-def fmt_cvd(data: Any, cvd_type: str) -> str:
-    """Format CVD response with trading context."""
+def _format_fr_compact(coins: list, symbol: str) -> list:
+    """Extract compact FR data for a specific coin from exchange-list response."""
+    result = []
+    for coin in coins:
+        for margin_list_key in ("stablecoinMarginList", "stablecoin_margin_list"):
+            exchanges = coin.get(margin_list_key, [])
+            if exchanges:
+                break
+        for ex in exchanges:
+            fr = ex.get("fundingRate", ex.get("funding_rate"))
+            if fr is not None:
+                result.append({
+                    "exchange": ex.get("exchangeName", ex.get("exchange", "?")),
+                    "pair": ex.get("pair", f"{symbol}USDT"),
+                    "funding_rate": fr,
+                    "interval_h": ex.get("fundingRateInterval", ex.get("funding_rate_interval", 8)),
+                    "next_funding": ex.get("nextFundingTime", ex.get("next_funding_time")),
+                })
+    return result
+
+
+def _fmt_fr_exchange_list(result: FetchResult, label: str) -> str:
+    """Format FR exchange-list with compact per-exchange breakdown."""
+    header = f"## Funding Rate — {label}\n\n"
+    header += _age_banner(result)
+    data = result.data
+    if not data:
+        return f"{header}**No funding rate data found.**"
+    # If already compacted (list of dicts with 'exchange' key)
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        if "exchange" in data[0]:
+            return header + json.dumps(data, indent=2, default=str)
+    # Raw format — compact it
+    compacted = _format_fr_compact(data, label)
+    if not compacted:
+        return f"{header}**No active funding rate entries.**"
+    return header + json.dumps(compacted, indent=2, default=str)
+
+
+def fmt_cvd(result: FetchResult, cvd_type: str) -> str:
+    """Format CVD response with trading interpretation."""
     title = f"{'Spot' if cvd_type == 'spot' else 'Futures'} CVD (Cumulative Volume Delta)"
-    result = fmt(data, title)
+    output = fmt(result, title)
+
+    # Add interpretation from latest data points
+    data = result.data
+    if isinstance(data, list) and len(data) >= 2:
+        last = data[-1]
+        prev = data[-2]
+        if isinstance(last, dict) and isinstance(prev, dict):
+            # Try to extract CVD value
+            for key in ("cvd", "v", "value", "vol"):
+                if key in last and key in prev:
+                    current = float(last[key])
+                    previous = float(prev[key])
+                    delta = current - previous
+                    direction = "RISING" if delta > 0 else "FALLING"
+                    sign = "POSITIVE" if current > 0 else "NEGATIVE"
+                    output += f"\n\n**Quick Read:** {sign} {direction} ({current:+,.0f}, delta: {delta:+,.0f})"
+                    break
 
     if cvd_type == "spot":
-        result += (
-            "\n\n**Trading Context (Ricoz Framework):**\n"
-            "- SpotCVD POSITIVE + rising = spot buyers dominant → BULLISH bias\n"
-            "- SpotCVD NEGATIVE = DO NOT LONG regardless of other signals (VETO)\n"
-            "- Look at DIRECTION of line, not just absolute number\n"
-            "- Compare with FuturesCVD for confluence"
+        output += (
+            "\n\n**Ricoz Framework:**\n"
+            "- SpotCVD POSITIVE + rising = spot buyers dominant = BULLISH\n"
+            "- SpotCVD NEGATIVE = **VETO — DO NOT LONG**\n"
+            "- Look at DIRECTION, not just absolute number"
         )
     else:
-        result += (
-            "\n\n**Trading Context (Ricoz Framework):**\n"
-            "- FutCVD confirms directional bias from SpotCVD\n"
-            "- FutCVD rising + SpotCVD rising = strong long setup\n"
-            "- Divergence between Spot & Futures CVD = caution"
+        output += (
+            "\n\n**Ricoz Framework:**\n"
+            "- FutCVD confirms SpotCVD directional bias\n"
+            "- Both rising = strong LONG | Both falling = strong SHORT\n"
+            "- Divergence = CAUTION, wait for alignment"
         )
-    return result
+    return output
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -104,6 +201,7 @@ async def coinglass_spot_cvd(
     symbol: str = "BTC",
     interval: str = "5m",
     limit: int = 100,
+    exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
     """Get Spot CVD (Cumulative Volume Delta) — PRIMARY VETO SIGNAL.
 
@@ -116,13 +214,16 @@ async def coinglass_spot_cvd(
         symbol: Coin symbol (BTC, ETH, SOL, HYPE, AVAX, etc.)
         interval: Candle interval (1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d)
         limit: Number of data points (max 4500)
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
     """
-    data = await client.get("/api/spot/aggregated-cvd-history", {
-        "symbol": symbol,
+    sym = normalize_symbol(symbol)
+    result = await client.get("/api/spot/aggregated-cvd/history", {
+        "exchange_list": exchange,
+        "symbol": sym,
         "interval": interval,
         "limit": limit,
     })
-    return fmt_cvd(data, "spot")
+    return fmt_cvd(result, "spot")
 
 
 @mcp.tool()
@@ -130,6 +231,7 @@ async def coinglass_futures_cvd(
     symbol: str = "BTC",
     interval: str = "5m",
     limit: int = 100,
+    exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
     """Get Futures CVD (Cumulative Volume Delta) — ENTRY FILTER signal.
 
@@ -142,20 +244,21 @@ async def coinglass_futures_cvd(
         symbol: Coin symbol (BTC, ETH, SOL, etc.)
         interval: Candle interval (1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d)
         limit: Number of data points (max 4500)
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
     """
-    data = await client.get("/api/futures/aggregated-cvd-history", {
-        "symbol": symbol,
+    sym = normalize_symbol(symbol)
+    result = await client.get("/api/futures/aggregated-cvd/history", {
+        "exchange_list": exchange,
+        "symbol": sym,
         "interval": interval,
         "limit": limit,
     })
-    return fmt_cvd(data, "futures")
+    return fmt_cvd(result, "futures")
 
 
 @mcp.tool()
-async def coinglass_funding_rate(
-    symbol: str = "BTC",
-) -> str:
-    """Get current Funding Rate across all exchanges.
+async def coinglass_funding_rate() -> str:
+    """Get current Funding Rate for ALL coins across all exchanges.
 
     Funding Rate indicates market sentiment:
     - Positive FR = longs pay shorts (market bullish/overleveraged long)
@@ -163,20 +266,45 @@ async def coinglass_funding_rate(
     - Extreme FR (>0.05%) = potential reversal zone
     - Near zero = neutral, good for directional trades
 
-    Args:
-        symbol: Coin symbol (BTC, ETH, SOL, etc.)
+    Returns data for all coins — only coins with active FR data shown.
     """
-    data = await client.get("/api/futures/funding-rate/exchange-list", {
-        "symbol": symbol,
-    })
-    result = fmt(data, f"Funding Rate — {symbol}")
-    result += (
-        "\n\n**Trading Context:**\n"
-        "- FR > 0.03% = overleveraged longs, SHORT bias\n"
-        "- FR < -0.03% = overleveraged shorts, LONG bias\n"
+    result = await client.get("/api/futures/funding-rate/exchange-list")
+    # Flatten to clean format: one row per coin+exchange with active FR
+    if isinstance(result.data, list):
+        clean = []
+        for coin in result.data:
+            sym = coin.get("symbol", "")
+            margin_list = (coin.get("stablecoin_margin_list")
+                           or coin.get("stablecoinMarginList") or [])
+            for ex in margin_list:
+                fr = ex.get("funding_rate", ex.get("fundingRate"))
+                if fr is not None:
+                    clean.append({
+                        "symbol": sym,
+                        "exchange": ex.get("exchange", "?"),
+                        "funding_rate": fr,
+                        "interval_h": ex.get("funding_rate_interval",
+                                             ex.get("fundingRateInterval", 8)),
+                        "next_funding": ex.get("next_funding_time",
+                                               ex.get("nextFundingTime")),
+                    })
+        if clean:
+            # Sort by extreme FR first (highest absolute value)
+            clean.sort(key=lambda x: abs(x.get("funding_rate", 0)), reverse=True)
+            total = len(clean)
+            top50 = clean[:50]
+            result = FetchResult(
+                data=top50, age_seconds=result.age_seconds,
+                is_cached=result.is_cached, fetched_at=result.fetched_at,
+            )
+    output = fmt(result, f"Funding Rate — Top 50 Extreme FR (of {total} active)")
+    output += (
+        "\n\n**Ricoz Framework:**\n"
+        "- FR > +0.03% = overleveraged longs → SHORT bias\n"
+        "- FR < -0.03% = overleveraged shorts → LONG bias\n"
         "- Check FR trend over 8h for better signal"
     )
-    return result
+    return output
 
 
 @mcp.tool()
@@ -184,6 +312,7 @@ async def coinglass_open_interest(
     symbol: str = "BTC",
     interval: str = "5m",
     limit: int = 100,
+    exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
     """Get Open Interest history (aggregated across exchanges).
 
@@ -197,27 +326,36 @@ async def coinglass_open_interest(
         symbol: Coin symbol (BTC, ETH, SOL, etc.)
         interval: Candle interval (1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d)
         limit: Number of data points
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
     """
-    data = await client.get("/api/futures/openInterest/ohlc-aggregated-history", {
-        "symbol": symbol,
+    sym = normalize_symbol(symbol)
+    params: dict = {
+        "symbol": sym,
         "interval": interval,
         "limit": limit,
-    })
-    result = fmt(data, f"Open Interest — {symbol}")
-    result += (
-        "\n\n**Trading Context (Ricoz Framework):**\n"
+    }
+    if exchange:
+        params["exchange_list"] = exchange
+    result = await client.get("/api/futures/open-interest/aggregated-history", params)
+    output = fmt(result, f"Open Interest — {sym}")
+    output += (
+        "\n\n**Ricoz Framework:**\n"
         "- Compare OI change with price direction\n"
         "- Sudden OI spike = new positions, volatility incoming\n"
         "- OI dropping sharply = liquidation cascade"
     )
-    return result
+    return output
 
 
 @mcp.tool()
 async def coinglass_liquidation_map(
     symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    range: str = "3d",
 ) -> str:
-    """Get Liquidation Map — shows where liquidation clusters are.
+    """Get Liquidation Heatmap — shows where liquidation clusters are.
+
+    ⚠️ Requires Professional or Enterprise plan.
 
     Critical for identifying:
     - Magnetic zones (price tends to move toward liquidation clusters)
@@ -225,28 +363,40 @@ async def coinglass_liquidation_map(
     - Potential reversal zones after liquidation sweeps
 
     Args:
-        symbol: Coin symbol (BTC, ETH, SOL, etc.)
+        symbol: Coin symbol (BTC, ETH, SOL, etc.) — auto-converted to pair (BTCUSDT)
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
+        range: Time range (12h, 24h, 3d, 7d, 30d, 90d, 180d, 1y)
     """
-    data = await client.get("/api/futures/liquidation/aggregated-map", {
-        "symbol": symbol,
+    if not config.has_feature("liquidation_heatmap"):
+        return (
+            f"**ERROR:** Liquidation Heatmap requires Professional or Enterprise plan.\n"
+            f"Current plan: {config.plan}"
+        )
+    pair = to_pair(symbol)
+    result = await client.get("/api/futures/liquidation/heatmap/model1", {
+        "exchange": exchange,
+        "symbol": pair,
+        "range": range,
     })
-    result = fmt(data, f"Liquidation Map — {symbol}")
-    result += (
-        "\n\n**Trading Context:**\n"
-        "- Large liquidation clusters = magnetic targets\n"
+    output = fmt(result, f"Liquidation Heatmap — {pair} ({exchange}, {range})")
+    output += (
+        "\n\n**Ricoz Framework:**\n"
+        "- Large liq clusters = magnetic targets (price moves toward them)\n"
         "- After sweep through cluster = potential reversal\n"
         "- Use for TP/SL placement"
     )
-    return result
+    return output
 
 
 @mcp.tool()
 async def coinglass_orderbook(
     symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
     interval: str = "5m",
     limit: int = 100,
+    range: str = "1",
 ) -> str:
-    """Get Aggregated Orderbook History — OBDelta (bid/ask imbalance).
+    """Get Aggregated Orderbook Ask/Bids History — OBDelta (bid/ask imbalance).
 
     Shows orderbook depth imbalance over time:
     - More bids than asks = buying pressure (bullish)
@@ -256,22 +406,27 @@ async def coinglass_orderbook(
 
     Args:
         symbol: Coin symbol (BTC, ETH, SOL, etc.)
-        interval: Candle interval (1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d)
-        limit: Number of data points
+        exchange: Exchange name or comma-separated list (Binance, OKX, Bybit or ALL)
+        interval: Candle interval (1m, 5m, 15m, 1h, 4h, 1d)
+        limit: Number of data points (max 1000)
+        range: Depth percentage (0.25, 0.5, 0.75, 1, 2, 3, 5, 10)
     """
-    data = await client.get("/api/futures/aggregated-orderbook-history", {
-        "symbol": symbol,
+    sym = normalize_symbol(symbol)
+    result = await client.get("/api/futures/orderbook/aggregated-ask-bids-history", {
+        "exchange_list": exchange,
+        "symbol": sym,
         "interval": interval,
         "limit": limit,
+        "range": range,
     })
-    result = fmt(data, f"Orderbook Delta — {symbol}")
-    result += (
-        "\n\n**Trading Context (Ricoz Framework):**\n"
+    output = fmt(result, f"Orderbook Delta — {normalize_symbol(symbol)}")
+    output += (
+        "\n\n**Ricoz Framework:**\n"
         "- OBDelta positive = more bids, bullish pressure\n"
         "- OBDelta negative = more asks, bearish pressure\n"
         "- Combine with CVD for entry confirmation"
     )
-    return result
+    return output
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -284,20 +439,24 @@ async def coinglass_price_ohlc(
     symbol: str = "BTC",
     interval: str = "5m",
     limit: int = 100,
+    exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
     """Get price OHLC history from futures markets.
 
     Args:
-        symbol: Coin symbol (BTC, ETH, SOL, etc.)
+        symbol: Coin symbol (BTC, ETH, SOL, etc.) — auto-converted to pair (BTCUSDT)
         interval: Candle interval (1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d)
         limit: Number of data points
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
     """
-    data = await client.get("/api/futures/price/ohlc-history", {
-        "symbol": symbol,
+    pair = to_pair(symbol)
+    result = await client.get("/api/futures/price/history", {
+        "exchange": exchange,
+        "symbol": pair,
         "interval": interval,
         "limit": limit,
     })
-    return fmt(data, f"Price OHLC — {symbol} ({interval})")
+    return fmt(result, f"Price OHLC — {normalize_symbol(symbol)} ({interval})")
 
 
 @mcp.tool()
@@ -305,8 +464,9 @@ async def coinglass_liquidation_history(
     symbol: str = "BTC",
     interval: str = "1h",
     limit: int = 100,
+    exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
-    """Get aggregated liquidation history — volume of liquidations over time.
+    """Get pair liquidation history — volume of liquidations over time.
 
     Shows when and how much was liquidated:
     - High liquidation volume = volatile period
@@ -314,16 +474,19 @@ async def coinglass_liquidation_history(
     - Short liquidations at resistance = potential top
 
     Args:
-        symbol: Coin symbol (BTC, ETH, SOL, etc.)
+        symbol: Coin symbol (BTC, ETH, SOL, etc.) — auto-converted to pair (BTCUSDT)
         interval: Candle interval (1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d)
         limit: Number of data points
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
     """
-    data = await client.get("/api/futures/liquidation/aggregated-history", {
-        "symbol": symbol,
+    pair = to_pair(symbol)
+    result = await client.get("/api/futures/liquidation/history", {
+        "exchange": exchange,
+        "symbol": pair,
         "interval": interval,
         "limit": limit,
     })
-    return fmt(data, f"Liquidation History — {symbol}")
+    return fmt(result, f"Liquidation History — {normalize_symbol(symbol)}")
 
 
 @mcp.tool()
@@ -331,6 +494,7 @@ async def coinglass_long_short_ratio(
     symbol: str = "BTC",
     interval: str = "1h",
     limit: int = 100,
+    exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
     """Get Global Long/Short Account Ratio.
 
@@ -343,13 +507,16 @@ async def coinglass_long_short_ratio(
         symbol: Coin symbol (BTC, ETH, SOL, etc.)
         interval: Candle interval (1h, 4h, 12h, 1d)
         limit: Number of data points
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
     """
-    data = await client.get("/api/futures/global-longshort-account-ratio", {
-        "symbol": symbol,
+    pair = to_pair(symbol)
+    result = await client.get("/api/futures/global-long-short-account-ratio/history", {
+        "exchange": exchange,
+        "symbol": pair,
         "interval": interval,
         "limit": limit,
     })
-    return fmt(data, f"Long/Short Ratio — {symbol}")
+    return fmt(result, f"Long/Short Ratio — {normalize_symbol(symbol)}")
 
 
 @mcp.tool()
@@ -357,6 +524,7 @@ async def coinglass_taker_buysell(
     symbol: str = "BTC",
     interval: str = "5m",
     limit: int = 100,
+    exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
     """Get Taker Buy/Sell Volume — shows aggressor side.
 
@@ -366,42 +534,84 @@ async def coinglass_taker_buysell(
     - Supports CVD signals
 
     Args:
-        symbol: Coin symbol (BTC, ETH, SOL, etc.)
+        symbol: Coin symbol (BTC, ETH, SOL, etc.) — auto-converted to pair (BTCUSDT)
         interval: Candle interval (1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d)
         limit: Number of data points
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
     """
-    data = await client.get("/api/futures/taker-buysell-volume", {
-        "symbol": symbol,
+    sym = normalize_symbol(symbol)
+    result = await client.get("/api/futures/aggregated-taker-buy-sell-volume/history", {
+        "exchange_list": exchange,
+        "symbol": sym,
         "interval": interval,
         "limit": limit,
     })
-    return fmt(data, f"Taker Buy/Sell — {symbol}")
+    return fmt(result, f"Taker Buy/Sell — {sym}")
 
 
 @mcp.tool()
-async def coinglass_fr_arbitrage() -> str:
+async def coinglass_fr_arbitrage(
+    usd: int = 10000,
+    exchange: str = "",
+) -> str:
     """Get Funding Rate Arbitrage — find extreme funding rates across coins.
 
     Shows coins with highest/lowest funding rates:
     - Extreme positive FR = potential short opportunity
     - Extreme negative FR = potential long opportunity
     - Good for finding FR arbitrage trades
+
+    Args:
+        usd: Position size in USD for calculating FR income (default: 10000)
+        exchange: Comma-separated exchange filter (e.g. Binance,OKX)
     """
-    data = await client.get("/api/futures/funding-rate/arbitrage")
-    return fmt(data, "Funding Rate Arbitrage — Top Opportunities")
+    params: dict = {"usd": usd}
+    if exchange:
+        params["exchange_list"] = exchange
+    result = await client.get("/api/futures/funding-rate/arbitrage", params)
+    # Sort by APR descending, show top 20 best opportunities
+    if isinstance(result.data, list) and result.data:
+        sorted_data = sorted(result.data, key=lambda x: abs(x.get("apr", 0)), reverse=True)
+        total = len(sorted_data)
+        top20 = sorted_data[:20]
+        result = FetchResult(
+            data=top20, age_seconds=result.age_seconds,
+            is_cached=result.is_cached, fetched_at=result.fetched_at,
+        )
+        output = fmt(result, f"Funding Rate Arbitrage — ${usd} position")
+        if total > 20:
+            output = output.replace(
+                f"## Funding Rate Arbitrage",
+                f"## Funding Rate Arbitrage (top 20 of {total} by APR)",
+                1,
+            )
+        return output
+    return fmt(result, f"Funding Rate Arbitrage — ${usd} position")
 
 
 @mcp.tool()
-async def coinglass_coins_markets() -> str:
+async def coinglass_coins_markets(
+    exchange: str = "",
+    page: int = 1,
+    per_page: int = 20,
+) -> str:
     """Get market overview for all futures coins.
 
     Returns comprehensive market data including:
     - Price, 24h change, volume
     - Open Interest, FR, Long/Short ratio
     - Good for market scanning and finding opportunities
+
+    Args:
+        exchange: Comma-separated exchange filter (e.g. Binance,OKX)
+        page: Page number (default: 1)
+        per_page: Results per page (default: 20)
     """
-    data = await client.get("/api/futures/coins-markets")
-    return fmt(data, "Futures Market Overview")
+    params: dict = {"page": page, "per_page": per_page}
+    if exchange:
+        params["exchange_list"] = exchange
+    result = await client.get("/api/futures/coins-markets", params)
+    return fmt(result, f"Futures Market Overview — page {page}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -410,23 +620,17 @@ async def coinglass_coins_markets() -> str:
 
 
 @mcp.tool()
-async def coinglass_whale_alert(
-    limit: int = 20,
-) -> str:
-    """Get Hyperliquid whale position alerts.
+async def coinglass_whale_alert() -> str:
+    """Get Hyperliquid whale position alerts (~200 most recent, positions > $1M).
 
     Shows large trader positions on Hyperliquid:
     - Whale opening large long = bullish signal
     - Whale opening large short = bearish signal
     - Track whale PnL for sentiment
-
-    Args:
-        limit: Number of alerts to return
+    - position_action: 1=open, 2=close | position_size: positive=long, negative=short
     """
-    data = await client.get("/api/hyperliquid/whale-alert", {
-        "limit": limit,
-    })
-    return fmt(data, "Whale Alerts — Hyperliquid")
+    result = await client.get("/api/hyperliquid/whale-alert")
+    return fmt(result, "Whale Alerts — Hyperliquid")
 
 
 @mcp.tool()
@@ -440,8 +644,8 @@ async def coinglass_fear_greed() -> str:
     - 55-75 = Greed
     - 75-100 = Extreme Greed (contrarian SELL zone)
     """
-    data = await client.get("/api/index/fear-greed-history")
-    return fmt(data, "Fear & Greed Index")
+    result = await client.get("/api/index/fear-greed-history")
+    return fmt(result, "Fear & Greed Index")
 
 
 @mcp.tool()
@@ -449,6 +653,7 @@ async def coinglass_footprint(
     symbol: str = "BTC",
     interval: str = "1h",
     limit: int = 50,
+    exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
     """Get Footprint chart data (90-day history max).
 
@@ -458,172 +663,1288 @@ async def coinglass_footprint(
     - Requires Standard plan or higher
 
     Args:
-        symbol: Coin symbol (BTC, ETH, SOL, etc.)
+        symbol: Coin symbol (BTC, ETH, SOL, etc.) — auto-converted to pair (BTCUSDT)
         interval: Candle interval
         limit: Number of data points (max ~2160 for 90d at 1h)
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
     """
-    data = await client.get("/api/futures/footprint", {
-        "symbol": symbol,
+    pair = to_pair(symbol)
+    result = await client.get("/api/futures/volume/footprint-history", {
+        "exchange": exchange,
+        "symbol": pair,
         "interval": interval,
         "limit": limit,
     })
-    return fmt(data, f"Footprint — {symbol}")
+    return fmt(result, f"Footprint — {normalize_symbol(symbol)}")
 
 
 @mcp.tool()
 async def coinglass_spot_netflow(
     symbol: str = "BTC",
-    interval: str = "1h",
-    limit: int = 100,
+    exchange: str = "Binance, Bybit, OKX, Bitget, Gate",
 ) -> str:
     """Get spot exchange net flow — coins moving in/out of exchanges.
 
-    - Net inflow = coins deposited to exchange (potential sell pressure)
-    - Net outflow = coins withdrawn (HODLing, bullish)
+    Returns net flow across multiple timeframes (5m to 1y) in a single response.
+    - Net inflow (positive) = more buy volume (bullish)
+    - Net outflow (negative) = more sell volume (bearish)
 
     Args:
         symbol: Coin symbol (BTC, ETH, SOL, etc.)
-        interval: Candle interval
-        limit: Number of data points
+        exchange: Comma-separated exchange list (default: Binance, Bybit, OKX, Bitget, Gate)
     """
-    data = await client.get("/api/spot/exchange-net-flow-history", {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
+    sym = normalize_symbol(symbol)
+    result = await client.get("/api/spot/coin/netflow", {
+        "symbol": sym,
+        "exchange_list": exchange,
     })
-    return fmt(data, f"Spot Exchange Net Flow — {symbol}")
+    return fmt(result, f"Spot Net Flow — {sym}")
 
 
 @mcp.tool()
 async def coinglass_orderbook_heatmap(
     symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "1h",
+    limit: int = 100,
 ) -> str:
     """Get Orderbook Heatmap data — visual representation of order depth.
 
     Shows where large orders are placed:
     - Dense bid zones = potential support levels
     - Dense ask zones = potential resistance levels
-    - Requires Professional plan
+    - Requires Standard plan or higher
+    - History: 1m=3days, 5m=15days, others=150days
 
     Args:
-        symbol: Coin symbol (BTC, ETH, SOL, etc.)
+        symbol: Coin symbol (BTC, ETH, SOL, etc.) — auto-converted to pair (BTCUSDT)
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
+        interval: Candle interval (1m, 5m, 15m, 1h, 4h, 1d)
+        limit: Data points (max 100)
     """
-    data = await client.get("/api/futures/orderbook-heatmap", {
-        "symbol": symbol,
+    pair = to_pair(symbol)
+    result = await client.get("/api/futures/orderbook/history", {
+        "exchange": exchange,
+        "symbol": pair,
+        "interval": interval,
+        "limit": min(limit, 100),
     })
-    return fmt(data, f"Orderbook Heatmap — {symbol}")
+    return fmt(result, f"Orderbook Heatmap — {normalize_symbol(symbol)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# COMPOSITE TOOL (18) — Ricoz Full Scan
+# CATEGORY TOOLS — All CoinGlass V4 Endpoints by Category
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def coinglass_trading_market(
+    action: str = "coins_markets",
+    symbol: str = "",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "1h",
+    limit: int = 100,
+    page: int = 1,
+    per_page: int = 20,
+) -> str:
+    """Futures Trading Market data — 9 endpoints in one tool.
+
+    Actions:
+    - supported_coins: List all supported coin symbols
+    - supported_exchanges: List all supported futures exchanges
+    - supported_pairs: List exchange-pair combinations (optional: filter by exchange)
+    - coins_markets: Market overview all coins (price, OI, volume, FR, liquidation)
+    - pairs_markets: All trading pairs for a coin (requires symbol)
+    - price_change: Price change % across timeframes (5m, 15m, 30m, 1h, 4h, 12h, 24h)
+    - price_history: OHLC candlestick data (requires symbol, exchange, interval)
+    - delisted_pairs: Retired/delisted trading pairs
+    - exchange_rank: Exchange rankings by volume/OI
+
+    Args:
+        action: One of the actions listed above
+        symbol: Coin symbol — needed for pairs_markets and price_history
+        exchange: Exchange name — needed for price_history, optional for supported_pairs
+        interval: Candle interval for price_history (1m, 5m, 15m, 1h, 4h, 1d)
+        limit: Data points for price_history (max 4500)
+        page: Page number for coins_markets
+        per_page: Results per page for coins_markets
+    """
+    action = action.strip().lower()
+
+    if action == "supported_coins":
+        result = await client.get("/api/futures/supported-coins")
+        return fmt(result, "Futures — Supported Coins")
+
+    elif action == "supported_exchanges":
+        result = await client.get("/api/futures/supported-exchanges")
+        return fmt(result, "Futures — Supported Exchanges")
+
+    elif action == "supported_pairs":
+        params = {}
+        if exchange:
+            params["exchange"] = exchange
+        result = await client.get("/api/futures/supported-exchange-pairs", params or None)
+        return fmt(result, f"Futures — Supported Pairs ({exchange or 'All'})")
+
+    elif action == "coins_markets":
+        params = {"per_page": per_page, "page": page}
+        if exchange:
+            params["exchange_list"] = exchange
+        result = await client.get("/api/futures/coins-markets", params)
+        return fmt(result, f"Futures — Coins Markets (page {page})")
+
+    elif action == "pairs_markets":
+        if not symbol:
+            return "**ERROR:** `symbol` is required for pairs_markets (e.g., BTC, ETH)"
+        sym = normalize_symbol(symbol)
+        result = await client.get("/api/futures/pairs-markets", {"symbol": sym})
+        return fmt(result, f"Futures — Pairs Markets ({sym})")
+
+    elif action == "price_change":
+        result = await client.get("/api/futures/coins-price-change")
+        return fmt(result, "Futures — Coins Price Change (5m→24h)")
+
+    elif action == "price_history":
+        if not symbol:
+            return "**ERROR:** `symbol` is required for price_history (e.g., BTC, ETH)"
+        pair = to_pair(symbol)
+        result = await client.get("/api/futures/price/history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"Futures — Price OHLC ({normalize_symbol(symbol)} {interval})")
+
+    elif action == "delisted_pairs":
+        result = await client.get("/api/futures/delisted-exchange-pairs")
+        return fmt(result, "Futures — Delisted Pairs")
+
+    elif action == "exchange_rank":
+        result = await client.get("/api/futures/exchange-rank")
+        return fmt(result, "Futures — Exchange Ranking")
+
+    else:
+        return (
+            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
+            "supported_coins, supported_exchanges, supported_pairs, coins_markets, "
+            "pairs_markets, price_change, price_history, delisted_pairs, exchange_rank"
+        )
+
+
+@mcp.tool()
+async def coinglass_open_interest_cat(
+    action: str = "aggregated_history",
+    symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "1h",
+    limit: int = 100,
+    range: str = "24h",
+) -> str:
+    """Open Interest data — 6 endpoints in one tool.
+
+    Actions:
+    - history: OI OHLC per pair (requires symbol as pair BTCUSDT + exchange)
+    - aggregated_history: Aggregated OI OHLC across all exchanges for a coin
+    - stablecoin_margin: Stablecoin-margined (USDT) OI OHLC
+    - coin_margin: Coin-margined OI OHLC
+    - exchange_list: OI breakdown by exchange (symbol optional, range required)
+    - exchange_chart: Historical OI chart by exchange (symbol only)
+
+    Args:
+        action: One of the actions listed above
+        symbol: Coin symbol (BTC, ETH, SOL) — auto-converted to pair for 'history' action
+        exchange: Exchange name — needed for 'history' action
+        interval: Candle interval (1m, 5m, 15m, 1h, 4h, 1d) — for history/aggregated/margin
+        limit: Data points (max 4500)
+        range: Time range for exchange_list only (1h, 4h, 12h, 24h)
+    """
+    action = action.strip().lower()
+    sym = normalize_symbol(symbol)
+
+    if action == "history":
+        pair = to_pair(symbol)
+        result = await client.get("/api/futures/open-interest/history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"OI History — {pair} ({exchange})")
+
+    elif action == "aggregated_history":
+        result = await client.get("/api/futures/open-interest/aggregated-history", {
+            "symbol": sym,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"OI Aggregated — {sym}")
+
+    elif action == "stablecoin_margin":
+        result = await client.get("/api/futures/open-interest/aggregated-stablecoin-history", {
+            "symbol": sym,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"OI Stablecoin Margin — {sym}")
+
+    elif action == "coin_margin":
+        result = await client.get("/api/futures/open-interest/aggregated-coin-margin-history", {
+            "symbol": sym,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"OI Coin Margin — {sym}")
+
+    elif action == "exchange_list":
+        params = {"range": range}
+        if symbol:
+            params["symbol"] = sym
+        result = await client.get("/api/futures/open-interest/exchange-list", params)
+        return fmt(result, f"OI Exchange List — {sym or 'All Coins'}")
+
+    elif action == "exchange_chart":
+        result = await client.get("/api/futures/open-interest/exchange-history-chart", {
+            "symbol": sym,
+        })
+        return fmt(result, f"OI Exchange Chart — {sym}")
+
+    else:
+        return (
+            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
+            "history, aggregated_history, stablecoin_margin, coin_margin, "
+            "exchange_list, exchange_chart"
+        )
+
+
+@mcp.tool()
+async def coinglass_funding_rate_cat(
+    action: str = "exchange_list",
+    symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "1d",
+    limit: int = 100,
+    usd: int = 10000,
+    range: str = "7d",
+) -> str:
+    """Funding Rate data — 6 endpoints in one tool.
+
+    Actions:
+    - history: FR OHLC per pair (requires symbol as pair BTCUSDT + exchange)
+    - oi_weight: OI-weighted FR OHLC (pair + exchange) — Professional plan only
+    - vol_weight: Volume-weighted FR OHLC (pair + exchange) — Professional plan only
+    - exchange_list: Current FR across all exchanges (symbol optional)
+    - cumulative: Accumulated/cumulative FR by exchange (range required, symbol optional)
+    - arbitrage: FR arbitrage opportunities (usd = position size, exchange optional)
+
+    Args:
+        action: One of the actions listed above
+        symbol: Coin symbol (BTC, ETH) — auto-converted to pair for history/oi_weight/vol_weight
+        exchange: Exchange name — needed for history, oi_weight, vol_weight
+        interval: Candle interval (1m, 5m, 15m, 1h, 4h, 1d) — for OHLC actions
+        limit: Data points (max 4500)
+        usd: Position size in USD for arbitrage FR income calc (default: 10000)
+        range: Time range for cumulative (7d, 30d, 90d, 180d, 1y)
+    """
+    action = action.strip().lower()
+    sym = normalize_symbol(symbol)
+
+    if action == "history":
+        pair = to_pair(symbol)
+        result = await client.get("/api/futures/funding-rate/history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"FR History OHLC — {pair} ({exchange})")
+
+    elif action == "oi_weight":
+        pair = to_pair(symbol)
+        result = await client.get("/api/futures/funding-rate/oi-weight-history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        output = fmt(result, f"FR OI-Weighted — {pair} ({exchange})")
+        if isinstance(result.data, list) and len(result.data) == 0:
+            output += (
+                "\n\n**NOTE:** Empty result. This endpoint may require "
+                "Professional or Enterprise plan. Use `history` action instead."
+            )
+        return output
+
+    elif action == "vol_weight":
+        pair = to_pair(symbol)
+        result = await client.get("/api/futures/funding-rate/vol-weight-history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        output = fmt(result, f"FR Vol-Weighted — {pair} ({exchange})")
+        if isinstance(result.data, list) and len(result.data) == 0:
+            output += (
+                "\n\n**NOTE:** Empty result. This endpoint may require "
+                "Professional or Enterprise plan. Use `history` action instead."
+            )
+        return output
+
+    elif action == "exchange_list":
+        result = await client.get("/api/futures/funding-rate/exchange-list")
+        # Post-filter by symbol if specified (API returns all coins)
+        if sym and isinstance(result.data, list):
+            filtered = [c for c in result.data if c.get("symbol", "").upper() == sym]
+            if not filtered:
+                return f"**ERROR:** No funding rate data found for {sym}."
+            result = FetchResult(
+                data=filtered, age_seconds=result.age_seconds,
+                is_cached=result.is_cached, fetched_at=result.fetched_at,
+            )
+        output = _fmt_fr_exchange_list(result, sym or "All Coins")
+        output += (
+            "\n\n**Ricoz Framework:**\n"
+            "- FR > +0.03% = overleveraged longs → SHORT bias\n"
+            "- FR < -0.03% = overleveraged shorts → LONG bias\n"
+            "- Check FR trend over 8h for better signal"
+        )
+        return output
+
+    elif action == "cumulative":
+        params: dict = {"range": range}
+        if symbol:
+            params["symbol"] = sym
+        result = await client.get("/api/futures/funding-rate/accumulated-exchange-list", params)
+        # Post-filter by symbol if specified (API returns all coins)
+        if sym and isinstance(result.data, list):
+            filtered = [c for c in result.data if c.get("symbol", "").upper() == sym]
+            if filtered:
+                result = FetchResult(
+                    data=filtered, age_seconds=result.age_seconds,
+                    is_cached=result.is_cached, fetched_at=result.fetched_at,
+                )
+        return fmt(result, f"Cumulative FR — {sym or 'All Coins'} ({range})")
+
+    elif action == "arbitrage":
+        params: dict = {"usd": usd}
+        if exchange and exchange != DEFAULT_EXCHANGE:
+            params["exchange_list"] = exchange
+        result = await client.get("/api/futures/funding-rate/arbitrage", params)
+        return fmt(result, f"FR Arbitrage — ${usd} position")
+
+    else:
+        return (
+            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
+            "history, oi_weight, vol_weight, exchange_list, cumulative, arbitrage"
+        )
+
+
+@mcp.tool()
+async def coinglass_long_short_cat(
+    action: str = "global_account",
+    symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "4h",
+    limit: int = 100,
+    range: str = "4h",
+) -> str:
+    """Long/Short Ratio & Net Position data — 6 endpoints in one tool.
+
+    Actions:
+    - global_account: Global L/S account ratio history (pair + exchange)
+    - top_account: Top traders L/S account ratio history (pair + exchange)
+    - top_position: Top traders L/S position ratio history (pair + exchange)
+    - taker_exchange: Taker buy/sell ratio per exchange (coin + range)
+    - net_position: Net long/short position history (pair + exchange)
+    - net_position_v2: Net position v2 with more detail (pair + exchange)
+
+    Args:
+        action: One of the actions listed above
+        symbol: Coin symbol (BTC, ETH) — auto-converted to pair for ratio endpoints
+        exchange: Exchange name (Binance, OKX, Bybit)
+        interval: Candle interval for history actions (1m, 5m, 1h, 4h, 1d)
+        limit: Data points (max 1000)
+        range: Time range for taker_exchange only (5m, 15m, 30m, 1h, 4h, 12h, 24h)
+    """
+    action = action.strip().lower()
+    sym = normalize_symbol(symbol)
+    pair = to_pair(symbol)
+
+    if action == "global_account":
+        result = await client.get("/api/futures/global-long-short-account-ratio/history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"Global L/S Account Ratio — {sym} ({exchange})")
+
+    elif action == "top_account":
+        result = await client.get("/api/futures/top-long-short-account-ratio/history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"Top Account L/S Ratio — {sym} ({exchange})")
+
+    elif action == "top_position":
+        result = await client.get("/api/futures/top-long-short-position-ratio/history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"Top Position L/S Ratio — {sym} ({exchange})")
+
+    elif action == "taker_exchange":
+        result = await client.get("/api/futures/taker-buy-sell-volume/exchange-list", {
+            "symbol": sym,
+            "range": range,
+        })
+        return fmt(result, f"Taker Buy/Sell Exchange Ratio — {sym} ({range})")
+
+    elif action == "net_position":
+        result = await client.get("/api/futures/net-position/history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"Net L/S Position — {sym} ({exchange})")
+
+    elif action == "net_position_v2":
+        result = await client.get("/api/futures/v2/net-position/history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"Net L/S Position v2 — {sym} ({exchange})")
+
+    else:
+        return (
+            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
+            "global_account, top_account, top_position, taker_exchange, "
+            "net_position, net_position_v2"
+        )
+
+
+@mcp.tool()
+async def coinglass_liquidation_cat(
+    action: str = "coin_history",
+    symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "1h",
+    limit: int = 100,
+    range: str = "24h",
+    min_amount: int = 10000,
+) -> str:
+    """Liquidation data — 5 endpoints in one tool.
+
+    Actions:
+    - pair_history: Liquidation history per pair (pair + exchange + interval)
+    - coin_history: Aggregated liq history across exchanges (coin + exchange_list + interval)
+    - coin_list: All coins liquidation on an exchange (1h/4h/12h/24h breakdown)
+    - exchange_list: Liquidation by exchange for a coin (coin optional + range)
+    - order: Individual liquidation orders last 7 days (coin + exchange + min_amount)
+
+    Args:
+        action: One of the actions listed above
+        symbol: Coin symbol (BTC, ETH) — auto-converted to pair for pair_history
+        exchange: Exchange name or comma-separated list for coin_history
+        interval: Candle interval for history actions (1m, 5m, 1h, 4h, 1d)
+        limit: Data points (max 1000)
+        range: Time range for exchange_list (1h, 4h, 12h, 24h)
+        min_amount: Minimum USD amount for order action (default 10000)
+    """
+    action = action.strip().lower()
+    sym = normalize_symbol(symbol)
+
+    if action == "pair_history":
+        pair = to_pair(symbol)
+        result = await client.get("/api/futures/liquidation/history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"Liq Pair History — {pair} ({exchange})")
+
+    elif action == "coin_history":
+        result = await client.get("/api/futures/liquidation/aggregated-history", {
+            "exchange_list": exchange,
+            "symbol": sym,
+            "interval": interval,
+            "limit": limit,
+        })
+        return fmt(result, f"Liq Aggregated History — {sym}")
+
+    elif action == "coin_list":
+        result = await client.get("/api/futures/liquidation/coin-list", {
+            "exchange": exchange,
+        })
+        return fmt(result, f"Liq Coin List — {exchange}")
+
+    elif action == "exchange_list":
+        params = {"range": range}
+        if symbol:
+            params["symbol"] = sym
+        result = await client.get("/api/futures/liquidation/exchange-list", params)
+        return fmt(result, f"Liq Exchange List — {sym or 'All Coins'} ({range})")
+
+    elif action == "order":
+        result = await client.get("/api/futures/liquidation/order", {
+            "exchange": exchange,
+            "symbol": sym,
+            "min_liquidation_amount": str(min_amount),
+        })
+        return fmt(result, f"Liq Orders — {sym} ({exchange}, min ${min_amount:,})")
+
+    else:
+        return (
+            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
+            "pair_history, coin_history, coin_list, exchange_list, order"
+        )
+
+
+@mcp.tool()
+async def coinglass_orderbook_cat(
+    action: str = "aggregated_bidask",
+    symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "1h",
+    limit: int = 100,
+    range: str = "1",
+    state: int = 1,
+) -> str:
+    """Order Book (L2) data — 5 endpoints in one tool.
+
+    Actions:
+    - pair_bidask: Bid/Ask history per pair (pair + exchange + interval + depth range)
+    - aggregated_bidask: Aggregated bid/ask across exchanges (coin + exchange_list + interval)
+    - heatmap: Orderbook heatmap visualization (pair + exchange + interval, max 100 pts)
+    - large_orders: Current large open orders (pair + exchange). BTC>=1M, ETH>=500K, Other>=50K
+    - large_orders_history: Completed large orders (pair + exchange + time range + state)
+
+    Args:
+        action: One of the actions listed above
+        symbol: Coin symbol (BTC, ETH) — auto-converted to pair where needed
+        exchange: Exchange name or comma-separated list for aggregated_bidask
+        interval: Candle interval for bidask/heatmap (1m, 5m, 15m, 1h, 4h, 1d)
+        limit: Data points (max 1000 for bidask, max 100 for heatmap)
+        range: Depth percentage for bidask (0.25, 0.5, 0.75, 1, 2, 3, 5, 10)
+        state: For large_orders_history only — 1=Open, 2=Filled, 3=Cancelled
+    """
+    action = action.strip().lower()
+    sym = normalize_symbol(symbol)
+    pair = to_pair(symbol)
+
+    if action == "pair_bidask":
+        result = await client.get("/api/futures/orderbook/ask-bids-history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+            "range": range,
+        })
+        return fmt(result, f"OB Pair Bid/Ask — {pair} ({exchange}, ±{range}%)")
+
+    elif action == "aggregated_bidask":
+        result = await client.get("/api/futures/orderbook/aggregated-ask-bids-history", {
+            "exchange_list": exchange,
+            "symbol": sym,
+            "interval": interval,
+            "limit": limit,
+            "range": range,
+        })
+        return fmt(result, f"OB Aggregated Bid/Ask — {sym} (±{range}%)")
+
+    elif action == "heatmap":
+        result = await client.get("/api/futures/orderbook/history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "interval": interval,
+            "limit": min(limit, 100),
+        })
+        return fmt(result, f"OB Heatmap — {pair} ({exchange})")
+
+    elif action == "large_orders":
+        result = await client.get("/api/futures/orderbook/large-limit-order", {
+            "exchange": exchange,
+            "symbol": pair,
+        })
+        return fmt(result, f"Large Orders — {pair} ({exchange})")
+
+    elif action == "large_orders_history":
+        import time as _time
+        # Default: last 24h
+        end_ms = int(_time.time() * 1000)
+        start_ms = end_ms - (24 * 3600 * 1000)
+        result = await client.get("/api/futures/orderbook/large-limit-order-history", {
+            "exchange": exchange,
+            "symbol": pair,
+            "start_time": start_ms,
+            "end_time": end_ms,
+            "state": state,
+        })
+        state_label = {1: "Open", 2: "Filled", 3: "Cancelled"}.get(state, str(state))
+        return fmt(result, f"Large Orders History — {pair} ({exchange}, {state_label})")
+
+    else:
+        return (
+            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
+            "pair_bidask, aggregated_bidask, heatmap, large_orders, large_orders_history"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CATEGORY TOOL — Hyperliquid (3 endpoints)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def coinglass_hyperliquid_cat(
+    action: str = "long_short_ratio",
+    symbol: str = "BTC",
+    interval: str = "1d",
+    limit: int = 100,
+    current_page: int = 1,
+) -> str:
+    """Hyperliquid on-chain data — 3 endpoints in one tool.
+
+Actions:
+- long_short_ratio: Global L/S account ratio history on Hyperliquid (symbol + interval)
+- wallet_distribution: Wallet position distribution by tier (Shrimp→Leviathan, no params)
+- positions: Individual wallet positions by coin (symbol + page)
+
+Args:
+    action: One of the actions listed above
+    symbol: Coin symbol (BTC, ETH, SOL) — for long_short_ratio and positions
+    interval: Time interval for long_short_ratio only (5m, 1h, 1d)
+    limit: Data points for long_short_ratio (max 1000)
+    current_page: Page number for positions action (paginated results)
+    """
+    action = action.strip().lower()
+    sym = normalize_symbol(symbol)
+
+    if action == "long_short_ratio":
+        result = await client.get(
+            "/api/hyperliquid/global-long-short-account-ratio/history",
+            {"symbol": sym, "interval": interval, "limit": limit},
+        )
+        return fmt(result, f"Hyperliquid L/S Ratio — {sym} ({interval})")
+
+    elif action == "wallet_distribution":
+        result = await client.get(
+            "/api/hyperliquid/wallet/position-distribution", {},
+        )
+        return fmt(result, "Hyperliquid Wallet Position Distribution (all tiers)")
+
+    elif action == "positions":
+        result = await client.get(
+            "/api/hyperliquid/position",
+            {"symbol": sym, "current_page": str(current_page)},
+        )
+        return fmt(result, f"Hyperliquid Positions — {sym} (page {current_page})")
+
+    else:
+        return (
+            f"Unknown action '{action}'. Available: "
+            "long_short_ratio, wallet_distribution, positions"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CATEGORY TOOL — Futures Taker Buy/Sell & Volume (4 endpoints)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def coinglass_futures_taker_cat(
+    action: str = "coin_taker",
+    symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "1h",
+    limit: int = 100,
+    unit: str = "usd",
+) -> str:
+    """Futures Taker Buy/Sell & Volume data — 4 endpoints in one tool.
+
+Actions:
+- cvd_pair: CVD per pair on single exchange (pair + exchange + interval)
+- footprint: Footprint chart — buy/sell vol at each price level (pair + exchange, 90d max, Pro+)
+- coin_taker: Aggregated taker buy/sell volume across exchanges (coin + exchange_list + unit)
+- pair_taker: Per-pair taker buy/sell volume on single exchange (pair + exchange + interval)
+
+Args:
+    action: One of the actions listed above
+    symbol: Coin symbol (BTC, ETH) — auto-converted to pair for cvd_pair/footprint/pair_taker
+    exchange: Exchange name. For coin_taker: comma-separated list (Binance,OKX,Bybit)
+    interval: Candle interval (1m, 5m, 15m, 30m, 1h, 4h, 8h, 12h, 1d, 1w)
+    limit: Data points (max 1000)
+    unit: For coin_taker only — 'usd' or 'coin'
+    """
+    action = action.strip().lower()
+    sym = normalize_symbol(symbol)
+    pair = to_pair(symbol)
+
+    if action == "cvd_pair":
+        result = await client.get(
+            "/api/futures/cvd/history",
+            {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit},
+        )
+        return fmt(result, f"Futures CVD (pair) — {pair} ({exchange}, {interval})")
+
+    elif action == "footprint":
+        result = await client.get(
+            "/api/futures/volume/footprint-history",
+            {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit},
+        )
+        return fmt(result, f"Footprint — {pair} ({exchange}, {interval})")
+
+    elif action == "coin_taker":
+        result = await client.get(
+            "/api/futures/aggregated-taker-buy-sell-volume/history",
+            {"exchange_list": exchange, "symbol": sym, "interval": interval,
+             "limit": limit, "unit": unit},
+        )
+        return fmt(result, f"Aggregated Taker Buy/Sell — {sym} ({exchange}, {interval})")
+
+    elif action == "pair_taker":
+        result = await client.get(
+            "/api/futures/v2/taker-buy-sell-volume/history",
+            {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit},
+        )
+        return fmt(result, f"Pair Taker Buy/Sell — {pair} ({exchange}, {interval})")
+
+    else:
+        return (
+            f"Unknown action '{action}'. Available: "
+            "cvd_pair, footprint, coin_taker, pair_taker"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CATEGORY TOOL — Spots Trading Market (4 endpoints)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def coinglass_spot_market_cat(
+    action: str = "coins_markets",
+    symbol: str = "BTC",
+    page: int = 1,
+    per_page: int = 20,
+) -> str:
+    """Spot Trading Market data — 4 endpoints in one tool.
+
+Actions:
+- supported_coins: List all supported spot coin symbols (no params)
+- supported_pairs: List all spot exchanges and their trading pairs (no params)
+- coins_markets: Spot market overview — price, volume, buy/sell, net flow across timeframes (paginated, Standard+)
+- pairs_markets: All spot trading pairs for a coin with volume/flow data (requires symbol)
+
+Args:
+    action: One of the actions listed above
+    symbol: Coin symbol (BTC, ETH) — needed for pairs_markets
+    page: Page number for coins_markets
+    per_page: Results per page for coins_markets
+    """
+    action = action.strip().lower()
+    sym = normalize_symbol(symbol)
+
+    if action == "supported_coins":
+        result = await client.get("/api/spot/supported-coins", {})
+        return fmt(result, "Spot Supported Coins")
+
+    elif action == "supported_pairs":
+        result = await client.get("/api/spot/supported-exchange-pairs", {})
+        return fmt(result, "Spot Supported Exchanges & Pairs")
+
+    elif action == "coins_markets":
+        result = await client.get(
+            "/api/spot/coins-markets",
+            {"page": page, "per_page": per_page},
+        )
+        return fmt(result, f"Spot Coins Markets (page {page})")
+
+    elif action == "pairs_markets":
+        result = await client.get(
+            "/api/spot/pairs-markets", {"symbol": sym},
+        )
+        return fmt(result, f"Spot Pairs Markets — {sym}")
+
+    else:
+        return (
+            f"Unknown action '{action}'. Available: "
+            "supported_coins, supported_pairs, coins_markets, pairs_markets"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CATEGORY TOOL — Spots Order Book (5 endpoints)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def coinglass_spot_orderbook_cat(
+    action: str = "aggregated_bidask",
+    symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "1h",
+    limit: int = 100,
+    range: str = "1",
+    state: int = 1,
+) -> str:
+    """Spot Order Book data — 5 endpoints in one tool.
+
+Actions:
+- pair_bidask: Bid/Ask history per pair (pair + exchange + interval + depth range)
+- aggregated_bidask: Aggregated bid/ask across exchanges (coin + exchange_list + interval + range)
+- heatmap: Orderbook heatmap visualization (pair + exchange + interval, max 100 pts)
+- large_orders: Current large open orders (pair + exchange). BTC>=350K, ETH>=250K, Other>=10K
+- large_orders_history: Completed large orders (pair + exchange + state). state: 1=Open 2=Filled 3=Cancelled
+
+Args:
+    action: One of the actions listed above
+    symbol: Coin symbol (BTC, ETH) — auto-converted to pair where needed
+    exchange: Exchange name or comma-separated list for aggregated_bidask
+    interval: Candle interval for bidask/heatmap (1m, 5m, 15m, 1h, 4h, 1d)
+    limit: Data points (max 1000 for bidask, max 100 for heatmap)
+    range: Depth percentage for bidask (0.25, 0.5, 0.75, 1, 2, 3, 5, 10)
+    state: For large_orders_history only — 1=Open, 2=Filled, 3=Cancelled
+    """
+    action = action.strip().lower()
+    sym = normalize_symbol(symbol)
+    pair = to_pair(symbol)
+
+    if action == "pair_bidask":
+        result = await client.get(
+            "/api/spot/orderbook/ask-bids-history",
+            {"exchange": exchange, "symbol": pair, "interval": interval,
+             "limit": limit, "range": range},
+        )
+        return fmt(result, f"Spot OB Pair Bid/Ask — {pair} ({exchange}, ±{range}%)")
+
+    elif action == "aggregated_bidask":
+        result = await client.get(
+            "/api/spot/orderbook/aggregated-ask-bids-history",
+            {"exchange_list": exchange, "symbol": sym, "interval": interval,
+             "limit": limit, "range": range},
+        )
+        return fmt(result, f"Spot OB Aggregated Bid/Ask — {sym} ({exchange}, ±{range}%)")
+
+    elif action == "heatmap":
+        hm_limit = min(limit, 100)
+        result = await client.get(
+            "/api/spot/orderbook/history",
+            {"exchange": exchange, "symbol": pair, "interval": interval, "limit": hm_limit},
+        )
+        return fmt(result, f"Spot OB Heatmap — {pair} ({exchange}, {interval})")
+
+    elif action == "large_orders":
+        result = await client.get(
+            "/api/spot/orderbook/large-limit-order",
+            {"exchange": exchange, "symbol": pair},
+        )
+        return fmt(result, f"Spot Large Orders — {pair} ({exchange})")
+
+    elif action == "large_orders_history":
+        import time as _time
+        end_ms = int(_time.time() * 1000)
+        start_ms = end_ms - 7 * 86400 * 1000  # last 7 days
+        result = await client.get(
+            "/api/spot/orderbook/large-limit-order-history",
+            {"exchange": exchange, "symbol": pair,
+             "start_time": str(start_ms), "end_time": str(end_ms), "state": str(state)},
+        )
+        state_labels = {1: "Open", 2: "Filled", 3: "Cancelled"}
+        return fmt(result, f"Spot Large Orders History — {pair} ({exchange}, {state_labels.get(state, state)})")
+
+    else:
+        return (
+            f"Unknown action '{action}'. Available: "
+            "pair_bidask, aggregated_bidask, heatmap, large_orders, large_orders_history"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CATEGORY TOOL — Futures Indicators (10 endpoints)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def coinglass_indicators_cat(
+    action: str = "rsi_list",
+    symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "1h",
+    limit: int = 100,
+    window: int = 14,
+    series_type: str = "close",
+    fast_window: int = 12,
+    slow_window: int = 26,
+    signal_window: int = 9,
+) -> str:
+    """Futures Technical Indicators — 10 endpoints in one tool.
+
+Actions (per-pair history — need symbol + exchange + interval):
+- pair_rsi: RSI history for a trading pair (window default 14)
+- pair_ma: Moving Average history (window default 10)
+- pair_ema: Exponential MA history (window default 10)
+- pair_macd: MACD history (fast=12, slow=26, signal=9)
+- pair_atr: Average True Range history (window default 14)
+- whale_index: Whale Index history for a pair
+
+Actions (all-coins snapshot — no params needed, Standard+):
+- rsi_list: RSI across all coins & timeframes
+- ma_list: MA across all coins & timeframes
+- ema_list: EMA across all coins & timeframes
+- macd_list: MACD across all coins & timeframes
+
+Args:
+    action: One of the actions listed above
+    symbol: Coin symbol (BTC, ETH) — auto-converted to pair for pair_* actions
+    exchange: Exchange name (Binance, OKX, Bybit)
+    interval: Candle interval (1m, 5m, 15m, 1h, 4h, 1d, 1w)
+    limit: Data points (max 1000 for most, 4500 for MA/EMA/MACD/RSI)
+    window: Lookback window for RSI/MA/EMA/ATR (e.g. 14 for RSI, 10 for MA)
+    series_type: Price type — open, high, low, close (default close)
+    fast_window: MACD fast period (default 12)
+    slow_window: MACD slow period (default 26)
+    signal_window: MACD signal period (default 9)
+    """
+    action = action.strip().lower()
+    pair = to_pair(symbol)
+
+    # --- All-coins list endpoints (no params) ---
+    if action == "rsi_list":
+        result = await client.get("/api/futures/rsi/list", {})
+        return fmt(result, "Futures RSI List (all coins)")
+
+    elif action == "ma_list":
+        result = await client.get("/api/futures/ma/list", {})
+        return fmt(result, "Futures MA List (all coins)")
+
+    elif action == "ema_list":
+        result = await client.get("/api/futures/ema/list", {})
+        return fmt(result, "Futures EMA List (all coins)")
+
+    elif action == "macd_list":
+        result = await client.get("/api/futures/macd/list", {})
+        return fmt(result, "Futures MACD List (all coins)")
+
+    # --- Per-pair history endpoints ---
+    elif action == "pair_rsi":
+        result = await client.get(
+            "/api/futures/indicators/rsi",
+            {"exchange": exchange, "symbol": pair, "interval": interval,
+             "limit": limit, "window": window, "series_type": series_type},
+        )
+        return fmt(result, f"RSI — {pair} ({exchange}, {interval}, w{window})")
+
+    elif action == "pair_ma":
+        result = await client.get(
+            "/api/futures/indicators/ma",
+            {"exchange": exchange, "symbol": pair, "interval": interval,
+             "limit": limit, "window": window, "series_type": series_type},
+        )
+        return fmt(result, f"MA — {pair} ({exchange}, {interval}, w{window})")
+
+    elif action == "pair_ema":
+        result = await client.get(
+            "/api/futures/indicators/ema",
+            {"exchange": exchange, "symbol": pair, "interval": interval,
+             "limit": limit, "window": window, "series_type": series_type},
+        )
+        return fmt(result, f"EMA — {pair} ({exchange}, {interval}, w{window})")
+
+    elif action == "pair_macd":
+        result = await client.get(
+            "/api/futures/indicators/macd",
+            {"exchange": exchange, "symbol": pair, "interval": interval,
+             "limit": limit, "series_type": series_type,
+             "fast_window": fast_window, "slow_window": slow_window,
+             "signal_window": signal_window},
+        )
+        return fmt(result, f"MACD — {pair} ({exchange}, {interval}, {fast_window}/{slow_window}/{signal_window})")
+
+    elif action == "pair_atr":
+        result = await client.get(
+            "/api/futures/indicators/avg-true-range",
+            {"exchange": exchange, "symbol": pair, "interval": interval,
+             "limit": limit, "window": window},
+        )
+        return fmt(result, f"ATR — {pair} ({exchange}, {interval}, w{window})")
+
+    elif action == "whale_index":
+        result = await client.get(
+            "/api/futures/whale-index/history",
+            {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit},
+        )
+        return fmt(result, f"Whale Index — {pair} ({exchange}, {interval})")
+
+    else:
+        return (
+            f"Unknown action '{action}'. Available: "
+            "rsi_list, ma_list, ema_list, macd_list, "
+            "pair_rsi, pair_ma, pair_ema, pair_macd, pair_atr, whale_index"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CATEGORY TOOL — Index, News & Other (3 endpoints)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def coinglass_index_news_cat(
+    action: str = "altcoin_season",
+    symbol: str = "BTC",
+    exchange: str = DEFAULT_EXCHANGE,
+    interval: str = "1h",
+    limit: int = 100,
+    language: str = "en",
+    page: int = 1,
+    per_page: int = 20,
+) -> str:
+    """Index, Volume Ratio & News — 3 endpoints in one tool.
+
+Actions:
+- altcoin_season: Altcoin Season Index history (no params needed)
+- futures_spot_ratio: Futures vs Spot volume ratio (exchange_list + coin + interval)
+- news: Latest crypto news articles (language: en/zh/zh-tw, paginated)
+
+Args:
+    action: One of the actions listed above
+    symbol: Coin symbol for futures_spot_ratio (BTC, ETH)
+    exchange: Exchange or comma-separated list for futures_spot_ratio
+    interval: Candle interval for futures_spot_ratio (1m, 5m, 1h, 4h, 1d)
+    limit: Data points for futures_spot_ratio (max 1000)
+    language: For news — 'en', 'zh', 'zh-tw'
+    page: Page number for news
+    per_page: Items per page for news
+    """
+    action = action.strip().lower()
+    sym = normalize_symbol(symbol)
+
+    if action == "altcoin_season":
+        result = await client.get("/api/index/altcoin-season", {})
+        return fmt(result, "Altcoin Season Index")
+
+    elif action == "futures_spot_ratio":
+        result = await client.get(
+            "/api/futures_spot_volume_ratio",
+            {"exchange_list": exchange, "symbol": sym,
+             "interval": interval, "limit": limit},
+        )
+        return fmt(result, f"Futures/Spot Volume Ratio — {sym} ({exchange}, {interval})")
+
+    elif action == "news":
+        result = await client.get(
+            "/api/article/list",
+            {"language": language, "page": page, "per_page": per_page},
+        )
+        return fmt(result, f"Crypto News ({language}, page {page})")
+
+    else:
+        return (
+            f"Unknown action '{action}'. Available: "
+            "altcoin_season, futures_spot_ratio, news"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMPOSITE TOOL — Ricoz Full Scan (HARDENED)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Critical metrics — if ANY fails, analysis is BLOCKED
+CRITICAL_METRICS = {"Spot CVD", "Futures CVD", "Open Interest"}
+# Supplementary metrics — partial failure is OK
+SUPPLEMENTARY_METRICS = {
+    "Funding Rate", "Orderbook Delta", "Liquidation Map",
+    "Price OHLC", "Taker Buy/Sell", "Long/Short Ratio",
+}
 
 
 @mcp.tool()
 async def coinglass_full_scan(
     symbol: str = "BTC",
     interval: str = "5m",
+    exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
-    """ALL-IN-ONE scan for a coin — Ricoz Scalping Framework complete analysis.
+    """ALL-IN-ONE scan — Ricoz Scalping Framework complete analysis.
 
-    Fetches ALL key metrics in one call:
-    1. Spot CVD (VETO signal)
-    2. Futures CVD (entry filter)
-    3. Funding Rate (sentiment)
-    4. Open Interest (positioning)
-    5. Orderbook Delta (pressure)
-    6. Liquidation Map (targets)
-    7. Price OHLC (context)
-    8. Taker Buy/Sell (aggressor)
-    9. Long/Short Ratio (sentiment)
+    Fetches 9 metrics with safety checks:
+    - CRITICAL (SpotCVD + FutCVD + OI): ALL must succeed or analysis BLOCKED
+    - SUPPLEMENTARY (FR, Liq, OB, Price, Taker, L/S): partial OK
 
     Use this for quick comprehensive analysis before entering a trade.
 
     Args:
         symbol: Coin symbol (BTC, ETH, SOL, HYPE, AVAX, etc.)
         interval: Candle interval for time-series data (5m recommended for scalping)
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
     """
     import asyncio
 
-    limit = 50  # Less data per metric for composite call
+    sym = normalize_symbol(symbol)
+    pair = to_pair(symbol)
+    limit = 50
 
-    # Fetch all data concurrently
-    results = await asyncio.gather(
-        client.get("/api/spot/aggregated-cvd-history", {
-            "symbol": symbol, "interval": interval, "limit": limit,
-        }),
-        client.get("/api/futures/aggregated-cvd-history", {
-            "symbol": symbol, "interval": interval, "limit": limit,
-        }),
-        client.get("/api/futures/funding-rate/exchange-list", {
-            "symbol": symbol,
-        }),
-        client.get("/api/futures/openInterest/ohlc-aggregated-history", {
-            "symbol": symbol, "interval": interval, "limit": limit,
-        }),
-        client.get("/api/futures/aggregated-orderbook-history", {
-            "symbol": symbol, "interval": interval, "limit": limit,
-        }),
-        client.get("/api/futures/liquidation/aggregated-map", {
-            "symbol": symbol,
-        }),
-        client.get("/api/futures/price/ohlc-history", {
-            "symbol": symbol, "interval": interval, "limit": limit,
-        }),
-        client.get("/api/futures/taker-buysell-volume", {
-            "symbol": symbol, "interval": interval, "limit": limit,
-        }),
-        client.get("/api/futures/global-longshort-account-ratio", {
-            "symbol": symbol, "interval": interval, "limit": limit,
-        }),
-        return_exceptions=True,
-    )
-
-    labels = [
-        "Spot CVD", "Futures CVD", "Funding Rate", "Open Interest",
-        "Orderbook Delta", "Liquidation Map", "Price OHLC",
-        "Taker Buy/Sell", "Long/Short Ratio",
+    # Define all endpoints with their labels and criticality
+    # V4 API: some endpoints need coin-level (BTC), some need pair-level (BTCUSDT)
+    calls = [
+        ("Spot CVD", "/api/spot/aggregated-cvd/history",
+         {"exchange_list": exchange, "symbol": sym, "interval": interval, "limit": limit}),
+        ("Futures CVD", "/api/futures/aggregated-cvd/history",
+         {"exchange_list": exchange, "symbol": sym, "interval": interval, "limit": limit}),
+        ("Open Interest", "/api/futures/open-interest/aggregated-history",
+         {"exchange_list": exchange, "symbol": sym, "interval": interval, "limit": limit}),
+        ("Funding Rate", "/api/futures/funding-rate/exchange-list",
+         {}),
+        ("Orderbook Delta", "/api/futures/orderbook/aggregated-ask-bids-history",
+         {"exchange_list": exchange, "symbol": sym, "interval": interval, "range": "1", "limit": limit}),
+        ("Price OHLC", "/api/futures/price/history",
+         {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit}),
+        ("Taker Buy/Sell", "/api/futures/aggregated-taker-buy-sell-volume/history",
+         {"exchange_list": exchange, "symbol": sym, "interval": interval, "limit": limit}),
+        ("Long/Short Ratio", "/api/futures/global-long-short-account-ratio/history",
+         {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit}),
     ]
+    # Only include Liquidation Heatmap if plan supports it
+    if config.has_feature("liquidation_heatmap"):
+        calls.append(("Liquidation Heatmap", "/api/futures/liquidation/heatmap/model1",
+                       {"exchange": exchange, "symbol": pair, "range": "3d"}))
 
-    # FIX #12: Track errors explicitly — don't hide failures
-    output = f"# FULL SCAN — {symbol} ({interval})\n\n"
-    output += "**Ricoz Scalping Framework — Complete Analysis**\n\n"
+    # Fetch all data — rate limiter serializes with 200ms spacing
+    tasks = [client.get(ep, params) for _, ep, params in calls]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    error_count = 0
-    for label, result in zip(labels, results):
+    # Post-filter: FR exchange-list returns all coins, extract only target symbol
+    for i, (label, _, _) in enumerate(calls):
+        if label == "Funding Rate" and isinstance(raw_results[i], FetchResult):
+            fr_result = raw_results[i]
+            if isinstance(fr_result.data, list):
+                filtered = [c for c in fr_result.data
+                            if c.get("symbol", "").upper() == sym]
+                raw_results[i] = FetchResult(
+                    data=_format_fr_compact(filtered, sym),
+                    age_seconds=fr_result.age_seconds,
+                    is_cached=fr_result.is_cached,
+                    fetched_at=fr_result.fetched_at,
+                )
+
+    # Build status map
+    scan_time = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+    output = f"# FULL SCAN — {sym} ({interval})\n"
+    output += f"**Scan time:** {scan_time}\n\n"
+
+    # Status checklist
+    output += "## Metric Status\n"
+    critical_failed = []
+    supplementary_failed = []
+    max_age = 0.0
+
+    for (label, _, _), result in zip(calls, raw_results):
+        is_critical = label in CRITICAL_METRICS
+        tag = "CRITICAL" if is_critical else "SUPPORT"
+
+        if isinstance(result, Exception):
+            status = f"FAILED ({client._mask_key(str(result))})"
+            icon = "X"
+            if is_critical:
+                critical_failed.append(label)
+            else:
+                supplementary_failed.append(label)
+        elif isinstance(result, FetchResult):
+            if result.is_expired:
+                status = f"EXPIRED ({result.age_seconds:.0f}s old)"
+                icon = "X"
+                if is_critical:
+                    critical_failed.append(label)
+                else:
+                    supplementary_failed.append(label)
+            elif result.is_stale:
+                status = f"STALE ({result.age_seconds:.0f}s)"
+                icon = "~"
+                if is_critical:
+                    critical_failed.append(f"{label} (STALE)")
+            else:
+                status = f"OK ({result.age_label})"
+                icon = "+"
+            max_age = max(max_age, result.age_seconds)
+        else:
+            status = "UNKNOWN"
+            icon = "?"
+
+        output += f"- [{icon}] **{label}** [{tag}]: {status}\n"
+
+    output += "\n"
+
+    # HARD BLOCK if critical metrics failed
+    if critical_failed:
+        output += (
+            f"## ANALYSIS BLOCKED\n\n"
+            f"**CRITICAL METRICS FAILED: {', '.join(critical_failed)}**\n\n"
+            f"SpotCVD + FutCVD + OI are the MINIMUM required dataset for "
+            f"Ricoz Scalping Framework analysis. Without ALL three, any "
+            f"conclusion would be unreliable.\n\n"
+            f"**ACTION: DO NOT TRADE based on this scan. Re-run or check individual tools.**\n\n"
+        )
+        if supplementary_failed:
+            output += f"Also failed (supplementary): {', '.join(supplementary_failed)}\n\n"
+        return output
+
+    # Data sections
+    for (label, _, _), result in zip(calls, raw_results):
         output += f"---\n\n## {label}\n\n"
         if isinstance(result, Exception):
-            error_count += 1
-            output += f"**⚠ FAILED:** {result}\n\n"
-        elif result is None:
-            error_count += 1
-            output += "**⚠ FAILED:** No data returned\n\n"
-        elif isinstance(result, list):
-            if len(result) == 0:
-                output += "**WARNING:** Empty dataset returned\n\n"
-            elif len(result) > 10:
-                output += json.dumps(result[-10:], indent=2, default=str) + "\n\n"
+            output += f"**FAILED:** {client._mask_key(str(result))}\n\n"
+        elif isinstance(result, FetchResult):
+            output += _age_banner(result)
+            data = result.data
+            if isinstance(data, list):
+                if len(data) == 0:
+                    output += "**Empty dataset**\n\n"
+                elif label == "Funding Rate":
+                    # FR: show ALL exchanges (already filtered to 1 symbol)
+                    output += json.dumps(data, indent=2, default=str) + "\n\n"
+                elif len(data) > 10:
+                    # Time-series: show last 10 (most recent)
+                    output += f"*(last 10 of {len(data)})*\n"
+                    output += json.dumps(data[-10:], indent=2, default=str) + "\n\n"
+                else:
+                    output += json.dumps(data, indent=2, default=str) + "\n\n"
             else:
-                output += json.dumps(result, indent=2, default=str) + "\n\n"
-        else:
-            output += json.dumps(result, indent=2, default=str) + "\n\n"
+                output += json.dumps(data, indent=2, default=str) + "\n\n"
 
-    # FIX #13: Show error summary at top level
-    if error_count > 0:
+    # Warnings
+    if supplementary_failed:
         output += (
-            f"---\n\n"
-            f"## ⚠ DATA INTEGRITY WARNING\n\n"
-            f"**{error_count} of 9 metrics FAILED to load.** "
-            f"Analysis below may be INCOMPLETE. Do NOT trade based on partial data.\n\n"
+            f"---\n\n## DATA GAPS\n\n"
+            f"**Missing supplementary metrics:** {', '.join(supplementary_failed)}\n"
+            f"Core analysis (SpotCVD/FutCVD/OI) is valid but be cautious "
+            f"with incomplete supporting data.\n\n"
         )
 
+    if max_age > STALE_WARNING_THRESHOLD:
+        output += (
+            f"## STALENESS WARNING\n\n"
+            f"**Oldest data in this scan: {max_age:.0f}s**. "
+            f"Some metrics may not reflect current market conditions.\n\n"
+        )
+
+    # Analysis checklist
     output += (
         "---\n\n"
-        "## Analysis Checklist (Ricoz Framework)\n\n"
-        f"1. **SpotCVD**: Check direction — if negative, DO NOT LONG {symbol}\n"
-        "2. **FutCVD**: Should align with SpotCVD direction\n"
-        "3. **FR**: Extreme = contrarian signal\n"
-        "4. **OI**: Rising + price direction = trend strength\n"
+        "## Ricoz Framework Checklist\n\n"
+        f"1. **SpotCVD**: If negative → DO NOT LONG {sym}\n"
+        "2. **FutCVD**: Must align with SpotCVD direction\n"
+        "3. **OI**: Rising + price direction = trend strength\n"
+        "4. **FR**: Extreme = contrarian signal\n"
         "5. **OBDelta**: Confirm buy/sell pressure\n"
         "6. **Liq Map**: Set TP near liquidation clusters\n"
         "7. **Taker**: Confirm aggressor side\n"
@@ -636,18 +1957,16 @@ async def coinglass_full_scan(
 # HISTORICAL & TREND TOOLS (19-22) — Persistent Storage
 # ═══════════════════════════════════════════════════════════════════════════════
 
-
-# Endpoint mapping for historical lookups
 ENDPOINT_MAP = {
-    "spot_cvd": "/api/spot/aggregated-cvd-history",
-    "futures_cvd": "/api/futures/aggregated-cvd-history",
+    "spot_cvd": "/api/spot/aggregated-cvd/history",
+    "futures_cvd": "/api/futures/aggregated-cvd/history",
     "funding_rate": "/api/futures/funding-rate/exchange-list",
-    "open_interest": "/api/futures/openInterest/ohlc-aggregated-history",
-    "orderbook": "/api/futures/aggregated-orderbook-history",
-    "liquidation": "/api/futures/liquidation/aggregated-history",
-    "price": "/api/futures/price/ohlc-history",
-    "taker": "/api/futures/taker-buysell-volume",
-    "long_short": "/api/futures/global-longshort-account-ratio",
+    "open_interest": "/api/futures/open-interest/aggregated-history",
+    "orderbook": "/api/futures/orderbook/aggregated-ask-bids-history",
+    "liquidation": "/api/futures/liquidation/history",
+    "price": "/api/futures/price/history",
+    "taker": "/api/futures/aggregated-taker-buy-sell-volume/history",
+    "long_short": "/api/futures/global-long-short-account-ratio/history",
 }
 
 
@@ -657,6 +1976,7 @@ async def coinglass_compare(
     metric: str = "spot_cvd",
     hours_ago: float = 1.0,
     interval: str = "5m",
+    exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
     """Compare current data with historical data — see if metric went UP or DOWN.
 
@@ -669,56 +1989,83 @@ async def coinglass_compare(
                 orderbook, liquidation, price, taker, long_short
         hours_ago: How many hours back to compare (e.g., 0.5, 1, 2, 4, 8, 24)
         interval: Candle interval for time-series metrics
+        exchange: Exchange name (Binance, OKX, Bybit, etc.)
     """
     endpoint = ENDPOINT_MAP.get(metric)
     if not endpoint:
         available = ", ".join(ENDPOINT_MAP.keys())
         return f"**ERROR:** Unknown metric '{metric}'. Available: {available}"
 
-    # Get current data (fresh from API)
-    params = {"symbol": symbol, "interval": interval, "limit": 20}
-    if metric == "funding_rate":
-        params = {"symbol": symbol}
+    sym = normalize_symbol(symbol)
+    pair = to_pair(symbol)
 
-    current = None
+    # Build params per V4 API requirements
+    if metric == "funding_rate":
+        params = {}
+    elif metric == "orderbook":
+        params = {"exchange_list": exchange, "symbol": sym, "interval": interval, "range": "1", "limit": 20}
+    elif metric in ("spot_cvd", "futures_cvd"):
+        # Aggregated CVD: exchange_list + coin
+        params = {"exchange_list": exchange, "symbol": sym, "interval": interval, "limit": 20}
+    elif metric == "taker":
+        # Aggregated taker: exchange_list + coin
+        params = {"exchange_list": exchange, "symbol": sym, "interval": interval, "limit": 20}
+    elif metric in ("price", "long_short", "liquidation"):
+        # Pair-level: exchange + pair
+        params = {"exchange": exchange, "symbol": pair, "interval": interval, "limit": 20}
+    else:
+        # Aggregated coin-level (open_interest): exchange_list + coin
+        params = {"exchange_list": exchange, "symbol": sym, "interval": interval, "limit": 20}
+
+    current: FetchResult | None = None
     current_err = ""
     try:
         current = await client.get(endpoint, params)
     except Exception as e:
         current_err = str(e)
 
-    # Get historical from storage (returns dict with age metadata)
-    historical = client.storage.get_historical(endpoint, symbol, hours_ago, interval)
+    # Get historical from storage
+    historical = await client.storage.aget_historical(endpoint, sym, hours_ago, interval)
 
-    output = f"## Compare {metric.upper()} — {symbol}\n"
-    output += f"**Now vs {hours_ago}h ago**\n\n"
+    output = f"## Compare {metric.upper()} — {sym}\n"
 
-    # FIX #10: Always show data source and freshness
     if current is not None:
-        output += "### Current (LIVE from API)\n"
-        if isinstance(current, list) and len(current) > 5:
-            output += json.dumps(current[-5:], indent=2, default=str) + "\n\n"
+        output += f"### Current\n"
+        output += _age_banner(current)
+        data = current.data
+        if isinstance(data, list) and len(data) > 5:
+            output += json.dumps(data[-5:], indent=2, default=str) + "\n\n"
         else:
-            output += json.dumps(current, indent=2, default=str) + "\n\n"
+            output += json.dumps(data, indent=2, default=str) + "\n\n"
     else:
         output += f"### Current\n**ERROR fetching live data:** {current_err}\n\n"
 
     if historical is not None:
         age = historical["age_minutes"]
         hist_data = historical["data"]
-        from datetime import datetime
-        ts = datetime.fromtimestamp(historical["fetched_at"]).strftime("%Y-%m-%d %H:%M:%S")
+        ts = datetime.fromtimestamp(
+            historical["fetched_at"], tz=WIB
+        ).strftime("%Y-%m-%d %H:%M:%S WIB")
+
+        # Accurate header: show actual snapshot age, not requested
+        actual_h = age / 60
+        output = output.replace(
+            f"## Compare {metric.upper()} — {sym}\n",
+            f"## Compare {metric.upper()} — {sym}\n"
+            f"**Now vs {actual_h:.1f}h ago** "
+            f"(requested {hours_ago}h, closest snapshot: {age:.0f}min ago)\n\n",
+        )
+
         output += f"### Historical (from storage)\n"
         output += f"**Stored at:** {ts} ({age:.0f} minutes ago)\n\n"
 
-        # FIX #11: Warn if stored data age doesn't match requested hours_ago
         expected_age_min = hours_ago * 60
         drift = abs(age - expected_age_min)
         if drift > 30:
             output += (
-                f"**⚠ DATA AGE WARNING:** You requested {hours_ago}h ago, "
-                f"but closest stored data is {age:.0f} min ago "
-                f"(drift: {drift:.0f} min). Interpret with caution.\n\n"
+                f"**WARNING:** No snapshot from {hours_ago}h ago. "
+                f"Using closest available: {age:.0f}min ago "
+                f"(drift {drift:.0f}min). Interpret with caution.\n\n"
             )
 
         if isinstance(hist_data, list) and len(hist_data) > 5:
@@ -760,36 +2107,59 @@ async def coinglass_trend(
         available = ", ".join(ENDPOINT_MAP.keys())
         return f"Unknown metric '{metric}'. Available: {available}"
 
-    snapshots = client.storage.get_trend(endpoint, symbol, hours, interval)
+    sym = normalize_symbol(symbol)
+    snapshots = await client.storage.aget_trend(endpoint, sym, hours, interval)
 
-    output = f"## Trend {metric.upper()} — {symbol} (last {hours}h)\n\n"
+    output = f"## Trend {metric.upper()} — {sym} (last {hours}h)\n\n"
 
     if not snapshots:
         output += (
-            f"*No stored snapshots found for {symbol} {metric} in the last {hours}h.*\n\n"
+            f"*No stored snapshots found for {sym} {metric} in the last {hours}h.*\n\n"
             "**Tip:** Data is stored automatically each time you query a metric. "
-            "Use `coinglass_spot_cvd`, `coinglass_open_interest`, etc. periodically "
-            "to build up historical snapshots for trend analysis.\n"
+            "Use the individual tools periodically to build up historical "
+            "snapshots for trend analysis.\n"
         )
         return output
 
     output += f"**{len(snapshots)} snapshots found**\n\n"
 
-    from datetime import datetime
-
-    for i, snap in enumerate(snapshots):
-        ts = datetime.fromtimestamp(snap["fetched_at"]).strftime("%H:%M:%S")
+    # Extract CVD/value from each snapshot for reset detection
+    cvd_values = []
+    for snap in snapshots:
+        ts = datetime.fromtimestamp(
+            snap["fetched_at"], tz=WIB
+        ).strftime("%H:%M:%S WIB")
         age = snap["age_minutes"]
         data = snap["data"]
-        # Show summary for each snapshot with age
         age_label = f"{age:.0f}min ago"
         if isinstance(data, list) and len(data) > 0:
             last = data[-1] if isinstance(data[-1], dict) else data[-1]
-            output += f"**{ts}** ({age_label}) — last entry: {json.dumps(last, default=str)}\n\n"
+            output += f"**{ts}** ({age_label}) — last: {json.dumps(last, default=str)}\n\n"
+            # Track CVD values for reset detection
+            if isinstance(last, dict):
+                for key in ("cum_vol_delta", "cvd", "v", "value"):
+                    if key in last:
+                        cvd_values.append((ts, float(last[key])))
+                        break
         elif isinstance(data, dict):
             output += f"**{ts}** ({age_label}) — {json.dumps(data, default=str)[:200]}\n\n"
         else:
             output += f"**{ts}** ({age_label}) — {str(data)[:200]}\n\n"
+
+    # Detect CVD resets (sudden drops >40% between consecutive snapshots)
+    if "cvd" in metric and len(cvd_values) >= 2:
+        for i in range(1, len(cvd_values)):
+            prev_ts, prev_val = cvd_values[i - 1]
+            curr_ts, curr_val = cvd_values[i]
+            if prev_val != 0:
+                change_pct = (curr_val - prev_val) / abs(prev_val) * 100
+                if change_pct < -40:
+                    output += (
+                        f"**CVD RESET DETECTED** between {prev_ts} → {curr_ts} "
+                        f"(drop {change_pct:.0f}%)\n"
+                        f"This is likely a daily CVD reset, NOT a bearish signal. "
+                        f"Verify against raw chart before interpreting.\n\n"
+                    )
 
     return output
 
@@ -801,9 +2171,19 @@ async def coinglass_storage_stats() -> str:
     Shows total records, oldest/newest data, top symbols tracked.
     Use this to check if historical data is available for trend analysis.
     """
-    stats = client.storage.get_stats()
+    stats = await client.storage.aget_stats()
     output = "## Storage Statistics\n\n"
     output += json.dumps(stats, indent=2, default=str) + "\n\n"
+
+    # Rate limit info
+    if client._rate_limiter:
+        rl = client._rate_limiter.usage
+        output += (
+            f"## Rate Limit Status\n\n"
+            f"- Used: {rl['used']}/{rl['limit']} req/min\n"
+            f"- Remaining: {rl['remaining']}\n\n"
+        )
+
     output += (
         "**How it works:**\n"
         "- Every API call is automatically stored in SQLite\n"

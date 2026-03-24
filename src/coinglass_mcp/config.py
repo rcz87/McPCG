@@ -50,8 +50,87 @@ INTERVAL_MAP = {
 # ─── API Constants ────────────────────────────────────────────────────────────
 
 BASE_URL = "https://open-api-v4.coinglass.com"
-DEFAULT_TIMEOUT = 30  # seconds
+DEFAULT_TIMEOUT = 10  # seconds (was 30 — tightened per audit)
 CACHE_TTL = 60  # seconds
+DEFAULT_EXCHANGE = "Binance"  # Default exchange for endpoints that require it
+
+# Stale data thresholds (seconds)
+STALE_WARNING_THRESHOLD = 120   # 2 min → WARNING
+STALE_EXPIRED_THRESHOLD = 300   # 5 min → DO NOT USE
+
+# Rate limiter
+MIN_REQUEST_SPACING = 0.2  # 200ms between requests
+
+# ─── Symbol Normalization ────────────────────────────────────────────────────
+
+SYMBOL_ALIASES = {
+    "BITCOIN": "BTC",
+    "ETHEREUM": "ETH",
+    "SOLANA": "SOL",
+    "RIPPLE": "XRP",
+    "CARDANO": "ADA",
+    "DOGECOIN": "DOGE",
+    "AVALANCHE": "AVAX",
+    "POLKADOT": "DOT",
+    "CHAINLINK": "LINK",
+    "POLYGON": "MATIC",
+    "LITECOIN": "LTC",
+    "UNISWAP": "UNI",
+    "COSMOS": "ATOM",
+    "NEAR": "NEAR",
+    "ARBITRUM": "ARB",
+    "OPTIMISM": "OP",
+    "FANTOM": "FTM",
+    "INJECTIVE": "INJ",
+    "CELESTIA": "TIA",
+    "SEI": "SEI",
+    "SUI": "SUI",
+    "APTOS": "APT",
+    "PEPE": "PEPE",
+    "BONK": "BONK",
+    "WIF": "WIF",
+    "HYPERLIQUID": "HYPE",
+    "JUPITER": "JUP",
+    "ONDO": "ONDO",
+    "PENDLE": "PENDLE",
+}
+
+STRIP_SUFFIXES = [
+    "/USDT", "/USD", "/BUSD", "/USDC",
+    "-PERP", "-SWAP", ".P",
+    "USDT", "BUSD", "USDC", "USD",
+    "PERP",
+]
+
+
+def normalize_symbol(raw: str) -> str:
+    """Normalize a trading symbol for CoinGlass API.
+
+    Handles: btc → BTC, BTCUSDT → BTC, BTC/USDT → BTC, btc-perp → BTC,
+    bitcoin → BTC, etc.
+    """
+    s = raw.strip().upper()
+    # Check aliases first (BITCOIN → BTC)
+    if s in SYMBOL_ALIASES:
+        return SYMBOL_ALIASES[s]
+    # Strip common suffixes (longest first to avoid partial matches)
+    for suffix in sorted(STRIP_SUFFIXES, key=len, reverse=True):
+        if s.endswith(suffix) and len(s) > len(suffix):
+            s = s[: -len(suffix)]
+            break
+    return s
+
+
+def to_pair(symbol: str, quote: str = "USDT") -> str:
+    """Convert coin symbol to trading pair for endpoints that need pair format.
+
+    BTC → BTCUSDT, ETH → ETHUSDT, etc.
+    """
+    sym = normalize_symbol(symbol)
+    return f"{sym}{quote}"
+
+
+# ─── Config Dataclass ────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -63,6 +142,7 @@ class Config:
     host: str = "0.0.0.0"
     port: int = 8787
     cache_ttl: int = CACHE_TTL
+    auth_token: str = ""  # Bearer token for MCP access control
 
     @classmethod
     def from_env(cls) -> Config:
@@ -72,6 +152,7 @@ class Config:
             host=os.getenv("MCP_HOST", "0.0.0.0"),
             port=int(os.getenv("MCP_PORT", "8787")),
             cache_ttl=int(os.getenv("CACHE_TTL", str(CACHE_TTL))),
+            auth_token=os.getenv("MCP_AUTH_TOKEN", ""),
         )
 
     @property

@@ -1,6 +1,6 @@
-"""Tests for config module."""
+"""Tests for config module — includes symbol normalization."""
 
-from coinglass_mcp.config import Config, PLAN_TIERS, INTERVAL_MAP
+from coinglass_mcp.config import Config, PLAN_TIERS, INTERVAL_MAP, normalize_symbol, to_pair, DEFAULT_EXCHANGE
 import pytest
 
 
@@ -59,3 +59,22 @@ def test_config_from_env_defaults(monkeypatch):
     assert cfg.plan == "standard"
     assert cfg.port == 8787
     assert cfg.host == "0.0.0.0"
+
+
+def test_to_pair_basic():
+    """to_pair should convert coin symbol to trading pair."""
+    assert to_pair("BTC") == "BTCUSDT"
+    assert to_pair("ETH") == "ETHUSDT"
+    assert to_pair("sol") == "SOLUSDT"
+
+
+def test_to_pair_from_raw():
+    """to_pair should normalize first, then append USDT."""
+    assert to_pair("BTCUSDT") == "BTCUSDT"
+    assert to_pair("bitcoin") == "BTCUSDT"
+    assert to_pair("eth/usdt") == "ETHUSDT"
+
+
+def test_default_exchange():
+    """Default exchange should be Binance."""
+    assert DEFAULT_EXCHANGE == "Binance"
