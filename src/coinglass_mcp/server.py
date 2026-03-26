@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 from .arkham import register_arkham_tools
+from .nansen import register_nansen_tools
 from .binance_client import (
     close_client as close_binance_client,
     binance_futures_request,
@@ -73,6 +74,9 @@ mcp = FastMCP(
 
 # ─── Register Arkham Intel Tools ──────────────────────────────────────────────
 register_arkham_tools(mcp)
+
+# ─── Register Nansen Smart Money Tools ────────────────────────────────────────
+register_nansen_tools(mcp)
 
 
 # ─── Formatting Helpers ──────────────────────────────────────────────────────
