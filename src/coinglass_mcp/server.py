@@ -22,6 +22,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
+from .binance_client import close_client as close_binance_client
 from .client import CoinGlassClient, FetchResult
 from .config import (
     DEFAULT_EXCHANGE,
@@ -48,15 +49,17 @@ async def lifespan(app):
         yield
     finally:
         await client.close()
+        await close_binance_client()
 
 
 mcp = FastMCP(
     name="coinglass-mcp",
     instructions=(
-        "CoinGlass crypto derivatives analytics for order flow trading. "
-        "Provides SpotCVD, FuturesCVD, Funding Rate, Open Interest, "
-        "Liquidation, Orderbook, and more — optimized for Ricoz Scalping Framework. "
-        "IMPORTANT: Always check data_age in responses. "
+        "CoinGlass + Binance crypto derivatives analytics for order flow trading. "
+        "CoinGlass: SpotCVD, FuturesCVD, Funding Rate, Open Interest, Liquidation, Orderbook. "
+        "Binance: Direct market data — spot prices, futures OI, funding rate, L/S ratio, taker volume, klines, depth. "
+        "Optimized for Ricoz Scalping Framework. "
+        "IMPORTANT: Always check data_age in CoinGlass responses. "
         "Data older than 2 minutes has WARNING. Data older than 5 minutes must NOT be used for entries."
     ),
     lifespan=lifespan,
@@ -1767,6 +1770,7 @@ SUPPLEMENTARY_METRICS = {
     "Funding Rate", "Orderbook Delta", "Liquidation Map",
     "Price OHLC", "Taker Buy/Sell", "Long/Short Ratio",
 }
+PRECISION_METRICS = {"Whale Alert", "OB Bidask ±1%", "Footprint", "RSI"}
 
 
 @mcp.tool()
@@ -1775,13 +1779,17 @@ async def coinglass_full_scan(
     interval: str = "5m",
     exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
-    """ALL-IN-ONE scan — Ricoz Scalping Framework complete analysis.
+    """ALL-IN-ONE 2-phase scan — Ricoz Scalping Framework (12 endpoints).
 
-    Fetches 9 metrics with safety checks:
+    Phase 1 — Quick Scan (8 core endpoints):
     - CRITICAL (SpotCVD + FutCVD + OI): ALL must succeed or analysis BLOCKED
-    - SUPPLEMENTARY (FR, Liq, OB, Price, Taker, L/S): partial OK
+    - SUPPLEMENTARY (FR, OB, Price, Taker, L/S): partial OK
 
-    Use this for quick comprehensive analysis before entering a trade.
+    Phase 2 — Pre-Entry Precision Check (4 endpoints, auto):
+    - Whale Alert: Hyperliquid whale positions >$1M (filtered by coin)
+    - OB Bidask ±1%: Real-time bids vs asks depth
+    - Footprint: Buy/sell absorption per price level (Standard+ plan)
+    - RSI: Overbought/oversold confirmation (>70 OB, <30 OS)
 
     Args:
         symbol: Coin symbol (BTC, ETH, SOL, HYPE, AVAX, etc.)
@@ -1819,9 +1827,36 @@ async def coinglass_full_scan(
         calls.append(("Liquidation Heatmap", "/api/futures/liquidation/heatmap/model1",
                        {"exchange": exchange, "symbol": pair, "range": "3d"}))
 
-    # Fetch all data — rate limiter serializes with 200ms spacing
-    tasks = [client.get(ep, params) for _, ep, params in calls]
+    # ── Phase 2: Precision endpoints ──
+    precision_calls = [
+        ("Whale Alert", "/api/hyperliquid/whale-alert", {}),
+        ("OB Bidask ±1%", "/api/futures/orderbook/ask-bids-history", {
+            "exchange": exchange, "symbol": pair,
+            "interval": interval, "limit": 3, "range": "1",
+        }),
+    ]
+    if config.has_feature("footprint"):
+        precision_calls.append(
+            ("Footprint", "/api/futures/volume/footprint-history", {
+                "exchange": exchange, "symbol": pair,
+                "interval": "5m", "limit": 3,
+            })
+        )
+    # RSI — available on Startup+ plans
+    precision_calls.append(
+        ("RSI", "/api/futures/indicators/rsi", {
+            "exchange": exchange, "symbol": pair,
+            "interval": interval, "limit": 3,
+        })
+    )
+
+    # Fetch ALL endpoints in one batch — rate limiter handles spacing
+    all_calls = calls + precision_calls
+    tasks = [client.get(ep, params) for _, ep, params in all_calls]
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Split Phase 2 results for later use
+    phase2_results = list(zip(precision_calls, raw_results[len(calls):]))
 
     # Post-filter: FR exchange-list returns all coins, extract only target symbol
     for i, (label, _, _) in enumerate(calls):
@@ -1843,7 +1878,7 @@ async def coinglass_full_scan(
     output += f"**Scan time:** {scan_time}\n\n"
 
     # Status checklist
-    output += "## Metric Status\n"
+    output += "## Phase 1 — Quick Scan Status\n"
     critical_failed = []
     supplementary_failed = []
     max_age = 0.0
@@ -1881,6 +1916,28 @@ async def coinglass_full_scan(
             icon = "?"
 
         output += f"- [{icon}] **{label}** [{tag}]: {status}\n"
+
+    # ── Phase 2 Precision Status ──
+    output += "\n**Phase 2 — Precision Endpoints:**\n"
+    for (p2_label, _, _), p2_result in phase2_results:
+        if isinstance(p2_result, Exception):
+            p2_status = f"FAILED ({client._mask_key(str(p2_result))})"
+            p2_icon = "X"
+        elif isinstance(p2_result, FetchResult):
+            if p2_result.is_expired:
+                p2_status = f"EXPIRED ({p2_result.age_seconds:.0f}s old)"
+                p2_icon = "X"
+            elif p2_result.is_stale:
+                p2_status = f"STALE ({p2_result.age_seconds:.0f}s)"
+                p2_icon = "~"
+            else:
+                p2_status = f"OK ({p2_result.age_label})"
+                p2_icon = "+"
+            max_age = max(max_age, p2_result.age_seconds)
+        else:
+            p2_status = "UNKNOWN"
+            p2_icon = "?"
+        output += f"- [{p2_icon}] **{p2_label}** [PRECISION]: {p2_status}\n"
 
     output += "\n"
 
@@ -1950,6 +2007,251 @@ async def coinglass_full_scan(
         "7. **Taker**: Confirm aggressor side\n"
         "8. **L/S Ratio**: Contrarian indicator\n"
     )
+
+    # ═════════════════════════════════════════════════════════════════
+    # PHASE 2 — PRE-ENTRY PRECISION CHECK
+    # ═════════════════════════════════════════════════════════════════
+    output += "\n---\n\n"
+    output += f"# PHASE 2 — PRE-ENTRY PRECISION CHECK ({sym})\n\n"
+    output += "## 🐋 WHALE CHECK\n\n"
+
+    # Build lookup for Phase 2 results
+    p2 = {}
+    for (p2_lbl, _, _), p2_res in phase2_results:
+        p2[p2_lbl] = p2_res
+
+    # ── Whale Alert ──
+    whale_result = p2.get("Whale Alert")
+    whale_entries = []
+    if isinstance(whale_result, FetchResult) and not whale_result.is_expired:
+        output += _age_banner(whale_result)
+        whale_data = whale_result.data
+        if isinstance(whale_data, list):
+            sym_whales = [
+                w for w in whale_data
+                if w.get("symbol", "").upper() == sym
+            ]
+            if sym_whales:
+                for w in sym_whales[:5]:
+                    direction = "LONG" if w.get("position_size", 0) > 0 else "SHORT"
+                    action_type = "OPEN" if w.get("position_action") == 1 else "CLOSE"
+                    size_usd = w.get("position_value_usd", 0)
+                    entry = w.get("entry_price", 0)
+                    whale_entries.append({
+                        "direction": direction, "action": action_type,
+                        "size_usd": size_usd, "entry": entry,
+                    })
+                    output += (
+                        f"- **Whale {action_type} {direction}**: "
+                        f"${size_usd:,.0f} @ ${entry:,.2f}\n"
+                    )
+                output += "\n"
+            else:
+                output += (
+                    f"**Whale Alert:** No {sym} whale positions "
+                    f"(>$1M) on Hyperliquid\n\n"
+                )
+        else:
+            output += "**Whale Alert:** No data available\n\n"
+    elif isinstance(whale_result, Exception):
+        output += (
+            f"**Whale Alert:** FAILED — "
+            f"{client._mask_key(str(whale_result))}\n\n"
+        )
+    else:
+        output += "**Whale Alert:** Data expired or unavailable\n\n"
+
+    # ── OB Bidask ±1% ──
+    ob_result = p2.get("OB Bidask ±1%")
+    ob_bids = 0.0
+    ob_asks = 0.0
+    if isinstance(ob_result, FetchResult) and not ob_result.is_expired:
+        output += _age_banner(ob_result)
+        ob_data = ob_result.data
+        if isinstance(ob_data, list) and ob_data:
+            latest = ob_data[-1]
+            ob_bids = latest.get("bids_usd", 0)
+            ob_asks = latest.get("asks_usd", 0)
+            dominant = "BIDS (buyers)" if ob_bids > ob_asks else "ASKS (sellers)"
+            ratio = ob_bids / ob_asks if ob_asks > 0 else float("inf")
+            output += (
+                f"**OB Bidask ±1%:** Bids ${ob_bids / 1e6:.1f}M vs "
+                f"Asks ${ob_asks / 1e6:.1f}M → **{dominant}** "
+                f"(ratio {ratio:.2f})\n\n"
+            )
+        else:
+            output += "**OB Bidask ±1%:** No data\n\n"
+    elif isinstance(ob_result, Exception):
+        output += (
+            f"**OB Bidask ±1%:** FAILED — "
+            f"{client._mask_key(str(ob_result))}\n\n"
+        )
+    else:
+        output += "**OB Bidask ±1%:** Data expired or unavailable\n\n"
+
+    # ── Footprint ──
+    fp_result = p2.get("Footprint")
+    fp_direction = None
+    if fp_result is not None:
+        if isinstance(fp_result, FetchResult) and not fp_result.is_expired:
+            output += _age_banner(fp_result)
+            fp_data = fp_result.data
+            if isinstance(fp_data, list) and fp_data:
+                latest_candle = fp_data[-1]
+                # Footprint format: [timestamp, [[price_start, price_end,
+                #   buy_vol, sell_vol, buy_quote, sell_quote,
+                #   buy_usdt, sell_usdt, buy_count, sell_count], ...]]
+                if isinstance(latest_candle, list) and len(latest_candle) >= 2:
+                    levels = latest_candle[1]
+                    total_buy = 0.0
+                    total_sell = 0.0
+                    max_imbalance = 0.0
+                    imbalance_level = 0.0
+                    imbalance_side = "BUY"
+                    for level in levels:
+                        if isinstance(level, list) and len(level) >= 8:
+                            buy_usdt = level[6]
+                            sell_usdt = level[7]
+                            price_mid = (level[0] + level[1]) / 2
+                            total_buy += buy_usdt
+                            total_sell += sell_usdt
+                            imbalance = abs(buy_usdt - sell_usdt)
+                            if imbalance > max_imbalance:
+                                max_imbalance = imbalance
+                                imbalance_level = price_mid
+                                imbalance_side = (
+                                    "BUY" if buy_usdt > sell_usdt
+                                    else "SELL"
+                                )
+                    fp_direction = "BUY" if total_buy > total_sell else "SELL"
+                    output += (
+                        f"**Footprint:** Absorption **{imbalance_side}** kuat "
+                        f"di ${imbalance_level:,.0f} "
+                        f"(total buy ${total_buy / 1e6:.2f}M vs "
+                        f"sell ${total_sell / 1e6:.2f}M)\n\n"
+                    )
+                else:
+                    output += "**Footprint:** Unexpected data format\n"
+                    output += (
+                        json.dumps(fp_data[-1:], indent=2, default=str)
+                        + "\n\n"
+                    )
+            else:
+                output += "**Footprint:** No data\n\n"
+        elif isinstance(fp_result, Exception):
+            output += (
+                f"**Footprint:** FAILED — "
+                f"{client._mask_key(str(fp_result))}\n\n"
+            )
+        else:
+            output += "**Footprint:** Data expired or unavailable\n\n"
+    else:
+        output += "**Footprint:** Not available (requires Standard+ plan)\n\n"
+
+    # ── RSI ──
+    rsi_result = p2.get("RSI")
+    rsi_value = None
+    rsi_label = ""
+    if isinstance(rsi_result, FetchResult) and not rsi_result.is_expired:
+        output += _age_banner(rsi_result)
+        rsi_data = rsi_result.data
+        if isinstance(rsi_data, list) and rsi_data:
+            latest_rsi = rsi_data[-1]
+            rsi_value = latest_rsi.get("rsi_value")
+            if rsi_value is not None:
+                if rsi_value >= 70:
+                    rsi_label = "OVERBOUGHT — contrarian SHORT zone"
+                elif rsi_value <= 30:
+                    rsi_label = "OVERSOLD — contrarian LONG zone"
+                elif rsi_value >= 60:
+                    rsi_label = "Bullish momentum"
+                elif rsi_value <= 40:
+                    rsi_label = "Bearish momentum"
+                else:
+                    rsi_label = "Neutral"
+                output += (
+                    f"**RSI ({interval}):** {rsi_value:.1f} — "
+                    f"**{rsi_label}**\n\n"
+                )
+            else:
+                output += "**RSI:** No rsi_value in response\n\n"
+        else:
+            output += "**RSI:** No data\n\n"
+    elif isinstance(rsi_result, Exception):
+        output += (
+            f"**RSI:** FAILED — "
+            f"{client._mask_key(str(rsi_result))}\n\n"
+        )
+    else:
+        output += "**RSI:** Data expired or unavailable\n\n"
+
+    # ── Conviction Summary ──
+    whale_long = sum(
+        w["size_usd"] for w in whale_entries
+        if w["action"] == "OPEN" and w["direction"] == "LONG"
+    )
+    whale_short = sum(
+        w["size_usd"] for w in whale_entries
+        if w["action"] == "OPEN" and w["direction"] == "SHORT"
+    )
+    whale_dir = None
+    if whale_long > 0 or whale_short > 0:
+        whale_dir = "LONG" if whale_long > whale_short else "SHORT"
+
+    ob_dir = None
+    if ob_bids > 0 or ob_asks > 0:
+        ob_dir = "LONG" if ob_bids > ob_asks else "SHORT"
+
+    output += "---\n\n## CONVICTION LEVEL\n\n"
+
+    signals = [s for s in [whale_dir, ob_dir, fp_direction] if s]
+    if len(signals) >= 2:
+        long_count = sum(
+            1 for s in signals if s in ("LONG", "BUY")
+        )
+        short_count = sum(
+            1 for s in signals if s in ("SHORT", "SELL")
+        )
+        if long_count >= 2:
+            output += (
+                "**Whale + OB + Footprint aligned LONG "
+                "→ HIGH CONVICTION**\n"
+            )
+        elif short_count >= 2:
+            output += (
+                "**Whale + OB + Footprint aligned SHORT "
+                "→ HIGH CONVICTION**\n"
+            )
+        else:
+            output += (
+                "**Mixed signals → WARNING, reduce size "
+                "or wait for alignment**\n"
+            )
+    elif len(signals) == 1:
+        output += (
+            f"**Only 1 precision signal ({signals[0]}) "
+            f"— moderate conviction, check Phase 1 alignment**\n"
+        )
+    else:
+        output += (
+            "**Insufficient precision data "
+            "— use Phase 1 analysis only**\n"
+        )
+
+    # RSI warning overlay
+    if rsi_value is not None:
+        if rsi_value >= 70:
+            output += (
+                f"\n⚠️ **RSI {rsi_value:.0f} OVERBOUGHT** "
+                "— jangan LONG di sini, tunggu pullback atau SHORT\n"
+            )
+        elif rsi_value <= 30:
+            output += (
+                f"\n⚠️ **RSI {rsi_value:.0f} OVERSOLD** "
+                "— jangan SHORT di sini, tunggu bounce atau LONG\n"
+            )
+
+    output += "\n"
     return output
 
 
@@ -2193,6 +2495,59 @@ async def coinglass_storage_stats() -> str:
         "- More queries = more history = better trend analysis\n"
     )
     return output
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BINANCE TOOLS — Direct market data (no API key needed)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from .binance_spot import (
+    binance_spot_price,
+    binance_spot_depth,
+    binance_spot_klines,
+    binance_spot_trades,
+    binance_spot_agg_trades,
+    binance_spot_ticker_24h,
+    binance_spot_book_ticker,
+    binance_spot_avg_price,
+)
+
+from .binance_futures import (
+    binance_futures_price,
+    binance_futures_funding_rate,
+    binance_futures_open_interest,
+    binance_futures_oi_history,
+    binance_futures_long_short_ratio,
+    binance_futures_top_ls_ratio,
+    binance_futures_taker_volume,
+    binance_futures_klines,
+    binance_futures_depth,
+    binance_futures_ticker_24h,
+    binance_futures_liquidation,
+)
+
+# Register Binance Spot tools
+mcp.tool()(binance_spot_price)
+mcp.tool()(binance_spot_depth)
+mcp.tool()(binance_spot_klines)
+mcp.tool()(binance_spot_trades)
+mcp.tool()(binance_spot_agg_trades)
+mcp.tool()(binance_spot_ticker_24h)
+mcp.tool()(binance_spot_book_ticker)
+mcp.tool()(binance_spot_avg_price)
+
+# Register Binance Futures tools
+mcp.tool()(binance_futures_price)
+mcp.tool()(binance_futures_funding_rate)
+mcp.tool()(binance_futures_open_interest)
+mcp.tool()(binance_futures_oi_history)
+mcp.tool()(binance_futures_long_short_ratio)
+mcp.tool()(binance_futures_top_ls_ratio)
+mcp.tool()(binance_futures_taker_volume)
+mcp.tool()(binance_futures_klines)
+mcp.tool()(binance_futures_depth)
+mcp.tool()(binance_futures_ticker_24h)
+mcp.tool()(binance_futures_liquidation)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
