@@ -121,13 +121,31 @@ def normalize_symbol(raw: str) -> str:
     return s
 
 
+# Coins that use "1000x" denomination on exchanges
+THOUSAND_COINS = {
+    "PEPE", "SHIB", "FLOKI", "BONK", "LUNC", "SATS", "RATS", "CAT",
+    "CHEEMS", "MOGGO", "APU", "WHY", "X", "STARL", "BABYDOGE",
+}
+
+
+def to_cg_symbol(symbol: str) -> str:
+    """Convert coin symbol to CoinGlass-compatible format.
+
+    Most coins: BTC → BTC, ETH → ETH
+    1000x coins: PEPE → 1000PEPE, SHIB → 1000SHIB, etc.
+    """
+    sym = normalize_symbol(symbol)
+    if sym in THOUSAND_COINS:
+        return f"1000{sym}"
+    return sym
+
+
 def to_pair(symbol: str, quote: str = "USDT") -> str:
     """Convert coin symbol to trading pair for endpoints that need pair format.
 
-    BTC → BTCUSDT, ETH → ETHUSDT, etc.
+    BTC → BTCUSDT, ETH → ETHUSDT, PEPE → 1000PEPEUSDT, etc.
     """
-    sym = normalize_symbol(symbol)
-    return f"{sym}{quote}"
+    return f"{to_cg_symbol(symbol)}{quote}"
 
 
 # ─── Config Dataclass ────────────────────────────────────────────────────────

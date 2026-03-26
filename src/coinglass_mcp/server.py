@@ -34,6 +34,7 @@ from .config import (
     STALE_WARNING_THRESHOLD,
     Config,
     normalize_symbol,
+    to_cg_symbol,
     to_pair,
 )
 
@@ -2114,12 +2115,13 @@ async def coinglass_full_scan(
     """
     import asyncio
 
-    sym = normalize_symbol(symbol)
+    sym = to_cg_symbol(symbol)  # PEPE→1000PEPE, BTC→BTC
+    raw_sym = normalize_symbol(symbol)  # Always base symbol for display
     pair = to_pair(symbol)
     limit = 50
 
     # Define all endpoints with their labels and criticality
-    # V4 API: some endpoints need coin-level (BTC), some need pair-level (BTCUSDT)
+    # V4 API: some endpoints need coin-level (1000PEPE), some need pair-level (1000PEPEUSDT)
     calls = [
         ("Spot CVD", "/api/spot/aggregated-cvd/history",
          {"exchange_list": exchange, "symbol": sym, "interval": interval, "limit": limit}),
@@ -2158,12 +2160,9 @@ async def coinglass_full_scan(
                 "interval": "5m", "limit": 3,
             })
         )
-    # RSI — available on Startup+ plans
+    # RSI — use rsi/list (all coins) then filter, because per-coin endpoint is broken
     precision_calls.append(
-        ("RSI", "/api/futures/indicators/rsi", {
-            "exchange": exchange, "symbol": pair,
-            "interval": interval, "limit": 3,
-        })
+        ("RSI", "/api/futures/rsi/list", {})
     )
 
     # Fetch ALL endpoints in one batch — rate limiter handles spacing
@@ -2208,9 +2207,9 @@ async def coinglass_full_scan(
             fr_result = raw_results[i]
             if isinstance(fr_result.data, list):
                 filtered = [c for c in fr_result.data
-                            if c.get("symbol", "").upper() == sym]
+                            if c.get("symbol", "").upper() in (sym, raw_sym)]
                 raw_results[i] = FetchResult(
-                    data=_format_fr_compact(filtered, sym),
+                    data=_format_fr_compact(filtered, raw_sym),
                     age_seconds=fr_result.age_seconds,
                     is_cached=fr_result.is_cached,
                     fetched_at=fr_result.fetched_at,
@@ -2218,7 +2217,7 @@ async def coinglass_full_scan(
 
     # Build status map
     scan_time = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
-    output = f"# FULL SCAN — {sym} ({interval})\n"
+    output = f"# FULL SCAN — {raw_sym} ({interval})\n"
     output += f"**Scan time:** {scan_time}\n\n"
 
     # Status checklist
@@ -2354,7 +2353,7 @@ async def coinglass_full_scan(
     output += (
         "---\n\n"
         "## Ricoz Framework Checklist\n\n"
-        f"1. **SpotCVD**: If negative → DO NOT LONG {sym}\n"
+        f"1. **SpotCVD**: If negative → DO NOT LONG {raw_sym}\n"
         "2. **FutCVD**: Must align with SpotCVD direction\n"
         "3. **OI**: Rising + price direction = trend strength\n"
         "4. **FR**: Extreme = contrarian signal\n"
@@ -2368,7 +2367,7 @@ async def coinglass_full_scan(
     # PHASE 2 — PRE-ENTRY PRECISION CHECK
     # ═════════════════════════════════════════════════════════════════
     output += "\n---\n\n"
-    output += f"# PHASE 2 — PRE-ENTRY PRECISION CHECK ({sym})\n\n"
+    output += f"# PHASE 2 — PRE-ENTRY PRECISION CHECK ({raw_sym})\n\n"
     output += "## 🐋 WHALE CHECK\n\n"
 
     # Build lookup for Phase 2 results
@@ -2385,7 +2384,7 @@ async def coinglass_full_scan(
         if isinstance(whale_data, list):
             sym_whales = [
                 w for w in whale_data
-                if w.get("symbol", "").upper() == sym
+                if w.get("symbol", "").upper() in (sym, raw_sym)
             ]
             if sym_whales:
                 for w in sym_whales[:5]:
@@ -2404,7 +2403,7 @@ async def coinglass_full_scan(
                 output += "\n"
             else:
                 output += (
-                    f"**Whale Alert:** No {sym} whale positions "
+                    f"**Whale Alert:** No {raw_sym} whale positions "
                     f"(>$1M) on Hyperliquid\n\n"
                 )
         else:
@@ -2504,7 +2503,7 @@ async def coinglass_full_scan(
     else:
         output += "**Footprint:** Not available (requires Standard+ plan)\n\n"
 
-    # ── RSI ──
+    # ── RSI (from rsi/list — filter by symbol) ──
     rsi_result = p2.get("RSI")
     rsi_value = None
     rsi_label = ""
@@ -2512,25 +2511,44 @@ async def coinglass_full_scan(
         output += _age_banner(rsi_result)
         rsi_data = rsi_result.data
         if isinstance(rsi_data, list) and rsi_data:
-            latest_rsi = rsi_data[-1]
-            rsi_value = latest_rsi.get("rsi_value")
-            if rsi_value is not None:
-                if rsi_value >= 70:
-                    rsi_label = "OVERBOUGHT — contrarian SHORT zone"
-                elif rsi_value <= 30:
-                    rsi_label = "OVERSOLD — contrarian LONG zone"
-                elif rsi_value >= 60:
-                    rsi_label = "Bullish momentum"
-                elif rsi_value <= 40:
-                    rsi_label = "Bearish momentum"
+            # rsi/list returns all coins — filter for our symbol
+            coin_rsi = None
+            for entry in rsi_data:
+                if isinstance(entry, dict) and entry.get("symbol", "").upper() in (sym, raw_sym):
+                    coin_rsi = entry
+                    break
+            if coin_rsi:
+                # Pick RSI for the closest matching interval
+                interval_map = {"1m": "15m", "3m": "15m", "5m": "15m", "15m": "15m",
+                                "30m": "1h", "1h": "1h", "2h": "4h", "4h": "4h",
+                                "8h": "12h", "12h": "12h", "1d": "24h"}
+                rsi_key = f"rsi_{interval_map.get(interval, '1h')}"
+                rsi_value = coin_rsi.get(rsi_key)
+
+                # Show all available RSI timeframes
+                rsi_parts = []
+                for tf in ("15m", "1h", "4h", "12h", "24h"):
+                    v = coin_rsi.get(f"rsi_{tf}")
+                    if v is not None:
+                        rsi_parts.append(f"{tf}={v:.1f}")
+                output += f"**RSI:** {' | '.join(rsi_parts)}\n"
+
+                if rsi_value is not None:
+                    if rsi_value >= 70:
+                        rsi_label = "OVERBOUGHT — contrarian SHORT zone"
+                    elif rsi_value <= 30:
+                        rsi_label = "OVERSOLD — contrarian LONG zone"
+                    elif rsi_value >= 60:
+                        rsi_label = "Bullish momentum"
+                    elif rsi_value <= 40:
+                        rsi_label = "Bearish momentum"
+                    else:
+                        rsi_label = "Neutral"
+                    output += f"**RSI ({interval} → {interval_map.get(interval, '1h')}):** {rsi_value:.1f} — **{rsi_label}**\n\n"
                 else:
-                    rsi_label = "Neutral"
-                output += (
-                    f"**RSI ({interval}):** {rsi_value:.1f} — "
-                    f"**{rsi_label}**\n\n"
-                )
+                    output += f"**RSI:** No data for {interval} interval\n\n"
             else:
-                output += "**RSI:** No rsi_value in response\n\n"
+                output += f"**RSI:** {raw_sym} not found in RSI list\n\n"
         else:
             output += "**RSI:** No data\n\n"
     elif isinstance(rsi_result, Exception):
@@ -2611,7 +2629,7 @@ async def coinglass_full_scan(
     # PHASE 3 — BINANCE DIRECT CROSS-CHECK
     # ═════════════════════════════════════════════════════════════════
     output += "\n---\n\n"
-    output += f"# PHASE 3 — BINANCE DIRECT CROSS-CHECK ({sym})\n\n"
+    output += f"# PHASE 3 — BINANCE DIRECT CROSS-CHECK ({raw_sym})\n\n"
 
     # Symbol mapping for Binance (some coins have different spot names)
     BINANCE_SPOT_MAP = {"HYPE": "HYPER"}
@@ -2651,9 +2669,9 @@ async def coinglass_full_scan(
         oi_val = float(bn_oi["openInterest"])
         if isinstance(bn_premium, dict) and "markPrice" in bn_premium:
             oi_usd = oi_val * float(bn_premium["markPrice"])
-            output += f"**Binance OI:** {oi_val:,.0f} {sym} (${oi_usd/1e6:,.1f}M)\n\n"
+            output += f"**Binance OI:** {oi_val:,.0f} {raw_sym} (${oi_usd/1e6:,.1f}M)\n\n"
         else:
-            output += f"**Binance OI:** {oi_val:,.0f} {sym}\n\n"
+            output += f"**Binance OI:** {oi_val:,.0f} {raw_sym}\n\n"
 
     # ── Taker Buy/Sell Ratio ──
     if isinstance(bn_taker, list) and bn_taker:
