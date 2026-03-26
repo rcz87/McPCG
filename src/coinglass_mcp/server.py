@@ -22,7 +22,11 @@ from typing import Any
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-from .binance_client import close_client as close_binance_client
+from .binance_client import (
+    close_client as close_binance_client,
+    binance_futures_request,
+    binance_spot_request,
+)
 from .client import CoinGlassClient, FetchResult
 from .config import (
     DEFAULT_EXCHANGE,
@@ -2299,6 +2303,91 @@ async def coinglass_full_scan(
                 f"\n⚠️ **RSI {rsi_value:.0f} OVERSOLD** "
                 "— jangan SHORT di sini, tunggu bounce atau LONG\n"
             )
+
+    # ═════════════════════════════════════════════════════════════════
+    # PHASE 3 — BINANCE DIRECT CROSS-CHECK
+    # ═════════════════════════════════════════════════════════════════
+    output += "\n---\n\n"
+    output += f"# PHASE 3 — BINANCE DIRECT CROSS-CHECK ({sym})\n\n"
+
+    # Symbol mapping for Binance (some coins have different spot names)
+    BINANCE_SPOT_MAP = {"HYPE": "HYPER"}
+    bn_spot_sym = BINANCE_SPOT_MAP.get(sym, sym) + "USDT"
+    bn_fut_sym = pair  # e.g. SOLUSDT
+
+    # Fetch Binance data in parallel
+    bn_tasks = [
+        binance_futures_request("/fapi/v1/premiumIndex", {"symbol": bn_fut_sym}),
+        binance_futures_request("/fapi/v1/openInterest", {"symbol": bn_fut_sym}),
+        binance_futures_request(
+            "/futures/data/takerlongshortRatio",
+            {"symbol": bn_fut_sym, "period": interval if interval in ("5m","15m","30m","1h","2h","4h") else "5m", "limit": 5},
+        ),
+        binance_futures_request(
+            "/futures/data/globalLongShortAccountRatio",
+            {"symbol": bn_fut_sym, "period": interval if interval in ("5m","15m","30m","1h","2h","4h") else "5m", "limit": 3},
+        ),
+        binance_spot_request("/api/v3/klines", {"symbol": bn_spot_sym, "interval": interval, "limit": 10}, weight=2),
+    ]
+    bn_results = await asyncio.gather(*bn_tasks, return_exceptions=True)
+    bn_premium, bn_oi, bn_taker, bn_ls, bn_klines = bn_results
+
+    # ── Futures Price + Funding Rate ──
+    if isinstance(bn_premium, dict) and "markPrice" in bn_premium:
+        mark = float(bn_premium["markPrice"])
+        fr = float(bn_premium.get("lastFundingRate", 0))
+        fr_pct = fr * 100
+        fr_label = "NEGATIF (shorts pay)" if fr < 0 else "POSITIF (longs pay)"
+        output += f"**Binance Mark Price:** ${mark:,.2f}\n"
+        output += f"**Binance Funding Rate:** {fr_pct:+.4f}% — {fr_label}\n\n"
+    elif isinstance(bn_premium, dict) and "error" in bn_premium:
+        output += f"**Binance Price:** {bn_premium['error']}\n\n"
+
+    # ── Open Interest ──
+    if isinstance(bn_oi, dict) and "openInterest" in bn_oi:
+        oi_val = float(bn_oi["openInterest"])
+        if isinstance(bn_premium, dict) and "markPrice" in bn_premium:
+            oi_usd = oi_val * float(bn_premium["markPrice"])
+            output += f"**Binance OI:** {oi_val:,.0f} {sym} (${oi_usd/1e6:,.1f}M)\n\n"
+        else:
+            output += f"**Binance OI:** {oi_val:,.0f} {sym}\n\n"
+
+    # ── Taker Buy/Sell Ratio ──
+    if isinstance(bn_taker, list) and bn_taker:
+        output += "**Binance Futures Taker Buy/Sell:**\n"
+        for t in bn_taker[-5:]:
+            ratio = float(t.get("buySellRatio", 0))
+            buy = float(t.get("buyVol", 0))
+            sell = float(t.get("sellVol", 0))
+            bias = "BULL" if ratio > 1 else "BEAR"
+            ts_ms = t.get("timestamp", 0)
+            ts_str = datetime.fromtimestamp(ts_ms / 1000, tz=WIB).strftime("%H:%M") if ts_ms else "?"
+            output += f"- {ts_str}: ratio={ratio:.3f} buy={buy:,.0f} sell={sell:,.0f} → **{bias}**\n"
+        output += "\n"
+
+    # ── Long/Short Account Ratio ──
+    if isinstance(bn_ls, list) and bn_ls:
+        latest_ls = bn_ls[-1]
+        long_pct = float(latest_ls.get("longAccount", 0)) * 100
+        ratio = float(latest_ls.get("longShortRatio", 0))
+        output += f"**Binance L/S Ratio:** {long_pct:.1f}% long (ratio {ratio:.3f})\n\n"
+
+    # ── Spot Klines CVD (taker buy vs sell) ──
+    if isinstance(bn_klines, list) and bn_klines:
+        output += f"**Binance Spot CVD ({bn_spot_sym}):**\n"
+        cumulative = 0.0
+        for c in bn_klines[-5:]:
+            ts_str = datetime.fromtimestamp(c[0] / 1000, tz=WIB).strftime("%H:%M")
+            vol = float(c[5])
+            buy = float(c[9])
+            sell = vol - buy
+            delta = buy - sell
+            cumulative += delta
+            bias = "BUY" if delta > 0 else "SELL"
+            output += f"- {ts_str}: buy={buy:,.0f} sell={sell:,.0f} delta={delta:+,.0f} → **{bias}**\n"
+        output += f"- **Cumulative (5 candles): {cumulative:+,.0f} {sym}**\n\n"
+    elif isinstance(bn_klines, dict) and "error" in bn_klines:
+        output += f"**Binance Spot:** {bn_spot_sym} — {bn_klines.get('error', 'not available')}\n\n"
 
     output += "\n"
     return output
