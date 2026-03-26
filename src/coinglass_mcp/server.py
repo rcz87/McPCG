@@ -260,7 +260,7 @@ async def coinglass_futures_cvd(
 
 
 @mcp.tool()
-async def coinglass_funding_rate() -> str:
+async def coinglass_funding_rate(symbol: str = "") -> str:
     """Get current Funding Rate for ALL coins across all exchanges.
 
     Funding Rate indicates market sentiment:
@@ -268,6 +268,9 @@ async def coinglass_funding_rate() -> str:
     - Negative FR = shorts pay longs (market bearish/overleveraged short)
     - Extreme FR (>0.05%) = potential reversal zone
     - Near zero = neutral, good for directional trades
+
+    Args:
+        symbol: Ignored — always returns all coins. Accepted for compatibility.
 
     Returns data for all coins — only coins with active FR data shown.
     """
@@ -623,7 +626,7 @@ async def coinglass_coins_markets(
 
 
 @mcp.tool()
-async def coinglass_whale_alert() -> str:
+async def coinglass_whale_alert(symbol: str = "") -> str:
     """Get Hyperliquid whale position alerts (~200 most recent, positions > $1M).
 
     Shows large trader positions on Hyperliquid:
@@ -631,13 +634,16 @@ async def coinglass_whale_alert() -> str:
     - Whale opening large short = bearish signal
     - Track whale PnL for sentiment
     - position_action: 1=open, 2=close | position_size: positive=long, negative=short
+
+    Args:
+        symbol: Ignored — returns all whales. Accepted for compatibility.
     """
     result = await client.get("/api/hyperliquid/whale-alert")
     return fmt(result, "Whale Alerts — Hyperliquid")
 
 
 @mcp.tool()
-async def coinglass_fear_greed() -> str:
+async def coinglass_fear_greed(symbol: str = "") -> str:
     """Get Fear & Greed Index history.
 
     Market sentiment indicator:
@@ -646,6 +652,9 @@ async def coinglass_fear_greed() -> str:
     - 45-55 = Neutral
     - 55-75 = Greed
     - 75-100 = Extreme Greed (contrarian SELL zone)
+
+    Args:
+        symbol: Ignored — index is market-wide. Accepted for compatibility.
     """
     result = await client.get("/api/index/fear-greed-history")
     return fmt(result, "Fear & Greed Index")
@@ -2467,11 +2476,14 @@ async def coinglass_trend(
 
 
 @mcp.tool()
-async def coinglass_storage_stats() -> str:
+async def coinglass_storage_stats(symbol: str = "") -> str:
     """Show storage statistics — how much historical data is stored.
 
     Shows total records, oldest/newest data, top symbols tracked.
     Use this to check if historical data is available for trend analysis.
+
+    Args:
+        symbol: Ignored — shows all stats. Accepted for compatibility.
     """
     stats = await client.storage.aget_stats()
     output = "## Storage Statistics\n\n"
