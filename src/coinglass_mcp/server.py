@@ -1773,6 +1773,256 @@ Args:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SMART SCREENER — Pump/Dump Early Detection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def coinglass_smart_screener(
+    mode: str = "all",
+    top_n: int = 15,
+    min_oi_usd: float = 10_000_000,
+) -> str:
+    """Screen ALL coins for pump/dump signals BEFORE retail notices.
+
+    Fetches coins-markets + whale data + FR in parallel, then scores each coin.
+
+    PUMP signals (positive score):
+    - OI rising while price flat/down = stealth accumulation
+    - Funding rate very negative = short squeeze setup
+    - Whale opening longs on Hyperliquid
+    - Short liquidation spike = shorts getting rekt
+
+    DUMP signals (negative score):
+    - Funding rate extreme positive = longs overleveraged
+    - OI rising + price rising + extreme FR = leverage bubble about to pop
+    - Whale opening shorts
+    - Long liquidation spike = longs getting rekt
+    - OI dropping sharply = smart money exiting
+
+    Args:
+        mode: "pump" (only pump candidates), "dump" (only dump), "all" (both)
+        top_n: Number of coins to return per category (default 15)
+        min_oi_usd: Minimum OI in USD to filter noise (default $10M)
+    """
+    import asyncio
+
+    scan_time = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+
+    # Fetch data in parallel: coins_markets (page1+2) + whale alerts
+    tasks = [
+        client.get("/api/futures/coins-markets", {"per_page": 200, "page": 1}),
+        client.get("/api/hyperliquid/whale-alert"),
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    markets_result, whale_result = results
+
+    # Parse market data
+    coins = []
+    if isinstance(markets_result, FetchResult) and isinstance(markets_result.data, list):
+        coins = markets_result.data
+    else:
+        return f"**ERROR:** Failed to fetch coins-markets data. {markets_result}"
+
+    # Parse whale data
+    whale_longs = {}   # symbol -> total USD long
+    whale_shorts = {}  # symbol -> total USD short
+    if isinstance(whale_result, FetchResult) and isinstance(whale_result.data, list):
+        for w in whale_result.data:
+            sym = w.get("symbol", "").upper()
+            action = w.get("position_action")  # 1=open, 2=close
+            size = abs(w.get("position_value_usd", 0) or 0)
+            is_long = (w.get("position_size", 0) or 0) > 0
+            if action == 1 and size > 500_000:  # Only open positions > $500K
+                if is_long:
+                    whale_longs[sym] = whale_longs.get(sym, 0) + size
+                else:
+                    whale_shorts[sym] = whale_shorts.get(sym, 0) + size
+
+    # Score each coin
+    scored = []
+    for coin in coins:
+        sym = coin.get("symbol", "")
+        oi_usd = coin.get("open_interest_usd") or 0
+        if oi_usd < min_oi_usd:
+            continue
+
+        price = coin.get("current_price") or 0
+        score = 0.0
+        signals = []
+
+        # ── OI Changes ──
+        oi_chg_1h = coin.get("open_interest_change_percent_1h") or 0
+        oi_chg_4h = coin.get("open_interest_change_percent_4h") or 0
+        oi_chg_24h = coin.get("open_interest_change_percent_24h") or 0
+
+        # ── Price Changes ──
+        price_chg_1h = coin.get("price_change_percent_1h") or 0
+        price_chg_4h = coin.get("price_change_percent_4h") or 0
+        price_chg_24h = coin.get("price_change_percent_24h") or 0
+
+        # ── Funding Rate ──
+        fr = coin.get("avg_funding_rate_by_oi") or 0
+
+        # ── Liquidation ──
+        long_liq_4h = coin.get("long_liquidation_usd_4h") or 0
+        short_liq_4h = coin.get("short_liquidation_usd_4h") or 0
+        long_liq_24h = coin.get("long_liquidation_usd_24h") or 0
+        short_liq_24h = coin.get("short_liquidation_usd_24h") or 0
+
+        # ── Long/Short Ratio ──
+        ls_ratio_4h = coin.get("long_short_ratio_4h") or 0
+
+        # ═══════════════════════════════════════════
+        # PUMP SCORING (positive = pump potential)
+        # ═══════════════════════════════════════════
+
+        # 1. Stealth accumulation: OI rising + price flat/down
+        if oi_chg_4h > 3 and price_chg_4h < 0.5:
+            score += 3
+            signals.append(f"STEALTH ACCUM: OI+{oi_chg_4h:.1f}% price{price_chg_4h:+.1f}% (4h)")
+        elif oi_chg_1h > 2 and price_chg_1h < 0.3:
+            score += 2
+            signals.append(f"ACCUM 1h: OI+{oi_chg_1h:.1f}% price{price_chg_1h:+.1f}%")
+
+        # 2. Short squeeze setup: extreme negative FR
+        if fr < -0.01:
+            score += 3
+            signals.append(f"SHORT SQUEEZE: FR={fr:.4f}% (extreme neg)")
+        elif fr < -0.005:
+            score += 1.5
+            signals.append(f"NEG FR: {fr:.4f}%")
+
+        # 3. Short liquidation cascade (shorts getting rekt = pump fuel)
+        if short_liq_4h > 1_000_000:
+            score += 2
+            signals.append(f"SHORT LIQ: ${short_liq_4h/1e6:.1f}M (4h)")
+        elif short_liq_4h > 500_000:
+            score += 1
+            signals.append(f"short liq: ${short_liq_4h/1e6:.1f}M (4h)")
+
+        # 4. Whale longs on Hyperliquid
+        wl = whale_longs.get(sym, 0)
+        if wl > 2_000_000:
+            score += 3
+            signals.append(f"WHALE LONG: ${wl/1e6:.1f}M")
+        elif wl > 500_000:
+            score += 1.5
+            signals.append(f"whale long: ${wl/1e6:.1f}M")
+
+        # ═══════════════════════════════════════════
+        # DUMP SCORING (negative = dump potential)
+        # ═══════════════════════════════════════════
+
+        # 5. Overleveraged longs: extreme positive FR
+        if fr > 0.05:
+            score -= 3
+            signals.append(f"OVERLEVERAGED: FR=+{fr:.4f}% (extreme pos)")
+        elif fr > 0.02:
+            score -= 1.5
+            signals.append(f"HIGH FR: +{fr:.4f}%")
+
+        # 6. Leverage bubble: OI + price + FR all rising
+        if oi_chg_4h > 3 and price_chg_4h > 3 and fr > 0.01:
+            score -= 3
+            signals.append(f"BUBBLE: OI+{oi_chg_4h:.1f}% price+{price_chg_4h:.1f}% FR+{fr:.4f}%")
+
+        # 7. Long liquidation cascade (longs getting rekt = dump fuel)
+        if long_liq_4h > 1_000_000:
+            score -= 2
+            signals.append(f"LONG LIQ: ${long_liq_4h/1e6:.1f}M (4h)")
+        elif long_liq_4h > 500_000:
+            score -= 1
+            signals.append(f"long liq: ${long_liq_4h/1e6:.1f}M (4h)")
+
+        # 8. Smart money exit: OI dropping sharply
+        if oi_chg_4h < -3:
+            score -= 2
+            signals.append(f"OI EXODUS: {oi_chg_4h:.1f}% (4h)")
+        elif oi_chg_1h < -2:
+            score -= 1.5
+            signals.append(f"OI drop: {oi_chg_1h:.1f}% (1h)")
+
+        # 9. Whale shorts on Hyperliquid
+        ws = whale_shorts.get(sym, 0)
+        if ws > 2_000_000:
+            score -= 3
+            signals.append(f"WHALE SHORT: ${ws/1e6:.1f}M")
+        elif ws > 500_000:
+            score -= 1.5
+            signals.append(f"whale short: ${ws/1e6:.1f}M")
+
+        # 10. Crowded longs (>70% long = contrarian dump signal)
+        if ls_ratio_4h > 3.0:
+            score -= 1.5
+            signals.append(f"CROWDED LONG: L/S={ls_ratio_4h:.2f}")
+
+        if abs(score) >= 1 and signals:
+            scored.append({
+                "symbol": sym,
+                "score": round(score, 1),
+                "price": price,
+                "oi_usd": oi_usd,
+                "fr": fr,
+                "oi_chg_4h": oi_chg_4h,
+                "price_chg_4h": price_chg_4h,
+                "signals": signals,
+            })
+
+    # Sort and format output
+    pump_list = sorted([c for c in scored if c["score"] > 0], key=lambda x: x["score"], reverse=True)
+    dump_list = sorted([c for c in scored if c["score"] < 0], key=lambda x: x["score"])
+
+    output = f"# SMART SCREENER — Pump/Dump Early Detection\n"
+    output += f"**Scan time:** {scan_time}\n"
+    output += f"**Coins scanned:** {len(coins)} | **Filtered (OI>${min_oi_usd/1e6:.0f}M):** {len([c for c in coins if (c.get('open_interest_usd') or 0) >= min_oi_usd])}\n"
+    output += f"**Signals detected:** {len(pump_list)} pump, {len(dump_list)} dump\n\n"
+
+    if mode in ("all", "pump"):
+        output += f"## PUMP CANDIDATES (top {top_n})\n\n"
+        if pump_list:
+            for i, c in enumerate(pump_list[:top_n], 1):
+                output += (
+                    f"### {i}. {c['symbol']} — Score: +{c['score']}\n"
+                    f"Price: ${c['price']:,.4f} | OI: ${c['oi_usd']/1e6:,.0f}M | "
+                    f"FR: {c['fr']:.4f}% | OI 4h: {c['oi_chg_4h']:+.1f}% | "
+                    f"Price 4h: {c['price_chg_4h']:+.1f}%\n"
+                )
+                for sig in c["signals"]:
+                    output += f"- {sig}\n"
+                output += "\n"
+        else:
+            output += "*No pump signals detected right now.*\n\n"
+
+    if mode in ("all", "dump"):
+        output += f"## DUMP CANDIDATES (top {top_n})\n\n"
+        if dump_list:
+            for i, c in enumerate(dump_list[:top_n], 1):
+                output += (
+                    f"### {i}. {c['symbol']} — Score: {c['score']}\n"
+                    f"Price: ${c['price']:,.4f} | OI: ${c['oi_usd']/1e6:,.0f}M | "
+                    f"FR: {c['fr']:.4f}% | OI 4h: {c['oi_chg_4h']:+.1f}% | "
+                    f"Price 4h: {c['price_chg_4h']:+.1f}%\n"
+                )
+                for sig in c["signals"]:
+                    output += f"- {sig}\n"
+                output += "\n"
+        else:
+            output += "*No dump signals detected right now.*\n\n"
+
+    output += (
+        "---\n\n"
+        "## Cara Pakai\n\n"
+        "1. Pilih coin dari list di atas\n"
+        "2. Jalankan `coinglass_full_scan` pada coin tersebut\n"
+        "3. Confirm dengan Phase 1 (CVD+OI) + Phase 2 (Whale+OB) + Phase 3 (Binance)\n"
+        "4. Score tinggi = sinyal kuat, tapi SELALU confirm sebelum entry\n"
+    )
+
+    return output
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # COMPOSITE TOOL — Ricoz Full Scan (HARDENED)
 # ═══════════════════════════════════════════════════════════════════════════════
 
