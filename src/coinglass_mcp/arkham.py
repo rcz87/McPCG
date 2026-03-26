@@ -47,10 +47,6 @@ def _mask_key(text: str, key: str) -> str:
     return text
 
 
-def _fmt_time(ts_wib: str) -> str:
-    return ts_wib
-
-
 async def arkham_get(
     endpoint: str,
     params: dict | None = None,
@@ -200,99 +196,82 @@ def register_arkham_tools(mcp):
         )
         return output
 
-    # ─── 2. Recent Transfers (Whale Movements) ────────────────────────────────
+    # ─── 2. Counterparties (Whale Movements) ────────────────────────────────
 
     @mcp.tool()
     async def arkham_transfers(
-        coin: str = "",
-        entity: str = "",
-        min_usd: float = 100000,
-        limit: int = 20,
+        entity: str = "binance",
         flow: str = "",
+        tokens: str = "",
+        usd_gte: float = 100000,
+        limit: int = 20,
     ) -> str:
-        """Get recent large on-chain transfers — detect whale accumulation.
+        """Get counterparty transfers for an entity — detect whale accumulation.
 
-        Shows large token movements between wallets, exchanges, and protocols.
+        Shows who is sending/receiving tokens from a specific entity (exchange, fund).
         Key for confirming SpotCVD signals with actual on-chain activity.
+        Rate limit: 1 req/sec.
 
         Args:
-            coin: Token symbol to filter (e.g., BTC, ETH, SOL, USDT)
-                  Leave empty for all tokens.
-            entity: Filter by entity name (e.g., "binance", "coinbase", "a16z")
-                    Leave empty for all entities.
-            min_usd: Minimum transfer size in USD (default $100K = whale territory)
-            limit: Number of transfers to return (max 20)
-            flow: Direction filter — "in" (to exchange), "out" (from exchange), "" (all)
+            entity: Entity slug (binance, coinbase, okx, bybit, jump-trading, etc.)
+                    Use arkham_search to find entity slugs.
+            flow: Direction — "in" (deposits to entity), "out" (withdrawals), "" (all)
+            tokens: Comma-separated token symbols to filter (e.g., "BTC,ETH,SOL")
+                    Leave empty for all tokens.
+            usd_gte: Minimum transfer size in USD (default $100K = whale territory)
+            limit: Number of counterparties to return (max 20)
 
         Use cases:
-        - Large BTC moving TO exchange = potential sell pressure (bearish SpotCVD confirm)
-        - Large BTC moving FROM exchange = accumulation (bullish SpotCVD confirm)
-        - Sudden whale transfer before price move = leading indicator
+        - Large BTC flowing IN to Binance = potential sell pressure (bearish SpotCVD confirm)
+        - Large BTC flowing OUT of Binance = accumulation (bullish SpotCVD confirm)
+        - Identify which whales/funds are the biggest counterparties
         """
         params: dict = {
             "limit": min(limit, 20),
-            "sortKey": "time",
-            "sortDir": "desc",
         }
-        if coin:
-            params["tokenSymbol"] = coin.upper()
-        if min_usd > 0:
-            params["usdGte"] = min_usd
-        if entity:
-            if flow == "in":
-                params["toEntity"] = entity
-            elif flow == "out":
-                params["fromEntity"] = entity
-            else:
-                params["entityName"] = entity
+        if flow:
+            params["flow"] = flow
+        if tokens:
+            params["tokens"] = tokens.upper()
+        if usd_gte > 0:
+            params["usdGte"] = usd_gte
 
-        result = await arkham_get("/transfers", params)
-        output = f"## Arkham Transfers — Whale On-Chain Activity\n\n"
-        output += _header("/transfers")
+        endpoint = f"/counterparties/entity/{entity}"
+        result = await arkham_get(endpoint, params)
+        output = f"## Arkham Counterparties — {entity}\n\n"
+        output += _header(endpoint)
 
         if result["status"] == "error":
             return output + f"**ERROR:** {result['error']}"
 
         data = result["data"]
-        transfers = data.get("transfers", []) if isinstance(data, dict) else []
+        counterparties = data if isinstance(data, list) else (data.get("counterparties", []) if isinstance(data, dict) else [])
 
-        if not transfers:
-            return output + f"**No transfers found** (min ${min_usd:,.0f}, coin={coin or 'all'}, entity={entity or 'all'})"
+        if not counterparties:
+            output += f"**No counterparties found** (entity={entity}, flow={flow or 'all'}, min ${usd_gte:,.0f})\n"
+            output += f"**Raw:** `{json.dumps(data, default=str)[:1000]}`\n"
+            return output
 
-        output += f"**Found {len(transfers)} transfers** | Min: {_format_usd(min_usd)} | "
-        output += f"Coin: {coin or 'ALL'} | Entity: {entity or 'ALL'}\n\n"
+        flow_label = {"in": "INFLOW to", "out": "OUTFLOW from"}.get(flow, "ALL flows for")
+        output += f"**{flow_label} {entity}** | Min: {_format_usd(usd_gte)} | Tokens: {tokens or 'ALL'}\n\n"
 
-        for i, tx in enumerate(transfers, 1):
-            ts_ms = tx.get("blockTimestamp", tx.get("timestamp", 0))
-            if ts_ms:
-                ts_sec = ts_ms / 1000 if ts_ms > 1e10 else ts_ms
-                dt = datetime.fromtimestamp(ts_sec, tz=WIB).strftime("%m/%d %H:%M")
-            else:
-                dt = "N/A"
+        for i, cp in enumerate(counterparties[:20], 1):
+            cp_entity = (cp.get("entity") or cp.get("arkhamEntity") or {})
+            cp_addr = (cp.get("address") or {})
+            name = cp_entity.get("name") or str(cp_addr.get("address", "Unknown"))[:16]
+            cp_type = cp_entity.get("type", "unknown")
+            usd_val = cp.get("usd", cp.get("totalUSD", 0)) or 0
+            tx_count = cp.get("count", cp.get("transfers", "?"))
 
-            from_entity = (tx.get("fromAddress", {}) or {})
-            to_entity = (tx.get("toAddress", {}) or {})
-            from_name = (from_entity.get("arkhamEntity", {}) or {}).get("name") or from_entity.get("address", "Unknown")[:12]
-            to_name = (to_entity.get("arkhamEntity", {}) or {}).get("name") or to_entity.get("address", "Unknown")[:12]
-
-            token = (tx.get("tokenSymbol") or tx.get("unitValue", "?"))
-            usd_val = tx.get("historicalUSD", tx.get("usdValue", 0)) or 0
-            amount = tx.get("tokenAmount", tx.get("amount", "?"))
-
-            output += f"**{i}. {dt}** | {_format_usd(usd_val)}\n"
-            output += f"   `{from_name}` → `{to_name}`\n"
-            output += f"   Token: {token} | Amount: {amount}\n"
-            tx_hash = tx.get("transactionHash", tx.get("hash", ""))
-            if tx_hash:
-                output += f"   Hash: `{tx_hash[:20]}...`\n"
-            output += "\n"
+            output += f"**{i}. {name}** ({cp_type})\n"
+            output += f"   Volume: {_format_usd(float(usd_val))} | Transfers: {tx_count}\n\n"
 
         output += (
             "**Ricoz Framework:**\n"
-            "- Token TO exchange = sell pressure (bearish) → confirms negative SpotCVD\n"
-            "- Token FROM exchange = accumulation (bullish) → confirms positive SpotCVD\n"
-            "- Unknown→Unknown large transfer = OTC deal, less market impact\n"
-            "- Multiple transfers same direction = coordinated whale activity\n"
+            "- Inflow to exchange = sell pressure (bearish) → confirms negative SpotCVD\n"
+            "- Outflow from exchange = accumulation (bullish) → confirms positive SpotCVD\n"
+            "- Large fund as counterparty = smart money signal\n"
+            "- Multiple whales same direction = coordinated activity\n"
         )
         return output
 
@@ -301,18 +280,17 @@ def register_arkham_tools(mcp):
     @mcp.tool()
     async def arkham_exchange_flow(
         entity: str = "binance",
-        coin: str = "BTC",
-        window: str = "1d",
+        chains: str = "",
     ) -> str:
-        """Get exchange inflow/outflow — on-chain confirmation of SpotCVD.
+        """Get historical USD inflow/outflow for an entity — on-chain SpotCVD confirmation.
 
-        Shows net flow of tokens into or out of a specific exchange.
+        Shows net flow of tokens into or out of a specific exchange over time.
         This is the on-chain ground truth behind SpotCVD movements.
 
         Args:
             entity: Exchange entity slug (binance, coinbase, okx, bybit, kraken, etc.)
-            coin: Token symbol (BTC, ETH, SOL, USDT, etc.)
-            window: Time window (1h, 4h, 8h, 1d, 7d, 30d)
+            chains: Optional comma-separated chain filter (ethereum, bitcoin, solana, etc.)
+                    Leave empty for all chains.
 
         Use cases:
         - SpotCVD positive but want on-chain confirmation → check exchange outflow
@@ -320,57 +298,51 @@ def register_arkham_tools(mcp):
         - Exchange inflow spike = smart money depositing to sell
         - Exchange outflow spike = smart money withdrawing to hold/accumulate
         """
-        # Map window to Arkham API format
-        window_map = {
-            "1h": "hour", "4h": "hour", "8h": "hour",
-            "1d": "day", "7d": "week", "30d": "month"
-        }
-        api_window = window_map.get(window, "day")
+        endpoint = f"/flow/entity/{entity}"
+        params: dict = {}
+        if chains:
+            params["chains"] = chains
 
-        params = {
-            "tokenSymbol": coin.upper(),
-            "window": api_window,
-        }
+        result = await arkham_get(endpoint, params)
+        output = f"## Arkham Exchange Flow — {entity.upper()}\n\n"
+        output += _header(endpoint)
+        output += f"**Exchange:** {entity} | **Chains:** {chains or 'ALL'}\n\n"
 
-        # Get inflow and outflow separately
-        inflow_result = await arkham_get(f"/flow/entity/{entity}", {**params, "flow": "in"})
-        outflow_result = await arkham_get(f"/flow/entity/{entity}", {**params, "flow": "out"})
+        if result["status"] == "error":
+            return output + f"**ERROR:** {result['error']}"
 
-        output = f"## Arkham Exchange Flow — {entity.upper()} | {coin}\n\n"
-        output += _header(f"/flow/entity/{entity}")
-        output += f"**Exchange:** {entity} | **Token:** {coin} | **Window:** {window}\n\n"
+        data = result["data"]
 
-        if inflow_result["status"] == "error":
-            # Try without flow filter
-            flow_result = await arkham_get(f"/flow/entity/{entity}", params)
-            if flow_result["status"] == "error":
-                return output + f"**ERROR:** {flow_result['error']}"
-            data = flow_result["data"]
-            output += f"```json\n{json.dumps(data, indent=2, default=str)[:3000]}\n```\n"
-            return output
+        if isinstance(data, dict):
+            # Try to extract flow series
+            inflow = data.get("inflow", data.get("in", 0))
+            outflow = data.get("outflow", data.get("out", 0))
 
-        inflow_data = inflow_result.get("data") or {}
-        outflow_data = outflow_result.get("data") or {}
+            if isinstance(inflow, (int, float)) and isinstance(outflow, (int, float)):
+                net = inflow - outflow
+                direction = "NET INFLOW" if net > 0 else "NET OUTFLOW"
+                output += f"| | USD Value |\n|--|--|\n"
+                output += f"| **Inflow** (deposits) | {_format_usd(inflow)} |\n"
+                output += f"| **Outflow** (withdrawals) | {_format_usd(outflow)} |\n"
+                output += f"| **Net** | **{_format_usd(abs(net))} ({direction})** |\n\n"
 
-        # Extract USD values
-        in_usd = 0
-        out_usd = 0
-        if isinstance(inflow_data, dict):
-            in_usd = inflow_data.get("totalUSD", inflow_data.get("usd", 0)) or 0
-        if isinstance(outflow_data, dict):
-            out_usd = outflow_data.get("totalUSD", outflow_data.get("usd", 0)) or 0
+            # Show time series if available
+            series = data.get("series", data.get("data", []))
+            if isinstance(series, list) and series:
+                output += f"### Time Series ({len(series)} points)\n"
+                for point in series[-10:]:  # Last 10 data points
+                    ts = point.get("time", point.get("timestamp", ""))
+                    if isinstance(ts, (int, float)):
+                        ts_sec = ts / 1000 if ts > 1e10 else ts
+                        ts = datetime.fromtimestamp(ts_sec, tz=WIB).strftime("%m/%d %H:%M")
+                    p_in = point.get("inflow", point.get("in", 0)) or 0
+                    p_out = point.get("outflow", point.get("out", 0)) or 0
+                    p_net = p_in - p_out
+                    icon = "+" if p_net > 0 else ""
+                    output += f"- {ts}: In {_format_usd(p_in)} | Out {_format_usd(p_out)} | Net {icon}{_format_usd(p_net)}\n"
+                output += "\n"
 
-        net = in_usd - out_usd
-        direction = "NET INFLOW 🔴" if net > 0 else "NET OUTFLOW 🟢"
-
-        output += f"### {window} Summary\n"
-        output += f"| | USD Value |\n|--|--|\n"
-        output += f"| **Inflow** (→ exchange) | {_format_usd(in_usd)} |\n"
-        output += f"| **Outflow** (← exchange) | {_format_usd(out_usd)} |\n"
-        output += f"| **Net** | **{_format_usd(net)} ({direction})** |\n\n"
-
-        output += f"**Raw Inflow:** `{json.dumps(inflow_data, default=str)[:500]}`\n\n"
-        output += f"**Raw Outflow:** `{json.dumps(outflow_data, default=str)[:500]}`\n\n"
+        output += f"**Raw:** `{json.dumps(data, default=str)[:1500]}`\n\n"
 
         output += (
             "**Ricoz Framework:**\n"
@@ -380,99 +352,137 @@ def register_arkham_tools(mcp):
         )
         return output
 
-    # ─── 4. Token Holders (Top Whales) ───────────────────────────────────────
+    # ─── 4. Portfolio Time Series (Track Entity Holdings Over Time) ──────────
 
     @mcp.tool()
-    async def arkham_token_holders(
-        token_id: str = "bitcoin",
-        limit: int = 20,
+    async def arkham_portfolio(
+        entity: str = "binance",
+        pricing_id: str = "bitcoin",
+        chains: str = "",
     ) -> str:
-        """Get top token holders — identify whales accumulating/distributing.
+        """Get historical portfolio time series for an entity — track accumulation/distribution.
 
-        Shows the largest holders of a token with their entity labels.
-        Useful for detecting early whale accumulation before price moves.
+        Shows how an entity's holdings of a specific token changed over time.
+        Useful for detecting whale accumulation before price moves.
 
         Args:
-            token_id: CoinGecko pricing ID (bitcoin, ethereum, solana, avalanche-2, etc.)
-                      Or use chain/address format: ethereum/0x...
-            limit: Number of holders to return (max 20)
+            entity: Entity slug (binance, coinbase, jump-trading, a16z, etc.)
+                    Use arkham_search to find entity slugs.
+            pricing_id: CoinGecko pricing ID (bitcoin, ethereum, solana, etc.)
+            chains: Optional chain filter (ethereum, bitcoin, solana, etc.)
 
         Use cases:
-        - Check if top holders are accumulating or distributing
-        - Identify which exchanges/funds hold most of a coin
-        - Cross-reference with OI data (whale holds + OI rising = strong long setup)
+        - Track if Binance BTC reserves are decreasing over time (bullish)
+        - See if a fund is slowly accumulating a token (early signal)
+        - Cross-reference with OI data (entity accumulating + OI rising = strong long)
         """
-        result = await arkham_get(f"/token/holders/{token_id}", {"limit": limit})
-        output = f"## Arkham Top Holders — {token_id}\n\n"
-        output += _header(f"/token/holders/{token_id}")
+        endpoint = f"/portfolio/timeSeries/entity/{entity}"
+        params: dict = {"pricingId": pricing_id}
+        if chains:
+            params["chains"] = chains
+
+        result = await arkham_get(endpoint, params)
+        output = f"## Arkham Portfolio — {entity} | {pricing_id}\n\n"
+        output += _header(endpoint)
 
         if result["status"] == "error":
             return output + f"**ERROR:** {result['error']}\n\nTip: Use CoinGecko ID (bitcoin, ethereum, solana, etc.)"
 
         data = result["data"]
-        holders = data.get("holders", []) if isinstance(data, dict) else []
+        series = data if isinstance(data, list) else (data.get("series", data.get("data", [])) if isinstance(data, dict) else [])
 
-        if not holders:
-            return output + "**No holder data found.**"
+        if not series:
+            output += f"**No portfolio data for {entity} / {pricing_id}.**\n"
+            output += f"**Raw:** `{json.dumps(data, default=str)[:1000]}`\n"
+            return output
 
-        output += f"**Top {len(holders)} holders of {token_id}**\n\n"
+        output += f"**Entity:** {entity} | **Token:** {pricing_id} | **Data points:** {len(series)}\n\n"
 
-        for i, holder in enumerate(holders, 1):
-            entity = (holder.get("entity") or {})
-            label = (holder.get("label") or {})
-            address = holder.get("address", {}) or {}
-
-            name = (entity.get("name") or label.get("name") or
-                    address.get("address", "Unknown")[:16])
-            entity_type = entity.get("type", "unknown")
-            balance_usd = holder.get("usdValue", holder.get("balanceUSD", 0)) or 0
-            pct = holder.get("percentage", holder.get("pct", 0)) or 0
-
-            output += f"**{i}.** `{name}` ({entity_type})\n"
-            output += f"   Balance: {_format_usd(balance_usd)} | Share: {pct:.2f}%\n\n"
+        # Show last 15 data points
+        for point in series[-15:]:
+            if not isinstance(point, dict):
+                continue
+            ts = point.get("time", point.get("timestamp", ""))
+            if isinstance(ts, (int, float)):
+                ts_sec = ts / 1000 if ts > 1e10 else ts
+                ts = datetime.fromtimestamp(ts_sec, tz=WIB).strftime("%Y-%m-%d %H:%M")
+            balance = point.get("balance", point.get("amount", 0)) or 0
+            usd_val = point.get("usd", point.get("usdValue", 0)) or 0
+            output += f"- **{ts}**: {balance} ({_format_usd(float(usd_val))})\n"
 
         output += (
             "\n**Ricoz Framework:**\n"
-            "- Top holders = exchanges → supply can sell anytime\n"
-            "- Top holders = funds/whales → likely HODLing, bullish\n"
-            "- Concentration increasing = whale accumulation setup\n"
-            "- Exchange share growing = distribution phase\n"
+            "- Balance decreasing over time = distribution / selling\n"
+            "- Balance increasing over time = accumulation (bullish)\n"
+            "- Sudden large drop = possible OTC sell or internal transfer\n"
+            "- Cross-check with SpotCVD direction for confirmation\n"
         )
         return output
 
-    # ─── 5. Token Market Data ─────────────────────────────────────────────────
+    # ─── 5. Entity Summary (Fund/Exchange Intel) ────────────────────────────
 
     @mcp.tool()
-    async def arkham_token_flow(
-        token_id: str = "solana",
+    async def arkham_entity_info(
+        entity: str = "binance",
     ) -> str:
-        """Get top exchange flows for a token — where is money moving?
+        """Get Arkham intelligence summary for an entity — exchange, fund, or whale.
 
-        Shows which exchanges are seeing most inflow/outflow for a token.
-        Combines with CoinGlass SpotCVD for full picture.
+        Shows entity profile, type, associated addresses, and metadata.
+        Useful for understanding who a counterparty is before trading.
 
         Args:
-            token_id: CoinGecko pricing ID (bitcoin, ethereum, solana, etc.)
+            entity: Entity slug (binance, coinbase, jump-trading, a16z, paradigm, etc.)
+                    Use arkham_search to find entity slugs.
 
         Use cases:
-        - See which exchange has most spot buying pressure
-        - Identify if flows are concentrated on one exchange (manipulation risk)
-        - Cross-reference with CoinGlass exchange-specific CVD
+        - Get overview of an exchange or fund before checking their flows
+        - Identify entity type (exchange, fund, protocol, individual)
+        - Find associated wallet addresses for deeper analysis
         """
-        result = await arkham_get(f"/token/top_flow/{token_id}")
-        output = f"## Arkham Token Flow — {token_id}\n\n"
-        output += _header(f"/token/top_flow/{token_id}")
+        endpoint = f"/intelligence/entity/{entity}/summary"
+        result = await arkham_get(endpoint)
+        output = f"## Arkham Entity Info — {entity}\n\n"
+        output += _header(endpoint)
 
         if result["status"] == "error":
-            return output + f"**ERROR:** {result['error']}"
+            # Fallback to base entity endpoint
+            result = await arkham_get(f"/intelligence/entity/{entity}")
+            if result["status"] == "error":
+                return output + f"**ERROR:** {result['error']}"
 
         data = result["data"]
-        output += f"```json\n{json.dumps(data, indent=2, default=str)[:3000]}\n```\n"
+        if not data:
+            return output + f"**No data found for entity '{entity}'.**"
+
+        if isinstance(data, dict):
+            name = data.get("name", entity)
+            etype = data.get("type", "unknown")
+            website = data.get("website", "N/A")
+            twitter = data.get("twitter", {})
+            if isinstance(twitter, dict):
+                twitter = twitter.get("screen_name", "N/A")
+
+            output += f"**Name:** {name}\n"
+            output += f"**Type:** {etype}\n"
+            output += f"**Website:** {website}\n"
+            output += f"**Twitter:** {twitter}\n\n"
+
+            # Address count / summary stats
+            addr_count = data.get("addressCount", data.get("numAddresses", "?"))
+            output += f"**Known Addresses:** {addr_count}\n"
+
+            # Show portfolio summary if available
+            portfolio = data.get("portfolio", data.get("holdings", {}))
+            if portfolio and isinstance(portfolio, dict):
+                total = portfolio.get("totalUSD", portfolio.get("total", 0))
+                output += f"**Total Holdings:** {_format_usd(float(total) if total else 0)}\n"
+
+        output += f"\n**Raw:** `{json.dumps(data, default=str)[:2000]}`\n"
         output += (
             "\n**Ricoz Framework:**\n"
-            "- High inflow to major exchange = sell pressure, bearish\n"
-            "- High outflow from exchange = accumulation, bullish\n"
-            "- Correlate with SpotCVD direction for high-conviction trades\n"
+            "- Exchange entity = check flows for SpotCVD confirmation\n"
+            "- Fund/whale entity = smart money, follow their accumulation\n"
+            "- Use entity slug in arkham_exchange_flow and arkham_entity_balance\n"
         )
         return output
 
@@ -481,7 +491,9 @@ def register_arkham_tools(mcp):
     @mcp.tool()
     async def arkham_entity_balance(
         entity: str = "binance",
+        chains: str = "",
         coin: str = "",
+        cheap: bool = False,
     ) -> str:
         """Get current token balances for an exchange/fund/entity.
 
@@ -491,16 +503,25 @@ def register_arkham_tools(mcp):
         Args:
             entity: Entity slug (binance, coinbase, okx, bybit, jump-trading,
                     alameda-research, a16z, paradigm, three-arrows-capital, etc.)
-            coin: Optional token filter (BTC, ETH, SOL — leave empty for all)
+            chains: Optional comma-separated chain filter (ethereum, bitcoin, solana, etc.)
+            coin: Optional token symbol filter for display (BTC, ETH, SOL — leave empty for all)
+            cheap: Use faster but less detailed query (default False)
 
         Use cases:
         - Check if Binance reserves are decreasing (bullish signal)
         - Track if major fund changed their coin exposure
         - Verify exchange solvency via on-chain balances
         """
-        result = await arkham_get(f"/balances/entity/{entity}")
+        params: dict = {}
+        if chains:
+            params["chains"] = chains
+        if cheap:
+            params["cheap"] = "true"
+
+        endpoint = f"/balances/entity/{entity}"
+        result = await arkham_get(endpoint, params)
         output = f"## Arkham Entity Balance — {entity}\n\n"
-        output += _header(f"/balances/entity/{entity}")
+        output += _header(endpoint)
 
         if result["status"] == "error":
             return output + f"**ERROR:** {result['error']}"
@@ -509,7 +530,6 @@ def register_arkham_tools(mcp):
         balances = []
 
         if isinstance(data, dict):
-            # Try to extract balance list
             for key in ("balances", "tokens", "holdings"):
                 if key in data:
                     balances = data[key]
@@ -524,13 +544,12 @@ def register_arkham_tools(mcp):
             output += f"**Raw:** `{json.dumps(data, default=str)[:1000]}`\n"
             return output
 
-        # Filter by coin if specified
         if coin:
             balances = [b for b in balances
                         if isinstance(b, dict) and
                         b.get("symbol", b.get("tokenSymbol", "")).upper() == coin.upper()]
 
-        output += f"**Entity:** {entity} | **Coin filter:** {coin or 'ALL'}\n\n"
+        output += f"**Entity:** {entity} | **Chains:** {chains or 'ALL'} | **Coin:** {coin or 'ALL'}\n\n"
 
         total_usd = 0
         for bal in balances[:20]:
@@ -624,55 +643,89 @@ def register_arkham_tools(mcp):
         output += "\n*Use entity slugs in `arkham_exchange_flow` or `arkham_entity_balance` tools.*\n"
         return output
 
-    # ─── 8. Trending Tokens (On-chain activity spike) ─────────────────────────
+    # ─── 8. Entity Balance Changes (Whale Accumulation Scanner) ──────────────
 
     @mcp.tool()
-    async def arkham_trending() -> str:
-        """Get trending tokens by on-chain activity — early signal scanner.
+    async def arkham_balance_changes(
+        entity_types: str = "exchange",
+        pricing_ids: str = "",
+        interval: str = "day",
+        order_by: str = "absoluteChange",
+        limit: int = 20,
+    ) -> str:
+        """Get entity balance changes — detect whale accumulation/distribution.
 
-        Shows tokens with unusually high on-chain transfer activity.
-        Can detect whale accumulation before it shows up in CoinGlass data.
+        Shows which entities had the largest balance changes for specific tokens.
+        Can detect smart money accumulation before it shows in CoinGlass data.
+
+        Args:
+            entity_types: Comma-separated entity types to filter
+                          (exchange, fund, protocol, individual, mev, etc.)
+            pricing_ids: Comma-separated CoinGecko IDs to filter (bitcoin, ethereum, solana)
+                         Leave empty for all tokens.
+            interval: Time interval (hour, day, week, month)
+            order_by: Sort by (absoluteChange, percentChange)
+            limit: Number of results (max 20)
 
         Use cases:
-        - Find coins with sudden on-chain activity spike (pre-pump signal)
-        - Cross-reference with CoinGlass smart screener stealth accum signals
-        - Discover new opportunities before retail catches on
+        - Find which exchanges had biggest BTC outflows today (accumulation signal)
+        - Detect funds accumulating altcoins before price moves
+        - Cross-reference with CoinGlass smart screener for high conviction
         """
-        result = await arkham_get("/token/trending")
-        output = f"## Arkham Trending Tokens — On-Chain Activity Spike\n\n"
-        output += _header("/token/trending")
+        endpoint = "/intelligence/entity_balance_changes"
+        params: dict = {
+            "interval": interval,
+            "orderBy": order_by,
+            "limit": min(limit, 20),
+        }
+        if entity_types:
+            params["entityTypes"] = entity_types
+        if pricing_ids:
+            params["pricingIds"] = pricing_ids
+
+        result = await arkham_get(endpoint, params)
+        output = f"## Arkham Balance Changes — Entity Accumulation Scanner\n\n"
+        output += _header(endpoint)
 
         if result["status"] == "error":
             return output + f"**ERROR:** {result['error']}"
 
         data = result["data"]
-        tokens = data.get("tokens", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        changes = data if isinstance(data, list) else (data.get("changes", data.get("data", [])) if isinstance(data, dict) else [])
 
-        if not tokens:
-            output += f"**Raw:** `{json.dumps(data, default=str)[:2000]}`\n"
+        if not changes:
+            output += f"**No balance change data found.**\n"
+            output += f"**Raw:** `{json.dumps(data, default=str)[:1500]}`\n"
             return output
 
-        output += f"**{len(tokens)} trending tokens by on-chain activity**\n\n"
+        output += f"**Filter:** types={entity_types or 'ALL'} | tokens={pricing_ids or 'ALL'} | interval={interval}\n\n"
 
-        for i, t in enumerate(tokens[:15], 1):
-            symbol = t.get("symbol", t.get("ticker", "?"))
-            name = t.get("name", "?")
-            price = t.get("price", t.get("priceUsd", 0)) or 0
-            change = t.get("percentChange24h", t.get("priceChange24h", 0)) or 0
-            vol = t.get("volume24h", t.get("volumeUSD24h", 0)) or 0
-            mc = t.get("marketCap", t.get("marketCapUSD", 0)) or 0
+        for i, ch in enumerate(changes[:20], 1):
+            if not isinstance(ch, dict):
+                continue
+            entity = ch.get("entity", ch.get("entityName", {}))
+            if isinstance(entity, dict):
+                name = entity.get("name", "Unknown")
+                etype = entity.get("type", "?")
+            else:
+                name = str(entity)
+                etype = "?"
 
-            change_icon = "🟢" if change > 0 else "🔴"
-            output += f"**{i}. {symbol}** ({name})\n"
-            output += f"   Price: {_format_usd(float(price))} | 24H: {change_icon} {change:+.1f}%\n"
-            if vol:
-                output += f"   Vol: {_format_usd(float(vol))} | MCap: {_format_usd(float(mc))}\n"
-            output += "\n"
+            token = ch.get("pricingId", ch.get("token", "?"))
+            abs_change = ch.get("absoluteChange", ch.get("change", 0)) or 0
+            pct_change = ch.get("percentChange", ch.get("pctChange", 0)) or 0
+
+            icon = "+" if abs_change > 0 else ""
+            direction = "ACCUMULATING" if abs_change > 0 else "DISTRIBUTING"
+
+            output += f"**{i}. {name}** ({etype}) — {direction}\n"
+            output += f"   Token: {token} | Change: {icon}{_format_usd(float(abs_change))} ({pct_change:+.1f}%)\n\n"
 
         output += (
             "**Ricoz Framework:**\n"
-            "- On-chain trending ≠ price pump yet → early accumulation signal\n"
-            "- Cross-check with CoinGlass: OI rising + on-chain trending = high conviction\n"
-            "- FR still negative + on-chain activity = short squeeze + accumulation combo\n"
+            "- Exchange balance decreasing = users withdrawing = bullish accumulation\n"
+            "- Fund balance increasing = smart money buying = follow the whale\n"
+            "- Cross-check with CoinGlass: OI rising + whale accumulating = high conviction\n"
+            "- FR negative + whale accumulating = short squeeze + accumulation combo\n"
         )
         return output
