@@ -22,6 +22,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
+from .arkham import register_arkham_tools
 from .client import CoinGlassClient, FetchResult
 from .config import (
     DEFAULT_EXCHANGE,
@@ -61,6 +62,9 @@ mcp = FastMCP(
     ),
     lifespan=lifespan,
 )
+
+# ─── Register Arkham Intel Tools ──────────────────────────────────────────────
+register_arkham_tools(mcp)
 
 
 # ─── Formatting Helpers ──────────────────────────────────────────────────────
