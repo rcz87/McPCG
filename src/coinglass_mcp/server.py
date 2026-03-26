@@ -667,31 +667,84 @@ async def coinglass_fear_greed(symbol: str = "") -> str:
 @mcp.tool()
 async def coinglass_footprint(
     symbol: str = "BTC",
-    interval: str = "1h",
-    limit: int = 50,
+    interval: str = "5m",
+    limit: int = 10,
     exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
-    """Get Footprint chart data (90-day history max).
+    """Get Footprint chart — buy/sell volume at each price level.
 
-    Shows volume at each price level:
-    - High volume nodes = support/resistance
-    - Volume imbalance = directional pressure
+    Shows WHERE buyers and sellers are active:
+    - High buy imbalance at a level = support zone
+    - High sell imbalance at a level = resistance zone
+    - Total buy > sell = buyers absorbing (bullish)
     - Requires Standard plan or higher
 
     Args:
-        symbol: Coin symbol (BTC, ETH, SOL, etc.) — auto-converted to pair (BTCUSDT)
-        interval: Candle interval
-        limit: Number of data points (max ~2160 for 90d at 1h)
+        symbol: Coin symbol (BTC, ETH, SOL, etc.)
+        interval: Candle interval (5m, 15m, 1h, etc.)
+        limit: Number of candles (default 10)
         exchange: Exchange name (Binance, OKX, Bybit, etc.)
+
+    Response format per level:
+    [price_low, price_high, buy_qty, sell_qty, buy_quote, sell_quote,
+     buy_usdt, sell_usdt, buy_count, sell_count]
     """
     pair = to_pair(symbol)
+    sym = normalize_symbol(symbol)
     result = await client.get("/api/futures/volume/footprint-history", {
         "exchange": exchange,
         "symbol": pair,
         "interval": interval,
         "limit": limit,
     })
-    return fmt(result, f"Footprint — {normalize_symbol(symbol)}")
+
+    header = f"## Footprint — {sym} ({interval}, {exchange})\n\n"
+    header += _age_banner(result)
+
+    data = result.data
+    if not isinstance(data, list) or len(data) == 0:
+        return header + "**No footprint data available.**"
+
+    # Filter out null candles (still forming)
+    valid = [c for c in data if c is not None and isinstance(c, list) and len(c) >= 2]
+    if not valid:
+        return header + "**All candles still forming (null). Try larger limit.**"
+
+    output = header
+    for candle in valid[-5:]:  # Show last 5 completed candles
+        ts = candle[0]
+        levels = candle[1]
+        if not isinstance(levels, list) or not levels:
+            continue
+
+        ts_str = datetime.fromtimestamp(ts, tz=WIB).strftime("%H:%M")
+        total_buy = sum(l[6] for l in levels if len(l) > 7)
+        total_sell = sum(l[7] for l in levels if len(l) > 7)
+        delta = total_buy - total_sell
+        dominant = "BUYERS" if delta > 0 else "SELLERS"
+        buy_count = sum(l[8] for l in levels if len(l) > 8)
+        sell_count = sum(l[9] for l in levels if len(l) > 9)
+
+        output += f"### {ts_str} — **{dominant}** (delta ${delta:+,.0f})\n"
+        output += f"Buy: ${total_buy:,.0f} ({buy_count} trades) | Sell: ${total_sell:,.0f} ({sell_count} trades)\n"
+
+        # Top 3 imbalance levels
+        ranked = sorted(levels, key=lambda l: abs(l[6] - l[7]) if len(l) > 7 else 0, reverse=True)
+        for l in ranked[:3]:
+            if len(l) > 7:
+                mid = (l[0] + l[1]) / 2
+                side = "BUY wall" if l[6] > l[7] else "SELL wall"
+                output += f"- ${mid:,.2f}: buy ${l[6]:,.0f} vs sell ${l[7]:,.0f} → **{side}** ${abs(l[6]-l[7]):,.0f}\n"
+        output += "\n"
+
+    output += (
+        "**Ricoz Framework:**\n"
+        "- Buy wall di level = support (harga susah turun)\n"
+        "- Sell wall di level = resistance (harga susah naik)\n"
+        "- Delta positif konsisten = absorption bullish\n"
+        "- Delta negatif konsisten = absorption bearish\n"
+    )
+    return output
 
 
 @mcp.tool()
