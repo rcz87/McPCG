@@ -1864,6 +1864,34 @@ async def coinglass_full_scan(
     tasks = [client.get(ep, params) for _, ep, params in all_calls]
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # ── Auto-fallback: if Spot CVD is empty, try OKX then Bybit ──
+    spot_cvd_idx = 0  # first call is always Spot CVD
+    spot_result = raw_results[spot_cvd_idx]
+    if (isinstance(spot_result, FetchResult)
+            and isinstance(spot_result.data, list)
+            and len(spot_result.data) == 0):
+        for fallback_ex in ("OKX", "Bybit"):
+            if fallback_ex == exchange:
+                continue
+            try:
+                fb_result = await client.get(
+                    "/api/spot/aggregated-cvd/history",
+                    {"exchange_list": fallback_ex, "symbol": sym,
+                     "interval": interval, "limit": limit},
+                )
+                if (isinstance(fb_result.data, list)
+                        and len(fb_result.data) > 0):
+                    raw_results[spot_cvd_idx] = fb_result
+                    # Update call label to show fallback exchange
+                    calls[spot_cvd_idx] = (
+                        f"Spot CVD (fallback: {fallback_ex})",
+                        calls[spot_cvd_idx][1],
+                        calls[spot_cvd_idx][2],
+                    )
+                    break
+            except Exception:
+                continue
+
     # Split Phase 2 results for later use
     phase2_results = list(zip(precision_calls, raw_results[len(calls):]))
 
@@ -1893,7 +1921,9 @@ async def coinglass_full_scan(
     max_age = 0.0
 
     for (label, _, _), result in zip(calls, raw_results):
-        is_critical = label in CRITICAL_METRICS
+        # Match "Spot CVD (fallback: OKX)" to CRITICAL set "Spot CVD"
+        base_label = label.split(" (fallback")[0]
+        is_critical = base_label in CRITICAL_METRICS
         tag = "CRITICAL" if is_critical else "SUPPORT"
 
         if isinstance(result, Exception):
@@ -1904,7 +1934,16 @@ async def coinglass_full_scan(
             else:
                 supplementary_failed.append(label)
         elif isinstance(result, FetchResult):
-            if result.is_expired:
+            # Detect empty dataset (API succeeded but returned no data)
+            is_empty = (isinstance(result.data, list) and len(result.data) == 0)
+            if is_empty:
+                status = "NO DATA (empty — coin may not be listed on this exchange)"
+                icon = "X"
+                if is_critical:
+                    critical_failed.append(f"{label} (NO DATA)")
+                else:
+                    supplementary_failed.append(f"{label} (NO DATA)")
+            elif result.is_expired:
                 status = f"EXPIRED ({result.age_seconds:.0f}s old)"
                 icon = "X"
                 if is_critical:
@@ -1919,7 +1958,8 @@ async def coinglass_full_scan(
             else:
                 status = f"OK ({result.age_label})"
                 icon = "+"
-            max_age = max(max_age, result.age_seconds)
+            if not is_empty:
+                max_age = max(max_age, result.age_seconds)
         else:
             status = "UNKNOWN"
             icon = "?"
