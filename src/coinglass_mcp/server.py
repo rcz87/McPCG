@@ -2566,6 +2566,7 @@ def main():
             transport="streamable-http",
             host=config.host,
             port=config.port,
+            stateless_http=True,
         )
 
 
