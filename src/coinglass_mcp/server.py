@@ -737,6 +737,28 @@ def _fmt_p2_spot_large_orders(data: list) -> str:
     return out
 
 
+def _fmt_spot_netflow(data) -> str:
+    """Format Spot Net Flow multi-timeframe as readable table — factual only."""
+    if not data:
+        return "**No data**\n\n"
+    d = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else {})
+    if not d:
+        return "**No data**\n\n"
+    timeframes = ["5m", "15m", "30m", "1h", "4h", "12h", "24h"]
+    out = "```\n"
+    out += f"{'TF':>5} | {'Buy':>12} | {'Sell':>12} | {'Net':>12} | {'Chg%':>8}\n"
+    out += f"{'─'*5} | {'─'*12} | {'─'*12} | {'─'*12} | {'─'*8}\n"
+    for tf in timeframes:
+        buy = float(d.get(f"taker_buy_volume_usd_{tf}", 0))
+        sell = float(d.get(f"taker_sell_volume_usd_{tf}", 0))
+        net = float(d.get(f"net_flow_usd_{tf}", 0))
+        chg = d.get(f"net_flow_usd_change_percent_{tf}")
+        chg_str = f"{float(chg):+.1f}%" if chg is not None else "N/A"
+        out += f"{tf:>5} | {_fmt_num(buy):>12} | {_fmt_num(sell):>12} | {_fmt_num(net, signed=True):>12} | {chg_str:>8}\n"
+    out += "```\n\n"
+    return out
+
+
 def _fmt_nansen_flows(data: dict, symbol: str) -> str:
     """Format Nansen token flow intelligence — factual only, no interpretation."""
     if not data:
@@ -1116,7 +1138,7 @@ async def coinglass_price_ohlc(
         "interval": interval,
         "limit": limit,
     })
-    return fmt(result, f"Price OHLC — {normalize_symbol(symbol)} ({interval})")
+    return fmt_parsed(result, f"Price OHLC — {normalize_symbol(symbol)} ({interval})", _fmt_scan_price)
 
 
 @mcp.tool()
@@ -1146,7 +1168,7 @@ async def coinglass_liquidation_history(
         "interval": interval,
         "limit": limit,
     })
-    return fmt(result, f"Liquidation History — {normalize_symbol(symbol)}")
+    return fmt_parsed(result, f"Liquidation History — {normalize_symbol(symbol)}", _fmt_liq_history)
 
 
 @mcp.tool()
@@ -1410,7 +1432,7 @@ async def coinglass_spot_netflow(
         "symbol": sym,
         "exchange_list": exchange,
     })
-    return fmt(result, f"Spot Net Flow — {sym}")
+    return fmt_parsed(result, f"Spot Net Flow — {sym}", _fmt_spot_netflow)
 
 
 @mcp.tool()
@@ -1582,7 +1604,7 @@ async def coinglass_open_interest_cat(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"OI History — {pair} ({exchange})")
+        return fmt_parsed(result, f"OI History — {pair} ({exchange})", _fmt_scan_oi)
 
     elif action == "aggregated_history":
         result = await client.get("/api/futures/open-interest/aggregated-history", {
@@ -1590,7 +1612,7 @@ async def coinglass_open_interest_cat(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"OI Aggregated — {sym}")
+        return fmt_parsed(result, f"OI Aggregated — {sym}", _fmt_scan_oi)
 
     elif action == "stablecoin_margin":
         result = await client.get("/api/futures/open-interest/aggregated-stablecoin-history", {
@@ -1598,7 +1620,7 @@ async def coinglass_open_interest_cat(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"OI Stablecoin Margin — {sym}")
+        return fmt_parsed(result, f"OI Stablecoin Margin — {sym}", _fmt_scan_oi)
 
     elif action == "coin_margin":
         result = await client.get("/api/futures/open-interest/aggregated-coin-margin-history", {
@@ -1606,7 +1628,7 @@ async def coinglass_open_interest_cat(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"OI Coin Margin — {sym}")
+        return fmt_parsed(result, f"OI Coin Margin — {sym}", _fmt_scan_oi)
 
     elif action == "exchange_list":
         params = {"range": range}
@@ -1669,7 +1691,7 @@ async def coinglass_funding_rate_cat(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"FR History OHLC — {pair} ({exchange})")
+        return fmt_parsed(result, f"FR History OHLC — {pair} ({exchange})", _fmt_scan_price)
 
     elif action == "oi_weight":
         pair = to_pair(symbol)
@@ -1783,7 +1805,7 @@ async def coinglass_long_short_cat(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"Global L/S Account Ratio — {sym} ({exchange})")
+        return fmt_parsed(result, f"Global L/S Account Ratio — {sym} ({exchange})", _fmt_scan_ls_ratio)
 
     elif action == "top_account":
         result = await client.get("/api/futures/top-long-short-account-ratio/history", {
@@ -1792,7 +1814,7 @@ async def coinglass_long_short_cat(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"Top Account L/S Ratio — {sym} ({exchange})")
+        return fmt_parsed(result, f"Top Account L/S Ratio — {sym} ({exchange})", _fmt_scan_ls_ratio)
 
     elif action == "top_position":
         result = await client.get("/api/futures/top-long-short-position-ratio/history", {
@@ -1801,7 +1823,7 @@ async def coinglass_long_short_cat(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"Top Position L/S Ratio — {sym} ({exchange})")
+        return fmt_parsed(result, f"Top Position L/S Ratio — {sym} ({exchange})", _fmt_p2_top_position_ls)
 
     elif action == "taker_exchange":
         result = await client.get("/api/futures/taker-buy-sell-volume/exchange-list", {
@@ -1954,7 +1976,7 @@ async def coinglass_orderbook_cat(
             "limit": limit,
             "range": range,
         })
-        return fmt(result, f"OB Pair Bid/Ask — {pair} ({exchange}, ±{range}%)")
+        return fmt_parsed(result, f"OB Pair Bid/Ask — {pair} ({exchange}, ±{range}%)", _fmt_scan_ob_delta)
 
     elif action == "aggregated_bidask":
         result = await client.get("/api/futures/orderbook/aggregated-ask-bids-history", {
@@ -1964,7 +1986,7 @@ async def coinglass_orderbook_cat(
             "limit": limit,
             "range": range,
         })
-        return fmt(result, f"OB Aggregated Bid/Ask — {sym} (±{range}%)")
+        return fmt_parsed(result, f"OB Aggregated Bid/Ask — {sym} (±{range}%)", _fmt_scan_ob_delta)
 
     elif action == "heatmap":
         result = await client.get("/api/futures/orderbook/history", {
@@ -2039,7 +2061,7 @@ Args:
             "/api/hyperliquid/global-long-short-account-ratio/history",
             {"symbol": sym, "interval": interval, "limit": limit},
         )
-        return fmt(result, f"Hyperliquid L/S Ratio — {sym} ({interval})")
+        return fmt_parsed(result, f"Hyperliquid L/S Ratio — {sym} ({interval})", _fmt_p2_hyperliquid_ls)
 
     elif action == "wallet_distribution":
         result = await client.get(
@@ -2100,7 +2122,7 @@ Args:
             "/api/futures/cvd/history",
             {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit},
         )
-        return fmt(result, f"Futures CVD (pair) — {pair} ({exchange}, {interval})")
+        return fmt_parsed(result, f"Futures CVD (pair) — {pair} ({exchange}, {interval})", lambda d: _fmt_scan_cvd(d, "Futures CVD"))
 
     elif action == "footprint":
         result = await client.get(
@@ -2115,14 +2137,14 @@ Args:
             {"exchange_list": exchange, "symbol": sym, "interval": interval,
              "limit": limit, "unit": unit},
         )
-        return fmt(result, f"Aggregated Taker Buy/Sell — {sym} ({exchange}, {interval})")
+        return fmt_parsed(result, f"Aggregated Taker Buy/Sell — {sym} ({exchange}, {interval})", _fmt_scan_taker)
 
     elif action == "pair_taker":
         result = await client.get(
             "/api/futures/v2/taker-buy-sell-volume/history",
             {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit},
         )
-        return fmt(result, f"Pair Taker Buy/Sell — {pair} ({exchange}, {interval})")
+        return fmt_parsed(result, f"Pair Taker Buy/Sell — {pair} ({exchange}, {interval})", _fmt_scan_taker)
 
     else:
         return (
@@ -2231,7 +2253,7 @@ Args:
             {"exchange": exchange, "symbol": pair, "interval": interval,
              "limit": limit, "range": range},
         )
-        return fmt(result, f"Spot OB Pair Bid/Ask — {pair} ({exchange}, ±{range}%)")
+        return fmt_parsed(result, f"Spot OB Pair Bid/Ask — {pair} ({exchange}, ±{range}%)", _fmt_scan_ob_delta)
 
     elif action == "aggregated_bidask":
         result = await client.get(
@@ -2239,7 +2261,7 @@ Args:
             {"exchange_list": exchange, "symbol": sym, "interval": interval,
              "limit": limit, "range": range},
         )
-        return fmt(result, f"Spot OB Aggregated Bid/Ask — {sym} ({exchange}, ±{range}%)")
+        return fmt_parsed(result, f"Spot OB Aggregated Bid/Ask — {sym} ({exchange}, ±{range}%)", _fmt_scan_ob_delta)
 
     elif action == "heatmap":
         hm_limit = min(limit, 100)
