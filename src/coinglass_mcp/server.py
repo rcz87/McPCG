@@ -22,7 +22,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-from .arkham import register_arkham_tools
+from .arkham import register_arkham_tools, arkham_get
 from .nansen import register_nansen_tools, nansen_token_flow_intelligence, NANSEN_TOKEN_MAP
 from .binance_client import (
     close_client as close_binance_client,
@@ -2717,6 +2717,16 @@ async def coinglass_smart_screener(
 
 # Critical metrics — if ANY fails, analysis is BLOCKED
 CRITICAL_METRICS = {"Spot CVD", "Futures CVD", "Open Interest"}
+
+# Arkham chain mapping for exchange flow (Phase 4)
+ARKHAM_CHAIN_MAP = {
+    "SOL": "solana", "BTC": "bitcoin", "ETH": "ethereum",
+    "BNB": "bnb", "AVAX": "avalanche", "SUI": "sui",
+    "HYPE": "ethereum", "XRP": "",
+}
+
+# Tokens NOT supported by Nansen flows (skip API call)
+NANSEN_UNSUPPORTED = {"BTC", "HYPE"}
 # Supplementary metrics — partial failure is OK
 SUPPLEMENTARY_METRICS = {
     "Funding Rate", "Orderbook Delta", "Liquidation Map",
@@ -2828,18 +2838,7 @@ async def coinglass_full_scan(
     # Fetch ALL endpoints in one batch — rate limiter handles spacing
     all_calls = calls + precision_calls
     tasks = [client.get(ep, params) for _, ep, params in all_calls]
-    # Nansen flow intelligence runs in parallel (separate HTTP, not CoinGlass)
-    nansen_supported = raw_sym.upper() in NANSEN_TOKEN_MAP
-    if nansen_supported:
-        tasks.append(nansen_token_flow_intelligence(raw_sym))
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-    # Pop Nansen result from the end (it's not a CoinGlass FetchResult)
-    nansen_flow_data = None
-    if nansen_supported:
-        nansen_raw = raw_results[-1]
-        raw_results = list(raw_results[:-1])
-        if isinstance(nansen_raw, dict):
-            nansen_flow_data = nansen_raw
 
     # ── Auto-fallback: if Spot CVD is empty, try OKX then Bybit ──
     spot_cvd_idx = 0  # first call is always Spot CVD
@@ -3194,13 +3193,6 @@ async def coinglass_full_scan(
     else:
         output += "**Liq Orders:** Data expired or unavailable\n\n"
 
-    # ── Nansen On-Chain Flows ──
-    if nansen_flow_data:
-        output += f"## Nansen On-Chain Flows — {raw_sym}\n\n"
-        output += _fmt_nansen_flows(nansen_flow_data, raw_sym)
-    elif nansen_supported:
-        output += f"**Nansen Flows:** No data for {raw_sym}\n\n"
-
     # ── Hyperliquid L/S Ratio ──
     hl_result = p2.get("Hyperliquid L/S")
     if isinstance(hl_result, FetchResult) and not hl_result.is_expired:
@@ -3451,6 +3443,117 @@ async def coinglass_full_scan(
             pass  # silently skip if klines format unexpected
     elif isinstance(bn_fut_klines, dict) and "error" in bn_fut_klines:
         output += f"**VWAP:** {bn_fut_klines.get('error', 'futures klines not available')}\n\n"
+
+    output += "\n"
+
+    # ═════════════════════════════════════════════════════════════════
+    # PHASE 4 — ON-CHAIN LAYER (Nansen + Arkham)
+    # ═════════════════════════════════════════════════════════════════
+    output += "---\n\n"
+    output += f"# PHASE 4 — ON-CHAIN LAYER ({raw_sym})\n\n"
+
+    # Fetch Nansen + Arkham in parallel
+    p4_tasks = []
+    # Nansen token flows
+    nansen_skip = raw_sym.upper() in NANSEN_UNSUPPORTED
+    nansen_has_map = raw_sym.upper() in NANSEN_TOKEN_MAP
+    if nansen_has_map and not nansen_skip:
+        p4_tasks.append(("nansen", nansen_token_flow_intelligence(raw_sym)))
+    else:
+        async def _noop():
+            return None
+        p4_tasks.append(("nansen", _noop()))
+
+    # Arkham exchange flow
+    arkham_chain = ARKHAM_CHAIN_MAP.get(raw_sym.upper(), "ethereum")
+    arkham_params: dict = {}
+    if arkham_chain:
+        arkham_params["chains"] = arkham_chain
+    p4_tasks.append(("arkham", arkham_get(f"/flow/entity/{exchange.lower()}", arkham_params)))
+
+    p4_results = await asyncio.gather(
+        *[t for _, t in p4_tasks], return_exceptions=True
+    )
+    p4 = dict(zip([n for n, _ in p4_tasks], p4_results))
+
+    # ── Nansen On-Chain Flows ──
+    nansen_result = p4.get("nansen")
+    if nansen_skip:
+        output += (
+            f"## Nansen On-Chain Flows — {raw_sym} | 1h\n\n"
+            f"*(Not supported — BTC and Hyperliquid chain excluded)*\n\n"
+        )
+    elif isinstance(nansen_result, dict) and nansen_result:
+        output += f"## Nansen On-Chain Flows — {raw_sym} | 1h\n\n"
+        output += _fmt_nansen_flows(nansen_result, raw_sym)
+    elif nansen_has_map:
+        output += f"## Nansen On-Chain Flows — {raw_sym} | 1h\n\n"
+        output += f"**No data returned for {raw_sym}**\n\n"
+    else:
+        output += (
+            f"## Nansen On-Chain Flows — {raw_sym} | 1h\n\n"
+            f"*(Token not in address map — add to NANSEN_TOKEN_MAP)*\n\n"
+        )
+
+    # ── Arkham Exchange Flow ──
+    arkham_result = p4.get("arkham")
+    output += f"## Arkham Exchange Flow — {exchange} | {arkham_chain or 'ALL'}\n\n"
+    if isinstance(arkham_result, Exception):
+        output += f"**FAILED:** {str(arkham_result)[:200]}\n\n"
+    elif isinstance(arkham_result, dict):
+        if arkham_result.get("status") == "error":
+            output += f"**ERROR:** {arkham_result.get('error', 'unknown')}\n\n"
+        else:
+            data = arkham_result.get("data")
+            # Arkham returns {chain_name: [time_series]} — extract the series
+            series = []
+            if isinstance(data, dict):
+                # Try chain-specific key first, then fallback to any list value
+                if arkham_chain and arkham_chain in data:
+                    series = data[arkham_chain]
+                else:
+                    for v in data.values():
+                        if isinstance(v, list):
+                            series = v
+                            break
+            elif isinstance(data, list):
+                series = data
+
+            if isinstance(series, list) and series:
+                # Show last 7 days (last 7 entries since it's daily data)
+                recent = series[-7:]
+                # Summary from last entry
+                total_in = sum(float(p.get("inflow", 0)) for p in recent)
+                total_out = sum(float(p.get("outflow", 0)) for p in recent)
+                total_net = total_in - total_out
+                direction = "NET INFLOW" if total_net > 0 else "NET OUTFLOW"
+                output += (
+                    f"**7d Summary:** In {_fmt_num(total_in)} | "
+                    f"Out {_fmt_num(total_out)} | "
+                    f"Net {_fmt_num(abs(total_net))} ({direction})\n\n"
+                )
+                output += "```\n"
+                output += f"{'Date':>12} | {'Inflow':>12} | {'Outflow':>12} | {'Net':>12}\n"
+                output += f"{'─'*12} | {'─'*12} | {'─'*12} | {'─'*12}\n"
+                for point in recent:
+                    ts = point.get("time", "")
+                    # Arkham returns ISO date string "2026-03-20T00:00:00Z"
+                    if isinstance(ts, str) and len(ts) >= 10:
+                        ts_str = ts[:10]  # YYYY-MM-DD
+                    else:
+                        ts_str = _ts_wib(ts)
+                    p_in = float(point.get("inflow", 0))
+                    p_out = float(point.get("outflow", 0))
+                    p_net = p_in - p_out
+                    output += (
+                        f"{ts_str:>12} | {_fmt_num(p_in):>12} | "
+                        f"{_fmt_num(p_out):>12} | {_fmt_num(p_net, signed=True):>12}\n"
+                    )
+                output += "```\n\n"
+            else:
+                output += "**No flow data available**\n\n"
+    else:
+        output += "**No data**\n\n"
 
     output += "\n"
     return output

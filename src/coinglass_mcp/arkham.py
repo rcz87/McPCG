@@ -342,14 +342,6 @@ def register_arkham_tools(mcp):
                     output += f"- {ts}: In {_format_usd(p_in)} | Out {_format_usd(p_out)} | Net {icon}{_format_usd(p_net)}\n"
                 output += "\n"
 
-        output += f"**Raw:** `{json.dumps(data, default=str)[:1500]}`\n\n"
-
-        output += (
-            "**Ricoz Framework:**\n"
-            f"- Net Inflow to {entity} = coins deposited to sell = **bearish SpotCVD confirm**\n"
-            f"- Net Outflow from {entity} = coins withdrawn to hold = **bullish SpotCVD confirm**\n"
-            "- Divergence from SpotCVD = investigate further before trading\n"
-        )
         return output
 
     # ─── 4. Portfolio Time Series (Track Entity Holdings Over Time) ──────────

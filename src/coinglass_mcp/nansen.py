@@ -144,6 +144,8 @@ NANSEN_TOKEN_MAP = {
     "MATIC": ("polygon", "0x0000000000000000000000000000000000001010"),
     "AVAX": ("avalanche", "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
     "BNB": ("bnb", "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+    "SUI": ("sui", "0x2::sui::SUI"),
+    "XRP": ("xrp", "XRP"),
 }
 
 
