@@ -245,11 +245,24 @@ def register_arkham_tools(mcp):
             return output + f"**ERROR:** {result['error']}"
 
         data = result["data"]
-        counterparties = data if isinstance(data, list) else (data.get("counterparties", []) if isinstance(data, dict) else [])
+        counterparties = []
+        if isinstance(data, list):
+            counterparties = data
+        elif isinstance(data, dict):
+            # Try known keys, then fallback to first list value
+            for key in ("counterparties", "transfers", "data", "results"):
+                if key in data and isinstance(data[key], list):
+                    counterparties = data[key]
+                    break
+            if not counterparties:
+                for v in data.values():
+                    if isinstance(v, list):
+                        counterparties = v
+                        break
 
         if not counterparties:
             output += f"**No counterparties found** (entity={entity}, flow={flow or 'all'}, min ${usd_gte:,.0f})\n"
-            output += f"**Raw:** `{json.dumps(data, default=str)[:1000]}`\n"
+            output += f"**Debug raw:** `{json.dumps(data, default=str)[:1500]}`\n"
             return output
 
         flow_label = {"in": "INFLOW to", "out": "OUTFLOW from"}.get(flow, "ALL flows for")
@@ -313,35 +326,62 @@ def register_arkham_tools(mcp):
 
         data = result["data"]
 
+        # Arkham returns {chain_name: [time_series_points]}
+        # e.g. {"ethereum": [{inflow: X, outflow: Y, time: "..."}, ...]}
+        series = []
         if isinstance(data, dict):
-            # Try to extract flow series
-            inflow = data.get("inflow", data.get("in", 0))
-            outflow = data.get("outflow", data.get("out", 0))
+            if chains and chains in data:
+                series = data[chains]
+            else:
+                # Take first list value found
+                for v in data.values():
+                    if isinstance(v, list):
+                        series = v
+                        break
+        elif isinstance(data, list):
+            series = data
 
-            if isinstance(inflow, (int, float)) and isinstance(outflow, (int, float)):
-                net = inflow - outflow
-                direction = "NET INFLOW" if net > 0 else "NET OUTFLOW"
-                output += f"| | USD Value |\n|--|--|\n"
-                output += f"| **Inflow** (deposits) | {_format_usd(inflow)} |\n"
-                output += f"| **Outflow** (withdrawals) | {_format_usd(outflow)} |\n"
-                output += f"| **Net** | **{_format_usd(abs(net))} ({direction})** |\n\n"
+        if isinstance(series, list) and series:
+            # Summary from recent data (last 7 days)
+            recent = series[-7:]
+            total_in = sum(float(p.get("inflow", 0)) for p in recent if isinstance(p, dict))
+            total_out = sum(float(p.get("outflow", 0)) for p in recent if isinstance(p, dict))
+            total_net = total_in - total_out
+            direction = "NET INFLOW" if total_net > 0 else "NET OUTFLOW"
 
-            # Show time series if available
-            series = data.get("series", data.get("data", []))
-            if isinstance(series, list) and series:
-                output += f"### Time Series ({len(series)} points)\n"
-                for point in series[-10:]:  # Last 10 data points
-                    ts = point.get("time", point.get("timestamp", ""))
-                    if isinstance(ts, (int, float)):
-                        ts_sec = ts / 1000 if ts > 1e10 else ts
-                        ts = datetime.fromtimestamp(ts_sec, tz=WIB).strftime("%m/%d %H:%M")
-                    p_in = point.get("inflow", point.get("in", 0)) or 0
-                    p_out = point.get("outflow", point.get("out", 0)) or 0
-                    p_net = p_in - p_out
-                    icon = "+" if p_net > 0 else ""
-                    output += f"- {ts}: In {_format_usd(p_in)} | Out {_format_usd(p_out)} | Net {icon}{_format_usd(p_net)}\n"
-                output += "\n"
+            output += f"**7d Summary:** In {_format_usd(total_in)} | Out {_format_usd(total_out)} | Net {_format_usd(abs(total_net))} ({direction})\n\n"
 
+            # Time series table
+            show = series[-10:]
+            output += f"### Time Series (last {len(show)} of {len(series)})\n\n"
+            for point in show:
+                if not isinstance(point, dict):
+                    continue
+                ts = point.get("time", point.get("timestamp", ""))
+                if isinstance(ts, str) and len(ts) >= 10:
+                    ts_str = ts[:10]
+                elif isinstance(ts, (int, float)):
+                    ts_sec = ts / 1000 if ts > 1e10 else ts
+                    ts_str = datetime.fromtimestamp(ts_sec, tz=WIB).strftime("%m/%d %H:%M")
+                else:
+                    ts_str = str(ts)
+                p_in = float(point.get("inflow", 0))
+                p_out = float(point.get("outflow", 0))
+                p_net = p_in - p_out
+                net_label = f"+{_format_usd(p_net)}" if p_net > 0 else f"-{_format_usd(abs(p_net))}"
+                output += f"- {ts_str}: In {_format_usd(p_in)} | Out {_format_usd(p_out)} | Net {net_label}\n"
+            output += "\n"
+        else:
+            output += "**No flow data available.**\n"
+            if data:
+                output += f"**Debug raw keys:** `{list(data.keys()) if isinstance(data, dict) else type(data).__name__}`\n"
+            output += "\n"
+
+        output += (
+            "**Ricoz Framework:**\n"
+            "- Inflow > Outflow = sell pressure (bearish) → confirms negative SpotCVD\n"
+            "- Outflow > Inflow = accumulation (bullish) → confirms positive SpotCVD\n"
+        )
         return output
 
     # ─── 4. Portfolio Time Series (Track Entity Holdings Over Time) ──────────
@@ -381,11 +421,25 @@ def register_arkham_tools(mcp):
             return output + f"**ERROR:** {result['error']}\n\nTip: Use CoinGecko ID (bitcoin, ethereum, solana, etc.)"
 
         data = result["data"]
-        series = data if isinstance(data, list) else (data.get("series", data.get("data", [])) if isinstance(data, dict) else [])
+        series = []
+        if isinstance(data, list):
+            series = data
+        elif isinstance(data, dict):
+            # Try known keys first
+            for key in ("series", "data", "timeSeries"):
+                if key in data and isinstance(data[key], list):
+                    series = data[key]
+                    break
+            if not series:
+                # Arkham may return {chain: [time_series]} like flow endpoint
+                for v in data.values():
+                    if isinstance(v, list) and v:
+                        series = v
+                        break
 
         if not series:
             output += f"**No portfolio data for {entity} / {pricing_id}.**\n"
-            output += f"**Raw:** `{json.dumps(data, default=str)[:1000]}`\n"
+            output += f"**Debug raw:** `{json.dumps(data, default=str)[:1500]}`\n"
             return output
 
         output += f"**Entity:** {entity} | **Token:** {pricing_id} | **Data points:** {len(series)}\n\n"
@@ -522,24 +576,38 @@ def register_arkham_tools(mcp):
         balances = []
 
         if isinstance(data, dict):
-            for key in ("balances", "tokens", "holdings"):
-                if key in data:
+            # Arkham may nest balances under "tokens", "balances", "holdings",
+            # or return {chain: [{token_data}]} like the flow endpoint
+            for key in ("tokens", "balances", "holdings"):
+                if key in data and isinstance(data[key], list):
                     balances = data[key]
                     break
             if not balances:
+                # Try: response is {chain_name: [tokens]} (similar to flow endpoint)
+                for v in data.values():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        balances = v
+                        break
+            if not balances and data:
+                # Last resort: flat dict values
                 balances = list(data.values())[:20] if data else []
         elif isinstance(data, list):
             balances = data
 
         if not balances:
             output += f"**No balance data for {entity}.**\n"
-            output += f"**Raw:** `{json.dumps(data, default=str)[:1000]}`\n"
+            output += f"**Debug raw:** `{json.dumps(data, default=str)[:1500]}`\n"
             return output
 
         if coin:
+            coin_upper = coin.upper()
             balances = [b for b in balances
                         if isinstance(b, dict) and
-                        b.get("symbol", b.get("tokenSymbol", "")).upper() == coin.upper()]
+                        b.get("symbol", b.get("tokenSymbol", b.get("token", ""))).upper() == coin_upper]
+            if not balances:
+                output += f"**No {coin} balance found for {entity}.**\n"
+                output += f"**Debug raw keys:** `{json.dumps(data, default=str)[:1500]}`\n"
+                return output
 
         output += f"**Entity:** {entity} | **Chains:** {chains or 'ALL'} | **Coin:** {coin or 'ALL'}\n\n"
 
@@ -547,14 +615,17 @@ def register_arkham_tools(mcp):
         for bal in balances[:20]:
             if not isinstance(bal, dict):
                 continue
-            symbol = bal.get("symbol", bal.get("tokenSymbol", "?"))
-            usd = bal.get("usdValue", bal.get("balanceUSD", bal.get("usd", 0))) or 0
-            amount = bal.get("amount", bal.get("balance", bal.get("quantity", "?")))
-            chain = bal.get("chain", bal.get("chainType", "?"))
-            total_usd += float(usd) if usd else 0
+            # Try multiple field name patterns
+            symbol = bal.get("symbol", bal.get("tokenSymbol", bal.get("token", "?")))
+            usd = float(bal.get("usdValue", bal.get("balanceUSD", bal.get("balanceUsd",
+                    bal.get("usd", bal.get("value", 0))))) or 0)
+            amount = bal.get("amount", bal.get("balance", bal.get("balanceUnit",
+                     bal.get("quantity", "?"))))
+            chain_name = bal.get("chain", bal.get("chainType", bal.get("blockchain", "?")))
+            total_usd += usd
 
-            output += f"- **{symbol}** ({chain}): {_format_usd(float(usd) if usd else 0)}"
-            if amount:
+            output += f"- **{symbol}** ({chain_name}): {_format_usd(usd)}"
+            if amount and amount != "?":
                 output += f" | Amount: {amount}"
             output += "\n"
 
@@ -642,7 +713,8 @@ def register_arkham_tools(mcp):
         entity_types: str = "exchange",
         pricing_ids: str = "",
         interval: str = "day",
-        order_by: str = "absoluteChange",
+        order_by: str = "balanceUsdChange",
+        order_dir: str = "desc",
         limit: int = 20,
     ) -> str:
         """Get entity balance changes — detect whale accumulation/distribution.
@@ -656,7 +728,9 @@ def register_arkham_tools(mcp):
             pricing_ids: Comma-separated CoinGecko IDs to filter (bitcoin, ethereum, solana)
                          Leave empty for all tokens.
             interval: Time interval (hour, day, week, month)
-            order_by: Sort by (absoluteChange, percentChange)
+            order_by: Sort field — balanceUsd, balanceUsdChange, balanceUsdPctChange,
+                      balanceUnit, balanceUnitChange, balanceUnitPctChange
+            order_dir: Sort direction — "asc" or "desc"
             limit: Number of results (max 20)
 
         Use cases:
@@ -668,6 +742,7 @@ def register_arkham_tools(mcp):
         params: dict = {
             "interval": interval,
             "orderBy": order_by,
+            "orderDir": order_dir,
             "limit": min(limit, 20),
         }
         if entity_types:
@@ -683,14 +758,26 @@ def register_arkham_tools(mcp):
             return output + f"**ERROR:** {result['error']}"
 
         data = result["data"]
-        changes = data if isinstance(data, list) else (data.get("changes", data.get("data", [])) if isinstance(data, dict) else [])
+        changes = []
+        if isinstance(data, list):
+            changes = data
+        elif isinstance(data, dict):
+            for key in ("changes", "data", "results", "entities"):
+                if key in data and isinstance(data[key], list):
+                    changes = data[key]
+                    break
+            if not changes:
+                for v in data.values():
+                    if isinstance(v, list):
+                        changes = v
+                        break
 
         if not changes:
             output += f"**No balance change data found.**\n"
-            output += f"**Raw:** `{json.dumps(data, default=str)[:1500]}`\n"
+            output += f"**Debug raw:** `{json.dumps(data, default=str)[:1500]}`\n"
             return output
 
-        output += f"**Filter:** types={entity_types or 'ALL'} | tokens={pricing_ids or 'ALL'} | interval={interval}\n\n"
+        output += f"**Filter:** types={entity_types or 'ALL'} | tokens={pricing_ids or 'ALL'} | interval={interval} | sort={order_by} {order_dir}\n\n"
 
         for i, ch in enumerate(changes[:20], 1):
             if not isinstance(ch, dict):
@@ -704,14 +791,18 @@ def register_arkham_tools(mcp):
                 etype = "?"
 
             token = ch.get("pricingId", ch.get("token", "?"))
-            abs_change = ch.get("absoluteChange", ch.get("change", 0)) or 0
-            pct_change = ch.get("percentChange", ch.get("pctChange", 0)) or 0
+            # Try multiple field name patterns for USD change
+            abs_change = float(ch.get("balanceUsdChange", ch.get("absoluteChange",
+                          ch.get("change", 0))) or 0)
+            pct_change = float(ch.get("balanceUsdPctChange", ch.get("percentChange",
+                          ch.get("pctChange", 0))) or 0)
+            balance_usd = float(ch.get("balanceUsd", ch.get("balance", 0)) or 0)
 
             icon = "+" if abs_change > 0 else ""
             direction = "ACCUMULATING" if abs_change > 0 else "DISTRIBUTING"
 
             output += f"**{i}. {name}** ({etype}) — {direction}\n"
-            output += f"   Token: {token} | Change: {icon}{_format_usd(float(abs_change))} ({pct_change:+.1f}%)\n\n"
+            output += f"   Token: {token} | Balance: {_format_usd(balance_usd)} | Change: {icon}{_format_usd(float(abs_change))} ({pct_change:+.1f}%)\n\n"
 
         output += (
             "**Ricoz Framework:**\n"
