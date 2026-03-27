@@ -3247,9 +3247,9 @@ async def coinglass_full_scan(
                 for ob_row in ob_data:
                     if not isinstance(ob_row, dict):
                         continue
-                    ts = ob_row.get("t", ob_row.get("timestamp", ob_row.get("time", 0)))
-                    b = ob_row.get("bids_usd", 0)
-                    a = ob_row.get("asks_usd", 0)
+                    ts = _get(ob_row, "t", "time", "timestamp", "createTime", default=0)
+                    b = float(_get(ob_row, "aggregated_bids_usd", "bids_usd", "bids", default=0))
+                    a = float(_get(ob_row, "aggregated_asks_usd", "asks_usd", "asks", default=0))
                     r = b / a if a > 0 else 0
                     dom = "BIDS" if b > a else "ASKS"
                     if b > a:
@@ -3543,12 +3543,14 @@ async def coinglass_full_scan(
             ratio = float(ls_row.get("longShortRatio", 0))
             output += f"{ts_str:>6} | {long_pct:>7.1f}% | {short_pct:>7.1f}% | {ratio:>8.3f}\n"
         output += "```\n"
-        latest_ls = bn_ls[-1]
-        latest_ratio = float(latest_ls.get("longShortRatio", 0))
-        first_ratio = float(bn_ls[0].get("longShortRatio", 0))
-        shift = latest_ratio - first_ratio
-        shift_label = "more long" if shift > 0 else "more short"
-        output += f"**Shift:** {shift:+.3f} ({shift_label})\n\n"
+        if len(bn_ls) > 1:
+            latest_ratio = float(bn_ls[-1].get("longShortRatio", 0))
+            first_ratio = float(bn_ls[0].get("longShortRatio", 0))
+            shift = latest_ratio - first_ratio
+            shift_label = "more long" if shift > 0 else "more short"
+            output += f"**Shift:** {shift:+.3f} ({shift_label})\n\n"
+        else:
+            output += "\n"
 
     # ── Spot Klines CVD (taker buy vs sell) ──
     if isinstance(bn_klines, list) and bn_klines:
