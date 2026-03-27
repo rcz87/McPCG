@@ -129,6 +129,23 @@ def fmt(result: FetchResult, title: str = "") -> str:
         return header + str(data)
 
 
+def fmt_parsed(result: FetchResult, title: str, formatter) -> str:
+    """Format API response using a parsed formatter instead of raw JSON.
+    formatter(data) should return a formatted string."""
+    header = ""
+    if title:
+        header = f"## {title}\n\n"
+    header += _age_banner(result)
+    data = result.data
+    if data is None:
+        return f"{header}**ERROR: No data returned.** The symbol may not exist."
+    if isinstance(data, list) and len(data) == 0:
+        return f"{header}**WARNING: Empty dataset.** No data points returned."
+    if isinstance(data, (list, dict)) and data:
+        return header + formatter(data)
+    return header + str(data)
+
+
 def _format_fr_compact(coins: list, symbol: str) -> list:
     """Extract compact FR data for a specific coin from exchange-list response."""
     result = []
@@ -150,6 +167,658 @@ def _format_fr_compact(coins: list, symbol: str) -> list:
     return result
 
 
+# ─── Full Scan Readable Formatters ───────────────────────────────────────────
+# Rules:
+# 1. Data values are NEVER modified — only presentation changes
+# 2. Timestamps converted to WIB for readability
+# 3. Large numbers formatted ($1.23M, $456K) but remain accurate
+# 4. Summary line = factual observation, not opinion/verdict
+
+
+def _ts_wib(t: Any) -> str:
+    """Convert unix timestamp (seconds or milliseconds) to HH:MM WIB."""
+    if t is None or t == 0:
+        return "??:??"
+    try:
+        ts = float(t)
+        if ts > 1e12:  # milliseconds
+            ts = ts / 1000
+        return datetime.fromtimestamp(ts, tz=WIB).strftime("%H:%M")
+    except (ValueError, OSError):
+        return "??:??"
+
+
+def _fmt_num(v: float, prefix: str = "$", signed: bool = False) -> str:
+    """Format number as readable string. $1.23M, $456K, $1,234.
+    signed=True adds +/- prefix for delta values."""
+    if v is None:
+        return "N/A"
+    v = float(v)
+    av = abs(v)
+    sign = "-" if v < 0 else ("+" if signed else "")
+    if av >= 1e9:
+        return f"{sign}{prefix}{av / 1e9:,.2f}B"
+    elif av >= 1e6:
+        return f"{sign}{prefix}{av / 1e6:,.2f}M"
+    elif av >= 1e3:
+        return f"{sign}{prefix}{av / 1e3:,.1f}K"
+    else:
+        return f"{sign}{prefix}{av:,.2f}"
+
+
+def _get(d: dict, *keys, default=None):
+    """Get first matching key from dict (handles camelCase/snake_case variants)."""
+    for k in keys:
+        if k in d:
+            return d[k]
+    return default
+
+
+def _check_all_zero(label: str, data: list) -> bool:
+    """Check if data has rows but all key values are zero (false positive OK status).
+    Returns True if data is effectively empty/$0."""
+    if not data or not isinstance(data[0], dict):
+        return False
+    # Define which fields to check per panel
+    checks = {
+        "Orderbook Delta": ("aggregated_bids_usd", "bids_usd"),
+        "Taker Buy/Sell": ("aggregated_buy_volume_usd", "taker_buy_volume_usd"),
+        "Long/Short Ratio": ("global_account_long_percent", "longAccount"),
+    }
+    fields = checks.get(label)
+    if not fields:
+        return False
+    for row in data[-5:]:  # check last 5 rows
+        for f in fields:
+            v = row.get(f)
+            if v is not None and float(v) != 0:
+                return False  # found non-zero data
+    return True  # all checked rows were zero or missing
+
+
+def _fmt_scan_cvd(data: list, label: str) -> str:
+    """Format CVD time-series as readable table. Data unchanged."""
+    if not data:
+        return "**Empty dataset**\n\n"
+
+    show = data[-10:]
+    total = len(data)
+    out = f"*(last {len(show)} of {total})*\n\n"
+    out += "```\n"
+    out += f"{'Time':>6} | {'CVD':>14} | {'Delta':>12}\n"
+    out += f"{'─'*6} | {'─'*14} | {'─'*12}\n"
+
+    pos_deltas = 0
+    prev_cvd = None
+    first_cvd = None
+    last_cvd = None
+
+    for row in show:
+        if not isinstance(row, dict):
+            continue
+        t = _get(row, "t", "time", "timestamp", "createTime", default=0)
+        # CVD value — try multiple field names
+        cvd_val = _get(row, "cvd", "cum_vol_delta", "v", "value", "vol", default=None)
+        if cvd_val is None:
+            continue
+        cvd_val = float(cvd_val)
+
+        if first_cvd is None:
+            first_cvd = cvd_val
+        last_cvd = cvd_val
+
+        delta = cvd_val - prev_cvd if prev_cvd is not None else 0
+        if delta > 0:
+            pos_deltas += 1
+        prev_cvd = cvd_val
+
+        out += f"{_ts_wib(t):>6} | {cvd_val:>+14,.0f} | {delta:>+12,.0f}\n"
+
+    out += "```\n\n"
+
+    # Factual summary
+    n = len(show) - 1  # first row has no delta
+    if n > 0 and first_cvd is not None and last_cvd is not None:
+        net = last_cvd - first_cvd
+        direction = "rising" if net > 0 else "falling" if net < 0 else "flat"
+        out += (
+            f"**Summary:** {pos_deltas}/{n} positive delta, "
+            f"net change: {_fmt_num(net, signed=True)}, direction: {direction}\n\n"
+        )
+
+    return out
+
+
+def _fmt_scan_oi(data: list) -> str:
+    """Format Open Interest time-series as readable table."""
+    if not data:
+        return "**Empty dataset**\n\n"
+
+    show = data[-10:]
+    total = len(data)
+    out = f"*(last {len(show)} of {total})*\n\n"
+
+    # Detect if OHLC format or single value
+    sample = show[0] if isinstance(show[0], dict) else {}
+    has_ohlc = any(k in sample for k in ("o", "h", "l", "c", "open", "high", "low", "close"))
+
+    if has_ohlc:
+        out += "```\n"
+        out += f"{'Time':>6} | {'Open':>12} | {'High':>12} | {'Low':>12} | {'Close':>12}\n"
+        out += f"{'─'*6} | {'─'*12} | {'─'*12} | {'─'*12} | {'─'*12}\n"
+        first_close = None
+        last_close = None
+        for row in show:
+            if not isinstance(row, dict):
+                continue
+            t = _get(row, "t", "time", "timestamp", "createTime", default=0)
+            o = float(_get(row, "o", "open", default=0))
+            h = float(_get(row, "h", "high", default=0))
+            l = float(_get(row, "l", "low", default=0))
+            c = float(_get(row, "c", "close", default=0))
+            if first_close is None:
+                first_close = c
+            last_close = c
+            out += f"{_ts_wib(t):>6} | {_fmt_num(o):>12} | {_fmt_num(h):>12} | {_fmt_num(l):>12} | {_fmt_num(c):>12}\n"
+        out += "```\n\n"
+        if first_close and last_close:
+            change = last_close - first_close
+            out += f"**Summary:** OI {_fmt_num(first_close)} -> {_fmt_num(last_close)} (change: {_fmt_num(change, signed=True)})\n\n"
+    else:
+        out += "```\n"
+        out += f"{'Time':>6} | {'OI':>14} | {'Change':>12}\n"
+        out += f"{'─'*6} | {'─'*14} | {'─'*12}\n"
+        prev_val = None
+        first_val = None
+        last_val = None
+        for row in show:
+            if not isinstance(row, dict):
+                continue
+            t = _get(row, "t", "time", "timestamp", "createTime", default=0)
+            v = float(_get(row, "v", "value", "openInterest", "open_interest", default=0))
+            if first_val is None:
+                first_val = v
+            last_val = v
+            chg = v - prev_val if prev_val is not None else 0
+            prev_val = v
+            out += f"{_ts_wib(t):>6} | {_fmt_num(v):>14} | {_fmt_num(chg, signed=True):>12}\n"
+        out += "```\n\n"
+        if first_val is not None and last_val is not None:
+            net = last_val - first_val
+            direction = "rising" if net > 0 else "falling" if net < 0 else "flat"
+            out += f"**Summary:** OI {direction}, net change: {_fmt_num(net, signed=True)}\n\n"
+
+    return out
+
+
+def _fmt_scan_fr(data: list) -> str:
+    """Format Funding Rate (already compacted) as readable table."""
+    if not data:
+        return "**No funding rate data**\n\n"
+
+    # If already compacted list of dicts with 'exchange' key
+    if isinstance(data[0], dict) and "exchange" in data[0]:
+        out = "```\n"
+        out += f"{'Exchange':<12} | {'FR':>10} | {'Interval':>8} | {'Next Funding':>14}\n"
+        out += f"{'─'*12} | {'─'*10} | {'─'*8} | {'─'*14}\n"
+
+        fr_values = []
+        for row in data:
+            ex = row.get("exchange", "?")
+            fr = row.get("funding_rate", 0)
+            interval = row.get("interval_h", 8)
+            nf = row.get("next_funding")
+            nf_str = _ts_wib(nf) if nf else "N/A"
+            if fr is not None:
+                fr_values.append(float(fr))
+            fr_pct = float(fr) * 100 if fr else 0
+            out += f"{ex:<12} | {fr_pct:>+10.4f}% | {interval:>7}h | {nf_str:>14}\n"
+
+        out += "```\n\n"
+
+        if fr_values:
+            avg_fr = sum(fr_values) / len(fr_values) * 100
+            out += f"**Summary:** Avg FR: {avg_fr:+.4f}% across {len(fr_values)} exchanges\n\n"
+        return out
+    else:
+        # Fallback for unexpected format
+        return json.dumps(data, indent=2, default=str) + "\n\n"
+
+
+def _fmt_scan_ob_delta(data: list) -> str:
+    """Format Orderbook Delta time-series as readable table."""
+    if not data:
+        return "**Empty dataset**\n\n"
+
+    show = data[-10:]
+    total = len(data)
+    out = f"*(last {len(show)} of {total})*\n\n"
+    out += "```\n"
+    out += f"{'Time':>6} | {'Bids':>12} | {'Asks':>12} | {'Delta':>12} | {'Dominant':>8}\n"
+    out += f"{'─'*6} | {'─'*12} | {'─'*12} | {'─'*12} | {'─'*8}\n"
+
+    bid_dominant = 0
+    n = 0
+
+    for row in show:
+        if not isinstance(row, dict):
+            continue
+        t = _get(row, "t", "time", "timestamp", "createTime", default=0)
+        bids = float(_get(row, "aggregated_bids_usd", "bids_usd", "bids", "bidVol", "bid", default=0))
+        asks = float(_get(row, "aggregated_asks_usd", "asks_usd", "asks", "askVol", "ask", default=0))
+        delta = bids - asks
+        dominant = "BIDS" if delta > 0 else "ASKS"
+        if delta > 0:
+            bid_dominant += 1
+        n += 1
+        out += f"{_ts_wib(t):>6} | {_fmt_num(bids):>12} | {_fmt_num(asks):>12} | {_fmt_num(delta, signed=True):>12} | {dominant:>8}\n"
+
+    out += "```\n\n"
+
+    if n > 0:
+        out += f"**Summary:** {bid_dominant}/{n} bid-dominant candles\n\n"
+
+    return out
+
+
+def _fmt_scan_price(data: list) -> str:
+    """Format Price OHLC time-series as readable table."""
+    if not data:
+        return "**Empty dataset**\n\n"
+
+    show = data[-10:]
+    total = len(data)
+    out = f"*(last {len(show)} of {total})*\n\n"
+    out += "```\n"
+    out += f"{'Time':>6} | {'Open':>12} | {'High':>12} | {'Low':>12} | {'Close':>12} | {'Vol':>10}\n"
+    out += f"{'─'*6} | {'─'*12} | {'─'*12} | {'─'*12} | {'─'*12} | {'─'*10}\n"
+
+    highs = []
+    lows = []
+    last_close = None
+
+    for row in show:
+        if not isinstance(row, dict):
+            continue
+        t = _get(row, "t", "time", "timestamp", "createTime", default=0)
+        o = float(_get(row, "o", "open", default=0))
+        h = float(_get(row, "h", "high", default=0))
+        l = float(_get(row, "l", "low", default=0))
+        c = float(_get(row, "c", "close", default=0))
+        v = float(_get(row, "v", "vol", "volume", "quoteVolume", default=0))
+        highs.append(h)
+        lows.append(l)
+        last_close = c
+        out += f"{_ts_wib(t):>6} | {_fmt_num(o, '$'):>12} | {_fmt_num(h, '$'):>12} | {_fmt_num(l, '$'):>12} | {_fmt_num(c, '$'):>12} | {_fmt_num(v, '$'):>10}\n"
+
+    out += "```\n\n"
+
+    if highs and lows and last_close:
+        range_h = max(highs)
+        range_l = min(lows)
+        range_pct = (range_h - range_l) / range_l * 100 if range_l else 0
+        out += (
+            f"**Summary:** Range {_fmt_num(range_l, '$')}-{_fmt_num(range_h, '$')} "
+            f"({range_pct:.2f}%), last close {_fmt_num(last_close, '$')}\n\n"
+        )
+
+    return out
+
+
+def _fmt_scan_taker(data: list) -> str:
+    """Format Taker Buy/Sell time-series as readable table."""
+    if not data:
+        return "**Empty dataset**\n\n"
+
+    show = data[-10:]
+    total = len(data)
+    out = f"*(last {len(show)} of {total})*\n\n"
+    out += "```\n"
+    out += f"{'Time':>6} | {'Buy Vol':>12} | {'Sell Vol':>12} | {'Net':>12} | {'Aggressor':>9}\n"
+    out += f"{'─'*6} | {'─'*12} | {'─'*12} | {'─'*12} | {'─'*9}\n"
+
+    buy_dominant = 0
+    total_net = 0
+    n = 0
+
+    for row in show:
+        if not isinstance(row, dict):
+            continue
+        t = _get(row, "t", "time", "timestamp", "createTime", default=0)
+        buy = float(_get(row, "aggregated_buy_volume_usd", "taker_buy_volume_usd", "buyVol", "buy_vol", "buy", "takerBuyVol", default=0))
+        sell = float(_get(row, "aggregated_sell_volume_usd", "taker_sell_volume_usd", "sellVol", "sell_vol", "sell", "takerSellVol", default=0))
+        net = buy - sell
+        total_net += net
+        aggressor = "BUY" if net > 0 else "SELL"
+        if net > 0:
+            buy_dominant += 1
+        n += 1
+        out += f"{_ts_wib(t):>6} | {_fmt_num(buy):>12} | {_fmt_num(sell):>12} | {_fmt_num(net, signed=True):>12} | {aggressor:>9}\n"
+
+    out += "```\n\n"
+
+    if n > 0:
+        out += (
+            f"**Summary:** {buy_dominant}/{n} buy-dominant, "
+            f"total net: {_fmt_num(total_net, signed=True)}\n\n"
+        )
+
+    return out
+
+
+def _fmt_scan_ls_ratio(data: list) -> str:
+    """Format Long/Short Ratio time-series as readable table."""
+    if not data:
+        return "**Empty dataset**\n\n"
+
+    show = data[-10:]
+    total = len(data)
+    out = f"*(last {len(show)} of {total})*\n\n"
+    out += "```\n"
+    out += f"{'Time':>6} | {'Long %':>8} | {'Short %':>8} | {'Ratio':>8}\n"
+    out += f"{'─'*6} | {'─'*8} | {'─'*8} | {'─'*8}\n"
+
+    ratios = []
+
+    for row in show:
+        if not isinstance(row, dict):
+            continue
+        t = _get(row, "t", "time", "timestamp", "createTime", default=0)
+        long_pct = _get(row, "global_account_long_percent", "longAccount", "long_account", "longRate", "long_rate", default=None)
+        short_pct = _get(row, "global_account_short_percent", "shortAccount", "short_account", "shortRate", "short_rate", default=None)
+        ratio = _get(row, "global_account_long_short_ratio", "longShortRatio", "long_short_ratio", "ratio", default=None)
+
+        # Convert ratio formats
+        if long_pct is not None:
+            long_pct = float(long_pct)
+            if long_pct <= 1:  # API returns as decimal 0.52
+                long_pct = long_pct * 100
+        if short_pct is not None:
+            short_pct = float(short_pct)
+            if short_pct <= 1:
+                short_pct = short_pct * 100
+        if ratio is not None:
+            ratio = float(ratio)
+            ratios.append(ratio)
+
+        l_str = f"{long_pct:.1f}%" if long_pct is not None else "N/A"
+        s_str = f"{short_pct:.1f}%" if short_pct is not None else "N/A"
+        r_str = f"{ratio:.3f}" if ratio is not None else "N/A"
+
+        out += f"{_ts_wib(t):>6} | {l_str:>8} | {s_str:>8} | {r_str:>8}\n"
+
+    out += "```\n\n"
+
+    if ratios:
+        avg_r = sum(ratios) / len(ratios)
+        min_r = min(ratios)
+        max_r = max(ratios)
+        out += (
+            f"**Summary:** Avg ratio {avg_r:.3f}, "
+            f"range {min_r:.3f}-{max_r:.3f}\n\n"
+        )
+
+    return out
+
+
+def _fmt_scan_liq_heatmap(data: Any) -> str:
+    """Format Liquidation Heatmap data (keep compact, structure varies)."""
+    if not data:
+        return "**Empty dataset**\n\n"
+    # Heatmap data is complex/nested — show compact JSON but limited
+    if isinstance(data, list) and len(data) > 5:
+        return f"*(showing last 5 of {len(data)})*\n" + json.dumps(data[-5:], indent=2, default=str) + "\n\n"
+    return json.dumps(data, indent=2, default=str) + "\n\n"
+
+
+def _fmt_scan_liq_orders(data: list) -> str:
+    """Format Liquidation Orders as readable table — factual only, no interpretation."""
+    if not data:
+        return "**No liquidation order data**\n\n"
+
+    # Sort by USD amount descending to show biggest clusters first
+    rows = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        price = float(row.get("price", 0))
+        amount = float(row.get("usd_value", row.get("vol_usd", row.get("amount_usd", 0))))
+        side_raw = row.get("side", "")
+        t = row.get("time", 0)
+        # side: 1=Buy (long liq = short closes), 2=Sell (short liq = long closes)
+        if side_raw == 1 or str(side_raw) == "1":
+            side = "LONG"   # buy-side liq = long position liquidated
+        elif side_raw == 2 or str(side_raw) == "2":
+            side = "SHORT"  # sell-side liq = short position liquidated
+        elif isinstance(side_raw, str):
+            side = side_raw.upper()
+        else:
+            side = "?"
+        rows.append({"price": price, "amount": amount, "side": side, "time": t})
+
+    if not rows:
+        return "**No liquidation order data**\n\n"
+
+    rows.sort(key=lambda r: r["amount"], reverse=True)
+    show = rows[:15]  # top 15 by size
+
+    out = "```\n"
+    out += f"{'Price':>12} | {'Side':>6} | {'Amount':>10} | {'Time':>6}\n"
+    out += f"{'─'*12} | {'─'*6} | {'─'*10} | {'─'*6}\n"
+
+    total_long = 0.0
+    total_short = 0.0
+
+    for r in show:
+        if r["side"] == "LONG":
+            total_long += r["amount"]
+        else:
+            total_short += r["amount"]
+        out += (
+            f"{_fmt_num(r['price'], '$'):>12} | {r['side']:>6} | "
+            f"{_fmt_num(r['amount']):>10} | {_ts_wib(r['time']):>6}\n"
+        )
+
+    out += "```\n\n"
+
+    # Factual stats only — no interpretation
+    biggest = rows[0]
+    out += (
+        f"**Stats:** Largest: {_fmt_num(biggest['price'], '$')} "
+        f"({biggest['side']} {_fmt_num(biggest['amount'])})\n"
+        f"Total LONG liq: {_fmt_num(total_long)} | "
+        f"Total SHORT liq: {_fmt_num(total_short)}\n\n"
+    )
+
+    return out
+
+
+def _fmt_p2_hyperliquid_ls(data: list) -> str:
+    """Format Hyperliquid L/S ratio as table — factual only."""
+    if not data:
+        return "**No data**\n\n"
+    out = "```\n"
+    out += f"{'Time':>6} | {'Long %':>8} | {'Short %':>8} | {'Ratio':>8} | {'Accts':>7}\n"
+    out += f"{'─'*6} | {'─'*8} | {'─'*8} | {'─'*8} | {'─'*7}\n"
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        t = _get(row, "t", "time", "timestamp", default=0)
+        long_pct = float(_get(row, "global_account_long_percent", "longPercent", "long_percent", default=0))
+        short_pct = float(_get(row, "global_account_short_percent", "shortPercent", "short_percent", default=0))
+        ratio = float(_get(row, "global_account_long_short_ratio", "longShortRatio", "ratio", default=0))
+        total = int(float(_get(row, "global_account_total_count", "totalCount", default=0)))
+        out += f"{_ts_wib(t):>6} | {long_pct:>7.1f}% | {short_pct:>7.1f}% | {ratio:>8.3f} | {total:>7}\n"
+    out += "```\n\n"
+    return out
+
+
+def _fmt_p2_top_position_ls(data: list) -> str:
+    """Format Top Trader Position L/S ratio as table — factual only."""
+    if not data:
+        return "**No data**\n\n"
+    out = "```\n"
+    out += f"{'Time':>6} | {'Long %':>8} | {'Short %':>8} | {'Ratio':>8}\n"
+    out += f"{'─'*6} | {'─'*8} | {'─'*8} | {'─'*8}\n"
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        t = _get(row, "t", "time", "timestamp", default=0)
+        long_pct = _get(row, "top_position_long_percent", "longAccount", "longRate", default=None)
+        short_pct = _get(row, "top_position_short_percent", "shortAccount", "shortRate", default=None)
+        ratio = _get(row, "top_position_long_short_ratio", "longShortRatio", "ratio", default=None)
+        if long_pct is not None:
+            long_pct = float(long_pct)
+            if 0 < long_pct <= 1:
+                long_pct *= 100
+        if short_pct is not None:
+            short_pct = float(short_pct)
+            if 0 < short_pct <= 1:
+                short_pct *= 100
+        if ratio is not None:
+            ratio = float(ratio)
+        l_str = f"{long_pct:.1f}%" if long_pct is not None else "N/A"
+        s_str = f"{short_pct:.1f}%" if short_pct is not None else "N/A"
+        r_str = f"{ratio:.3f}" if ratio is not None else "N/A"
+        out += f"{_ts_wib(t):>6} | {l_str:>8} | {s_str:>8} | {r_str:>8}\n"
+    out += "```\n\n"
+    return out
+
+
+def _fmt_p2_spot_large_orders(data: list) -> str:
+    """Format Spot Large Orders as table — factual only."""
+    if not data:
+        return "**No large orders**\n\n"
+    # Sort by USD amount descending
+    rows = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        price = float(_get(row, "limit_price", "price", default=0))
+        amount_usd = float(_get(row, "current_usd_value", "start_usd_value", "amountUsd", default=0))
+        side_raw = _get(row, "order_side", "orderSide", "side", "posSide", default="")
+        # order_side: 1=BID(buy), 2=ASK(sell)
+        if side_raw in (1, "1"):
+            side = "BID"
+        elif side_raw in (2, "2"):
+            side = "ASK"
+        elif isinstance(side_raw, str):
+            side = side_raw.upper()
+            if side in ("BUY",):
+                side = "BID"
+            elif side in ("SELL",):
+                side = "ASK"
+        else:
+            side = "?"
+        if amount_usd > 0:
+            rows.append({"price": price, "amount_usd": amount_usd, "side": side})
+    if not rows:
+        return "**No large orders**\n\n"
+    rows.sort(key=lambda r: r["amount_usd"], reverse=True)
+    show = rows[:10]
+    out = "```\n"
+    out += f"{'Price':>12} | {'Side':>5} | {'Amount':>10}\n"
+    out += f"{'─'*12} | {'─'*5} | {'─'*10}\n"
+    total_bid = 0.0
+    total_ask = 0.0
+    for r in show:
+        if r["side"] == "BID":
+            total_bid += r["amount_usd"]
+        else:
+            total_ask += r["amount_usd"]
+        out += f"{_fmt_num(r['price'], '$'):>12} | {r['side']:>5} | {_fmt_num(r['amount_usd']):>10}\n"
+    out += "```\n\n"
+    bid_count = len([r for r in show if r["side"] == "BID"])
+    ask_count = len([r for r in show if r["side"] == "ASK"])
+    out += (
+        f"**Stats:** {bid_count} bids / {ask_count} asks | "
+        f"Total BID: {_fmt_num(total_bid)} | Total ASK: {_fmt_num(total_ask)}\n\n"
+    )
+    return out
+
+
+def _fmt_whale_alert(data: list) -> str:
+    """Format Hyperliquid whale alerts as readable table — factual only."""
+    if not data:
+        return "**No whale alerts**\n\n"
+    out = "```\n"
+    out += f"{'Time':>6} | {'Coin':>6} | {'Action':>6} | {'Side':>6} | {'Size':>12} | {'Entry':>12}\n"
+    out += f"{'─'*6} | {'─'*6} | {'─'*6} | {'─'*6} | {'─'*12} | {'─'*12}\n"
+    total_long_open = 0.0
+    total_short_open = 0.0
+    for w in data[:20]:  # show top 20
+        if not isinstance(w, dict):
+            continue
+        sym = w.get("symbol", "?")
+        pos_size = float(w.get("position_size", 0))
+        pos_value = float(w.get("position_value_usd", 0))
+        entry = float(w.get("entry_price", 0))
+        action_raw = w.get("position_action", 0)
+        t = w.get("create_time", w.get("time", 0))
+        direction = "LONG" if pos_size > 0 else "SHORT"
+        action = "OPEN" if action_raw == 1 else "CLOSE"
+        if action == "OPEN" and direction == "LONG":
+            total_long_open += pos_value
+        elif action == "OPEN" and direction == "SHORT":
+            total_short_open += pos_value
+        out += (
+            f"{_ts_wib(t):>6} | {sym:>6} | {action:>6} | {direction:>6} | "
+            f"{_fmt_num(pos_value):>12} | {_fmt_num(entry, '$'):>12}\n"
+        )
+    out += "```\n\n"
+    out += (
+        f"**Stats:** Open LONG: {_fmt_num(total_long_open)} | "
+        f"Open SHORT: {_fmt_num(total_short_open)}\n\n"
+    )
+    return out
+
+
+def _fmt_liq_history(data: list) -> str:
+    """Format liquidation history time-series as readable table — factual only."""
+    if not data:
+        return "**Empty dataset**\n\n"
+    show = data[-10:]
+    total = len(data)
+    out = f"*(last {len(show)} of {total})*\n\n"
+    out += "```\n"
+    out += f"{'Time':>6} | {'Long Liq':>12} | {'Short Liq':>12} | {'Total':>12}\n"
+    out += f"{'─'*6} | {'─'*12} | {'─'*12} | {'─'*12}\n"
+    total_long = 0.0
+    total_short = 0.0
+    for row in show:
+        if not isinstance(row, dict):
+            continue
+        t = _get(row, "t", "time", "timestamp", "createTime", default=0)
+        long_liq = float(_get(row, "longLiquidationUsd", "long_liquidation_usd",
+                               "longVolUsd", "buyVolUsd", default=0))
+        short_liq = float(_get(row, "shortLiquidationUsd", "short_liquidation_usd",
+                                "shortVolUsd", "sellVolUsd", default=0))
+        total_row = long_liq + short_liq
+        total_long += long_liq
+        total_short += short_liq
+        out += f"{_ts_wib(t):>6} | {_fmt_num(long_liq):>12} | {_fmt_num(short_liq):>12} | {_fmt_num(total_row):>12}\n"
+    out += "```\n\n"
+    out += (
+        f"**Stats:** Total LONG liq: {_fmt_num(total_long)} | "
+        f"Total SHORT liq: {_fmt_num(total_short)}\n\n"
+    )
+    return out
+
+
+# Map full_scan labels to their formatters
+_SCAN_FORMATTERS = {
+    "Spot CVD": lambda data, label: _fmt_scan_cvd(data, label),
+    "Futures CVD": lambda data, label: _fmt_scan_cvd(data, label),
+    "Open Interest": lambda data, label: _fmt_scan_oi(data),
+    "Funding Rate": lambda data, label: _fmt_scan_fr(data),
+    "Orderbook Delta": lambda data, label: _fmt_scan_ob_delta(data),
+    "Price OHLC": lambda data, label: _fmt_scan_price(data),
+    "Taker Buy/Sell": lambda data, label: _fmt_scan_taker(data),
+    "Long/Short Ratio": lambda data, label: _fmt_scan_ls_ratio(data),
+    "Liquidation Heatmap": lambda data, label: _fmt_scan_liq_heatmap(data),
+}
+
+
 def _fmt_fr_exchange_list(result: FetchResult, label: str) -> str:
     """Format FR exchange-list with compact per-exchange breakdown."""
     header = f"## Funding Rate — {label}\n\n"
@@ -167,44 +836,6 @@ def _fmt_fr_exchange_list(result: FetchResult, label: str) -> str:
         return f"{header}**No active funding rate entries.**"
     return header + json.dumps(compacted, indent=2, default=str)
 
-
-def fmt_cvd(result: FetchResult, cvd_type: str) -> str:
-    """Format CVD response with trading interpretation."""
-    title = f"{'Spot' if cvd_type == 'spot' else 'Futures'} CVD (Cumulative Volume Delta)"
-    output = fmt(result, title)
-
-    # Add interpretation from latest data points
-    data = result.data
-    if isinstance(data, list) and len(data) >= 2:
-        last = data[-1]
-        prev = data[-2]
-        if isinstance(last, dict) and isinstance(prev, dict):
-            # Try to extract CVD value
-            for key in ("cvd", "v", "value", "vol"):
-                if key in last and key in prev:
-                    current = float(last[key])
-                    previous = float(prev[key])
-                    delta = current - previous
-                    direction = "RISING" if delta > 0 else "FALLING"
-                    sign = "POSITIVE" if current > 0 else "NEGATIVE"
-                    output += f"\n\n**Quick Read:** {sign} {direction} ({current:+,.0f}, delta: {delta:+,.0f})"
-                    break
-
-    if cvd_type == "spot":
-        output += (
-            "\n\n**Ricoz Framework:**\n"
-            "- SpotCVD POSITIVE + rising = spot buyers dominant = BULLISH\n"
-            "- SpotCVD NEGATIVE = **VETO — DO NOT LONG**\n"
-            "- Look at DIRECTION, not just absolute number"
-        )
-    else:
-        output += (
-            "\n\n**Ricoz Framework:**\n"
-            "- FutCVD confirms SpotCVD directional bias\n"
-            "- Both rising = strong LONG | Both falling = strong SHORT\n"
-            "- Divergence = CAUTION, wait for alignment"
-        )
-    return output
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -239,7 +870,7 @@ async def coinglass_spot_cvd(
         "interval": interval,
         "limit": limit,
     })
-    return fmt_cvd(result, "spot")
+    return fmt_parsed(result, f"Spot CVD — {sym}", lambda d: _fmt_scan_cvd(d, "Spot CVD"))
 
 
 @mcp.tool()
@@ -269,7 +900,7 @@ async def coinglass_futures_cvd(
         "interval": interval,
         "limit": limit,
     })
-    return fmt_cvd(result, "futures")
+    return fmt_parsed(result, f"Futures CVD — {sym}", lambda d: _fmt_scan_cvd(d, "Futures CVD"))
 
 
 @mcp.tool()
@@ -316,14 +947,7 @@ async def coinglass_funding_rate(symbol: str = "") -> str:
                 data=top50, age_seconds=result.age_seconds,
                 is_cached=result.is_cached, fetched_at=result.fetched_at,
             )
-    output = fmt(result, f"Funding Rate — Top 50 Extreme FR (of {total} active)")
-    output += (
-        "\n\n**Ricoz Framework:**\n"
-        "- FR > +0.03% = overleveraged longs → SHORT bias\n"
-        "- FR < -0.03% = overleveraged shorts → LONG bias\n"
-        "- Check FR trend over 8h for better signal"
-    )
-    return output
+    return fmt(result, f"Funding Rate — Top 50 Extreme FR (of {total} active)")
 
 
 @mcp.tool()
@@ -356,14 +980,7 @@ async def coinglass_open_interest(
     if exchange:
         params["exchange_list"] = exchange
     result = await client.get("/api/futures/open-interest/aggregated-history", params)
-    output = fmt(result, f"Open Interest — {sym}")
-    output += (
-        "\n\n**Ricoz Framework:**\n"
-        "- Compare OI change with price direction\n"
-        "- Sudden OI spike = new positions, volatility incoming\n"
-        "- OI dropping sharply = liquidation cascade"
-    )
-    return output
+    return fmt_parsed(result, f"Open Interest — {sym}", _fmt_scan_oi)
 
 
 @mcp.tool()
@@ -397,14 +1014,7 @@ async def coinglass_liquidation_map(
         "symbol": pair,
         "range": range,
     })
-    output = fmt(result, f"Liquidation Heatmap — {pair} ({exchange}, {range})")
-    output += (
-        "\n\n**Ricoz Framework:**\n"
-        "- Large liq clusters = magnetic targets (price moves toward them)\n"
-        "- After sweep through cluster = potential reversal\n"
-        "- Use for TP/SL placement"
-    )
-    return output
+    return fmt(result, f"Liquidation Heatmap — {pair} ({exchange}, {range})")
 
 
 @mcp.tool()
@@ -438,14 +1048,7 @@ async def coinglass_orderbook(
         "limit": limit,
         "range": range,
     })
-    output = fmt(result, f"Orderbook Delta — {normalize_symbol(symbol)}")
-    output += (
-        "\n\n**Ricoz Framework:**\n"
-        "- OBDelta positive = more bids, bullish pressure\n"
-        "- OBDelta negative = more asks, bearish pressure\n"
-        "- Combine with CVD for entry confirmation"
-    )
-    return output
+    return fmt_parsed(result, f"Orderbook Delta — {normalize_symbol(symbol)}", _fmt_scan_ob_delta)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -535,7 +1138,7 @@ async def coinglass_long_short_ratio(
         "interval": interval,
         "limit": limit,
     })
-    return fmt(result, f"Long/Short Ratio — {normalize_symbol(symbol)}")
+    return fmt_parsed(result, f"Long/Short Ratio — {normalize_symbol(symbol)}", _fmt_scan_ls_ratio)
 
 
 @mcp.tool()
@@ -565,7 +1168,7 @@ async def coinglass_taker_buysell(
         "interval": interval,
         "limit": limit,
     })
-    return fmt(result, f"Taker Buy/Sell — {sym}")
+    return fmt_parsed(result, f"Taker Buy/Sell — {sym}", _fmt_scan_taker)
 
 
 @mcp.tool()
@@ -652,7 +1255,7 @@ async def coinglass_whale_alert(symbol: str = "") -> str:
         symbol: Ignored — returns all whales. Accepted for compatibility.
     """
     result = await client.get("/api/hyperliquid/whale-alert")
-    return fmt(result, "Whale Alerts — Hyperliquid")
+    return fmt_parsed(result, "Whale Alerts — Hyperliquid", _fmt_whale_alert)
 
 
 @mcp.tool()
@@ -746,13 +1349,6 @@ async def coinglass_footprint(
                 output += f"- ${mid:,.2f}: buy ${l[6]:,.0f} vs sell ${l[7]:,.0f} → **{side}** ${abs(l[6]-l[7]):,.0f}\n"
         output += "\n"
 
-    output += (
-        "**Ricoz Framework:**\n"
-        "- Buy wall di level = support (harga susah turun)\n"
-        "- Sell wall di level = resistance (harga susah naik)\n"
-        "- Delta positif konsisten = absorption bullish\n"
-        "- Delta negatif konsisten = absorption bearish\n"
-    )
     return output
 
 
@@ -1080,14 +1676,7 @@ async def coinglass_funding_rate_cat(
                 data=filtered, age_seconds=result.age_seconds,
                 is_cached=result.is_cached, fetched_at=result.fetched_at,
             )
-        output = _fmt_fr_exchange_list(result, sym or "All Coins")
-        output += (
-            "\n\n**Ricoz Framework:**\n"
-            "- FR > +0.03% = overleveraged longs → SHORT bias\n"
-            "- FR < -0.03% = overleveraged shorts → LONG bias\n"
-            "- Check FR trend over 8h for better signal"
-        )
-        return output
+        return _fmt_fr_exchange_list(result, sym or "All Coins")
 
     elif action == "cumulative":
         params: dict = {"range": range}
@@ -1248,7 +1837,7 @@ async def coinglass_liquidation_cat(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"Liq Pair History — {pair} ({exchange})")
+        return fmt_parsed(result, f"Liq Pair History — {pair} ({exchange})", _fmt_liq_history)
 
     elif action == "coin_history":
         result = await client.get("/api/futures/liquidation/aggregated-history", {
@@ -1257,7 +1846,7 @@ async def coinglass_liquidation_cat(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"Liq Aggregated History — {sym}")
+        return fmt_parsed(result, f"Liq Aggregated History — {sym}", _fmt_liq_history)
 
     elif action == "coin_list":
         result = await client.get("/api/futures/liquidation/coin-list", {
@@ -1278,7 +1867,7 @@ async def coinglass_liquidation_cat(
             "symbol": sym,
             "min_liquidation_amount": str(min_amount),
         })
-        return fmt(result, f"Liq Orders — {sym} ({exchange}, min ${min_amount:,})")
+        return fmt_parsed(result, f"Liq Orders — {sym} ({exchange}, min ${min_amount:,})", _fmt_scan_liq_orders)
 
     else:
         return (
@@ -2139,12 +2728,12 @@ async def coinglass_full_scan(
          {"exchange_list": exchange, "symbol": sym, "interval": interval, "limit": limit}),
         ("Funding Rate", "/api/futures/funding-rate/exchange-list",
          {}),
-        ("Orderbook Delta", "/api/futures/orderbook/aggregated-ask-bids-history",
-         {"exchange_list": exchange, "symbol": sym, "interval": interval, "range": "1", "limit": limit}),
+        ("Orderbook Delta", "/api/futures/orderbook/ask-bids-history",
+         {"exchange": exchange, "symbol": pair, "interval": interval, "range": "1", "limit": limit}),
         ("Price OHLC", "/api/futures/price/history",
          {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit}),
-        ("Taker Buy/Sell", "/api/futures/aggregated-taker-buy-sell-volume/history",
-         {"exchange_list": exchange, "symbol": sym, "interval": interval, "limit": limit}),
+        ("Taker Buy/Sell", "/api/futures/v2/taker-buy-sell-volume/history",
+         {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit}),
         ("Long/Short Ratio", "/api/futures/global-long-short-account-ratio/history",
          {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit}),
     ]
@@ -2168,6 +2757,31 @@ async def coinglass_full_scan(
                 "interval": "5m", "limit": 3,
             })
         )
+    # Liquidation Orders — cluster data for TP/SL placement
+    precision_calls.append(
+        ("Liq Orders", "/api/futures/liquidation/order", {
+            "exchange": exchange, "symbol": sym,
+            "min_liquidation_amount": "10000",
+        })
+    )
+    # Hyperliquid L/S Ratio — on-chain sophisticated trader sentiment
+    precision_calls.append(
+        ("Hyperliquid L/S", "/api/hyperliquid/global-long-short-account-ratio/history", {
+            "symbol": sym, "interval": "1h", "limit": 5,
+        })
+    )
+    # Top Trader Position Ratio — smart money positioning (not retail)
+    precision_calls.append(
+        ("Top Position L/S", "/api/futures/top-long-short-position-ratio/history", {
+            "exchange": exchange, "symbol": pair, "interval": interval, "limit": 5,
+        })
+    )
+    # Spot Large Orders — detect bid/ask walls, spoofing identification
+    precision_calls.append(
+        ("Spot Large Orders", "/api/spot/orderbook/large-limit-order", {
+            "exchange": exchange, "symbol": pair,
+        })
+    )
     # RSI — use rsi/list (all coins) then filter, because per-coin endpoint is broken
     precision_calls.append(
         ("RSI", "/api/futures/rsi/list", {})
@@ -2248,8 +2862,10 @@ async def coinglass_full_scan(
             else:
                 supplementary_failed.append(label)
         elif isinstance(result, FetchResult):
-            # Detect empty dataset (API succeeded but returned no data)
+            # Detect empty dataset (API succeeded but returned no data or all $0)
             is_empty = (isinstance(result.data, list) and len(result.data) == 0)
+            if not is_empty and isinstance(result.data, list) and result.data:
+                is_empty = _check_all_zero(base_label, result.data)
             if is_empty:
                 status = "NO DATA (empty — coin may not be listed on this exchange)"
                 icon = "X"
@@ -2318,7 +2934,7 @@ async def coinglass_full_scan(
             output += f"Also failed (supplementary): {', '.join(supplementary_failed)}\n\n"
         return output
 
-    # Data sections
+    # Data sections — formatted as readable tables (data values unchanged)
     for (label, _, _), result in zip(calls, raw_results):
         output += f"---\n\n## {label}\n\n"
         if isinstance(result, Exception):
@@ -2326,20 +2942,20 @@ async def coinglass_full_scan(
         elif isinstance(result, FetchResult):
             output += _age_banner(result)
             data = result.data
-            if isinstance(data, list):
-                if len(data) == 0:
-                    output += "**Empty dataset**\n\n"
-                elif label == "Funding Rate":
-                    # FR: show ALL exchanges (already filtered to 1 symbol)
-                    output += json.dumps(data, indent=2, default=str) + "\n\n"
-                elif len(data) > 10:
-                    # Time-series: show last 10 (most recent)
+            # Match label to formatter (handle fallback labels like "Spot CVD (fallback: OKX)")
+            base_label = label.split(" (fallback")[0]
+            formatter = _SCAN_FORMATTERS.get(base_label)
+            if formatter and isinstance(data, (list, dict)) and data:
+                output += formatter(data, label)
+            elif isinstance(data, list) and len(data) == 0:
+                output += "**Empty dataset**\n\n"
+            else:
+                # Fallback: compact JSON for unknown formats
+                if isinstance(data, list) and len(data) > 10:
                     output += f"*(last 10 of {len(data)})*\n"
                     output += json.dumps(data[-10:], indent=2, default=str) + "\n\n"
                 else:
                     output += json.dumps(data, indent=2, default=str) + "\n\n"
-            else:
-                output += json.dumps(data, indent=2, default=str) + "\n\n"
 
     # Warnings
     if supplementary_failed:
@@ -2511,6 +3127,69 @@ async def coinglass_full_scan(
     else:
         output += "**Footprint:** Not available (requires Standard+ plan)\n\n"
 
+    # ── Liquidation Orders ──
+    liq_result = p2.get("Liq Orders")
+    if isinstance(liq_result, FetchResult) and not liq_result.is_expired:
+        output += _age_banner(liq_result)
+        liq_data = liq_result.data
+        if isinstance(liq_data, list) and liq_data:
+            output += f"## Liquidation Orders — {raw_sym} | {exchange} | 24h\n\n"
+            output += _fmt_scan_liq_orders(liq_data)
+        else:
+            output += f"**Liq Orders:** No {raw_sym} liquidation orders in last 24h\n\n"
+    elif isinstance(liq_result, Exception):
+        output += (
+            f"**Liq Orders:** FAILED — "
+            f"{client._mask_key(str(liq_result))}\n\n"
+        )
+    else:
+        output += "**Liq Orders:** Data expired or unavailable\n\n"
+
+    # ── Hyperliquid L/S Ratio ──
+    hl_result = p2.get("Hyperliquid L/S")
+    if isinstance(hl_result, FetchResult) and not hl_result.is_expired:
+        output += _age_banner(hl_result)
+        hl_data = hl_result.data
+        if isinstance(hl_data, list) and hl_data:
+            output += f"## Hyperliquid L/S Ratio — {raw_sym} | 1h\n\n"
+            output += _fmt_p2_hyperliquid_ls(hl_data)
+        else:
+            output += f"**Hyperliquid L/S:** No data for {raw_sym}\n\n"
+    elif isinstance(hl_result, Exception):
+        output += f"**Hyperliquid L/S:** FAILED — {client._mask_key(str(hl_result))}\n\n"
+    else:
+        output += "**Hyperliquid L/S:** Data expired or unavailable\n\n"
+
+    # ── Top Trader Position L/S Ratio ──
+    tp_result = p2.get("Top Position L/S")
+    if isinstance(tp_result, FetchResult) and not tp_result.is_expired:
+        output += _age_banner(tp_result)
+        tp_data = tp_result.data
+        if isinstance(tp_data, list) and tp_data:
+            output += f"## Top Position L/S — {raw_sym} | {exchange} | {interval}\n\n"
+            output += _fmt_p2_top_position_ls(tp_data)
+        else:
+            output += f"**Top Position L/S:** No data for {raw_sym}\n\n"
+    elif isinstance(tp_result, Exception):
+        output += f"**Top Position L/S:** FAILED — {client._mask_key(str(tp_result))}\n\n"
+    else:
+        output += "**Top Position L/S:** Data expired or unavailable\n\n"
+
+    # ── Spot Large Orders ──
+    slo_result = p2.get("Spot Large Orders")
+    if isinstance(slo_result, FetchResult) and not slo_result.is_expired:
+        output += _age_banner(slo_result)
+        slo_data = slo_result.data
+        if isinstance(slo_data, list) and slo_data:
+            output += f"## Spot Large Orders — {raw_sym} | {exchange}\n\n"
+            output += _fmt_p2_spot_large_orders(slo_data)
+        else:
+            output += f"**Spot Large Orders:** No large orders for {raw_sym}\n\n"
+    elif isinstance(slo_result, Exception):
+        output += f"**Spot Large Orders:** FAILED — {client._mask_key(str(slo_result))}\n\n"
+    else:
+        output += "**Spot Large Orders:** Data expired or unavailable\n\n"
+
     # ── RSI (from rsi/list — filter by symbol) ──
     rsi_result = p2.get("RSI")
     rsi_value = None
@@ -2541,20 +3220,9 @@ async def coinglass_full_scan(
                         rsi_parts.append(f"{tf}={v:.1f}")
                 output += f"**RSI:** {' | '.join(rsi_parts)}\n"
 
-                if rsi_value is not None:
-                    if rsi_value >= 70:
-                        rsi_label = "OVERBOUGHT — contrarian SHORT zone"
-                    elif rsi_value <= 30:
-                        rsi_label = "OVERSOLD — contrarian LONG zone"
-                    elif rsi_value >= 60:
-                        rsi_label = "Bullish momentum"
-                    elif rsi_value <= 40:
-                        rsi_label = "Bearish momentum"
-                    else:
-                        rsi_label = "Neutral"
-                    output += f"**RSI ({interval} → {interval_map.get(interval, '1h')}):** {rsi_value:.1f} — **{rsi_label}**\n\n"
-                else:
-                    output += f"**RSI:** No data for {interval} interval\n\n"
+                if rsi_value is None:
+                    output += f"*(no RSI data for {interval} interval)*\n"
+                output += "\n"
             else:
                 output += f"**RSI:** {raw_sym} not found in RSI list\n\n"
         else:
@@ -2567,71 +3235,6 @@ async def coinglass_full_scan(
     else:
         output += "**RSI:** Data expired or unavailable\n\n"
 
-    # ── Conviction Summary ──
-    whale_long = sum(
-        w["size_usd"] for w in whale_entries
-        if w["action"] == "OPEN" and w["direction"] == "LONG"
-    )
-    whale_short = sum(
-        w["size_usd"] for w in whale_entries
-        if w["action"] == "OPEN" and w["direction"] == "SHORT"
-    )
-    whale_dir = None
-    if whale_long > 0 or whale_short > 0:
-        whale_dir = "LONG" if whale_long > whale_short else "SHORT"
-
-    ob_dir = None
-    if ob_bids > 0 or ob_asks > 0:
-        ob_dir = "LONG" if ob_bids > ob_asks else "SHORT"
-
-    output += "---\n\n## CONVICTION LEVEL\n\n"
-
-    signals = [s for s in [whale_dir, ob_dir, fp_direction] if s]
-    if len(signals) >= 2:
-        long_count = sum(
-            1 for s in signals if s in ("LONG", "BUY")
-        )
-        short_count = sum(
-            1 for s in signals if s in ("SHORT", "SELL")
-        )
-        if long_count >= 2:
-            output += (
-                "**Whale + OB + Footprint aligned LONG "
-                "→ HIGH CONVICTION**\n"
-            )
-        elif short_count >= 2:
-            output += (
-                "**Whale + OB + Footprint aligned SHORT "
-                "→ HIGH CONVICTION**\n"
-            )
-        else:
-            output += (
-                "**Mixed signals → WARNING, reduce size "
-                "or wait for alignment**\n"
-            )
-    elif len(signals) == 1:
-        output += (
-            f"**Only 1 precision signal ({signals[0]}) "
-            f"— moderate conviction, check Phase 1 alignment**\n"
-        )
-    else:
-        output += (
-            "**Insufficient precision data "
-            "— use Phase 1 analysis only**\n"
-        )
-
-    # RSI warning overlay
-    if rsi_value is not None:
-        if rsi_value >= 70:
-            output += (
-                f"\n⚠️ **RSI {rsi_value:.0f} OVERBOUGHT** "
-                "— jangan LONG di sini, tunggu pullback atau SHORT\n"
-            )
-        elif rsi_value <= 30:
-            output += (
-                f"\n⚠️ **RSI {rsi_value:.0f} OVERSOLD** "
-                "— jangan SHORT di sini, tunggu bounce atau LONG\n"
-            )
 
     # ═════════════════════════════════════════════════════════════════
     # PHASE 3 — BINANCE DIRECT CROSS-CHECK
@@ -2657,9 +3260,10 @@ async def coinglass_full_scan(
             {"symbol": bn_fut_sym, "period": interval if interval in ("5m","15m","30m","1h","2h","4h") else "5m", "limit": 3},
         ),
         binance_spot_request("/api/v3/klines", {"symbol": bn_spot_sym, "interval": interval, "limit": 10}, weight=2),
+        binance_futures_request("/fapi/v1/klines", {"symbol": bn_fut_sym, "interval": interval, "limit": 50}, weight=5),
     ]
     bn_results = await asyncio.gather(*bn_tasks, return_exceptions=True)
-    bn_premium, bn_oi, bn_taker, bn_ls, bn_klines = bn_results
+    bn_premium, bn_oi, bn_taker, bn_ls, bn_klines, bn_fut_klines = bn_results
 
     # ── Futures Price + Funding Rate ──
     if isinstance(bn_premium, dict) and "markPrice" in bn_premium:
@@ -2681,18 +3285,32 @@ async def coinglass_full_scan(
         else:
             output += f"**Binance OI:** {oi_val:,.0f} {raw_sym}\n\n"
 
-    # ── Taker Buy/Sell Ratio ──
+    # ── Taker Buy/Sell Volume (cross-check FutCVD) ──
     if isinstance(bn_taker, list) and bn_taker:
-        output += "**Binance Futures Taker Buy/Sell:**\n"
+        # Get mark price for USD conversion
+        mark_price = 0.0
+        if isinstance(bn_premium, dict) and "markPrice" in bn_premium:
+            mark_price = float(bn_premium["markPrice"])
+        output += "**Binance Futures Taker Buy/Sell:**\n```\n"
+        output += f"{'Time':>6} | {'Buy':>10} | {'Sell':>10} | {'Net':>10} | {'Ratio':>6}\n"
+        output += f"{'─'*6} | {'─'*10} | {'─'*10} | {'─'*10} | {'─'*6}\n"
+        bn_buy_dom = 0
+        bn_total_net = 0.0
         for t in bn_taker[-5:]:
             ratio = float(t.get("buySellRatio", 0))
-            buy = float(t.get("buyVol", 0))
-            sell = float(t.get("sellVol", 0))
-            bias = "BULL" if ratio > 1 else "BEAR"
+            buy_qty = float(t.get("buyVol", 0))
+            sell_qty = float(t.get("sellVol", 0))
+            buy_usd = buy_qty * mark_price if mark_price else buy_qty
+            sell_usd = sell_qty * mark_price if mark_price else sell_qty
+            net_usd = buy_usd - sell_usd
+            bn_total_net += net_usd
+            if net_usd > 0:
+                bn_buy_dom += 1
             ts_ms = t.get("timestamp", 0)
             ts_str = datetime.fromtimestamp(ts_ms / 1000, tz=WIB).strftime("%H:%M") if ts_ms else "?"
-            output += f"- {ts_str}: ratio={ratio:.3f} buy={buy:,.0f} sell={sell:,.0f} → **{bias}**\n"
-        output += "\n"
+            output += f"{ts_str:>6} | {_fmt_num(buy_usd):>10} | {_fmt_num(sell_usd):>10} | {_fmt_num(net_usd, signed=True):>10} | {ratio:>6.3f}\n"
+        output += "```\n"
+        output += f"**Stats:** {bn_buy_dom}/5 buy-dominant | total net: {_fmt_num(bn_total_net, signed=True)}\n\n"
 
     # ── Long/Short Account Ratio ──
     if isinstance(bn_ls, list) and bn_ls:
@@ -2717,6 +3335,48 @@ async def coinglass_full_scan(
         output += f"- **Cumulative (5 candles): {cumulative:+,.0f} {sym}**\n\n"
     elif isinstance(bn_klines, dict) and "error" in bn_klines:
         output += f"**Binance Spot:** {bn_spot_sym} — {bn_klines.get('error', 'not available')}\n\n"
+
+    # ── VWAP (Volume Weighted Average Price) ──
+    # Calculated from futures klines: VWAP = Σ(TP × Vol) / Σ(Vol)
+    # where TP (Typical Price) = (High + Low + Close) / 3
+    # Binance klines: [openTime, O, H, L, C, vol, closeTime, quoteVol, trades, takerBuyBaseVol, takerBuyQuoteVol, ...]
+    if isinstance(bn_fut_klines, list) and len(bn_fut_klines) >= 3:
+        try:
+            sum_tp_vol = 0.0
+            sum_vol = 0.0
+            candle_count = len(bn_fut_klines)
+            first_ts = bn_fut_klines[0][0]
+            last_ts = bn_fut_klines[-1][0]
+
+            for c in bn_fut_klines:
+                h = float(c[2])
+                l = float(c[3])
+                cl = float(c[4])
+                vol = float(c[5])
+                tp = (h + l + cl) / 3
+                sum_tp_vol += tp * vol
+                sum_vol += vol
+
+            if sum_vol > 0:
+                vwap = sum_tp_vol / sum_vol
+                current_price = float(bn_fut_klines[-1][4])  # last close
+                diff = current_price - vwap
+                diff_pct = (diff / vwap) * 100
+                position = "ABOVE" if diff > 0 else "BELOW"
+                first_str = datetime.fromtimestamp(first_ts / 1000, tz=WIB).strftime("%H:%M")
+                last_str = datetime.fromtimestamp(last_ts / 1000, tz=WIB).strftime("%H:%M")
+
+                output += (
+                    f"**Futures VWAP ({candle_count}x {interval}, {first_str}-{last_str} WIB):**\n"
+                    f"- VWAP: ${vwap:,.2f}\n"
+                    f"- Price: ${current_price:,.2f}\n"
+                    f"- Price {position} VWAP by ${abs(diff):,.2f} ({diff_pct:+.2f}%)\n"
+                    f"- Total volume: {_fmt_num(sum_vol, '$')}\n\n"
+                )
+        except (IndexError, ValueError, TypeError):
+            pass  # silently skip if klines format unexpected
+    elif isinstance(bn_fut_klines, dict) and "error" in bn_fut_klines:
+        output += f"**VWAP:** {bn_fut_klines.get('error', 'futures klines not available')}\n\n"
 
     output += "\n"
     return output
