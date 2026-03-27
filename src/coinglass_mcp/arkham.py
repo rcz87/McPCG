@@ -24,7 +24,7 @@ import httpx
 WIB = timezone(timedelta(hours=7))
 
 ARKHAM_BASE_URL = "https://api.arkm.com"
-ARKHAM_TIMEOUT = 15.0
+ARKHAM_TIMEOUT = 10.0
 
 
 def _get_arkham_key() -> str:

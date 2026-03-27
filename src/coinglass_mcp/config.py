@@ -50,7 +50,7 @@ INTERVAL_MAP = {
 # ─── API Constants ────────────────────────────────────────────────────────────
 
 BASE_URL = "https://open-api-v4.coinglass.com"
-DEFAULT_TIMEOUT = 10  # seconds (was 30 — tightened per audit)
+DEFAULT_TIMEOUT = 8  # seconds — tight for MCP; retries handle transient failures
 CACHE_TTL = 60  # seconds
 DEFAULT_EXCHANGE = "Binance"  # Default exchange for endpoints that require it
 
@@ -59,7 +59,7 @@ STALE_WARNING_THRESHOLD = 120   # 2 min → WARNING
 STALE_EXPIRED_THRESHOLD = 300   # 5 min → DO NOT USE
 
 # Rate limiter
-MIN_REQUEST_SPACING = 0.2  # 200ms between requests
+MIN_REQUEST_SPACING = 0.1  # 100ms between requests (was 200ms — per-minute counter is the real guard)
 
 # ─── Symbol Normalization ────────────────────────────────────────────────────
 

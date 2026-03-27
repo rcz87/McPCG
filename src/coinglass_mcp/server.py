@@ -304,7 +304,7 @@ def _fmt_scan_cvd(data: list, label: str) -> str:
     if not data:
         return "**Empty dataset**\n\n"
 
-    show = data[-10:]
+    show = data[-15:]
     total = len(data)
     out = f"*(last {len(show)} of {total})*\n\n"
     out += "```\n"
@@ -357,7 +357,7 @@ def _fmt_scan_oi(data: list) -> str:
     if not data:
         return "**Empty dataset**\n\n"
 
-    show = data[-10:]
+    show = data[-15:]
     total = len(data)
     out = f"*(last {len(show)} of {total})*\n\n"
 
@@ -453,7 +453,7 @@ def _fmt_scan_ob_delta(data: list) -> str:
     if not data:
         return "**Empty dataset**\n\n"
 
-    show = data[-10:]
+    show = data[-15:]
     total = len(data)
     out = f"*(last {len(show)} of {total})*\n\n"
     out += "```\n"
@@ -489,7 +489,7 @@ def _fmt_scan_price(data: list) -> str:
     if not data:
         return "**Empty dataset**\n\n"
 
-    show = data[-10:]
+    show = data[-15:]
     total = len(data)
     out = f"*(last {len(show)} of {total})*\n\n"
     out += "```\n"
@@ -533,7 +533,7 @@ def _fmt_scan_taker(data: list) -> str:
     if not data:
         return "**Empty dataset**\n\n"
 
-    show = data[-10:]
+    show = data[-15:]
     total = len(data)
     out = f"*(last {len(show)} of {total})*\n\n"
     out += "```\n"
@@ -574,7 +574,7 @@ def _fmt_scan_ls_ratio(data: list) -> str:
     if not data:
         return "**Empty dataset**\n\n"
 
-    show = data[-10:]
+    show = data[-15:]
     total = len(data)
     out = f"*(last {len(show)} of {total})*\n\n"
     out += "```\n"
@@ -900,7 +900,7 @@ def _fmt_liq_history(data: list) -> str:
     """Format liquidation history time-series as readable table — factual only."""
     if not data:
         return "**Empty dataset**\n\n"
-    show = data[-10:]
+    show = data[-15:]
     total = len(data)
     out = f"*(last {len(show)} of {total})*\n\n"
     out += "```\n"
@@ -2848,7 +2848,7 @@ async def coinglass_full_scan(
     sym = to_cg_symbol(symbol)  # PEPE→1000PEPE, BTC→BTC
     raw_sym = normalize_symbol(symbol)  # Always base symbol for display
     pair = to_pair(symbol)
-    limit = 50
+    limit = 100
 
     # Define all endpoints with their labels and criticality
     # V4 API: some endpoints need coin-level (1000PEPE), some need pair-level (1000PEPEUSDT)
@@ -2880,14 +2880,14 @@ async def coinglass_full_scan(
         ("Whale Alert", "/api/hyperliquid/whale-alert", {}),
         ("OB Bidask ±1%", "/api/futures/orderbook/ask-bids-history", {
             "exchange": exchange, "symbol": pair,
-            "interval": interval, "limit": 3, "range": "1",
+            "interval": interval, "limit": 10, "range": "1",
         }),
     ]
     if config.has_feature("footprint"):
         precision_calls.append(
             ("Footprint", "/api/futures/volume/footprint-history", {
                 "exchange": exchange, "symbol": pair,
-                "interval": "5m", "limit": 3,
+                "interval": "5m", "limit": 10,
             })
         )
     # Liquidation Orders — cluster data for TP/SL placement
@@ -2900,13 +2900,13 @@ async def coinglass_full_scan(
     # Hyperliquid L/S Ratio — on-chain sophisticated trader sentiment
     precision_calls.append(
         ("Hyperliquid L/S", "/api/hyperliquid/global-long-short-account-ratio/history", {
-            "symbol": sym, "interval": "1h", "limit": 5,
+            "symbol": sym, "interval": "1h", "limit": 15,
         })
     )
     # Top Trader Position Ratio — smart money positioning (not retail)
     precision_calls.append(
         ("Top Position L/S", "/api/futures/top-long-short-position-ratio/history", {
-            "exchange": exchange, "symbol": pair, "interval": interval, "limit": 5,
+            "exchange": exchange, "symbol": pair, "interval": interval, "limit": 10,
         })
     )
     # Spot Large Orders — detect bid/ask walls, spoofing identification
@@ -2920,10 +2920,61 @@ async def coinglass_full_scan(
         ("RSI", "/api/futures/rsi/list", {})
     )
 
-    # Fetch ALL endpoints in one batch — rate limiter handles spacing
+    # ── Prepare ALL phases for parallel execution ──
+    # Phase 1+2: CoinGlass endpoints
     all_calls = calls + precision_calls
-    tasks = [client.get(ep, params) for _, ep, params in all_calls]
-    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    cg_tasks = [client.get(ep, params) for _, ep, params in all_calls]
+
+    # Phase 3: Binance direct (no API key, separate rate limiter)
+    BINANCE_SPOT_MAP = {"HYPE": "HYPER"}
+    bn_spot_sym = BINANCE_SPOT_MAP.get(sym, sym) + "USDT"
+    bn_fut_sym = pair  # e.g. SOLUSDT
+    bn_tasks = [
+        binance_futures_request("/fapi/v1/premiumIndex", {"symbol": bn_fut_sym}),
+        binance_futures_request("/fapi/v1/openInterest", {"symbol": bn_fut_sym}),
+        binance_futures_request(
+            "/futures/data/takerlongshortRatio",
+            {"symbol": bn_fut_sym, "period": interval if interval in ("5m","15m","30m","1h","2h","4h") else "5m", "limit": 10},
+        ),
+        binance_futures_request(
+            "/futures/data/globalLongShortAccountRatio",
+            {"symbol": bn_fut_sym, "period": interval if interval in ("5m","15m","30m","1h","2h","4h") else "5m", "limit": 10},
+        ),
+        binance_spot_request("/api/v3/klines", {"symbol": bn_spot_sym, "interval": interval, "limit": 20}, weight=2),
+        binance_futures_request("/fapi/v1/klines", {"symbol": bn_fut_sym, "interval": interval, "limit": 50}, weight=5),
+    ]
+
+    # Phase 4: Nansen + Arkham (external APIs)
+    p4_task_names = []
+    p4_coros = []
+    nansen_skip = raw_sym.upper() in NANSEN_UNSUPPORTED
+    nansen_has_map = raw_sym.upper() in NANSEN_TOKEN_MAP
+    if nansen_has_map and not nansen_skip:
+        p4_task_names.append("nansen")
+        p4_coros.append(nansen_token_flow_intelligence(raw_sym))
+    else:
+        async def _noop():
+            return None
+        p4_task_names.append("nansen")
+        p4_coros.append(_noop())
+
+    arkham_chain = ARKHAM_CHAIN_MAP.get(raw_sym.upper(), "ethereum")
+    arkham_params: dict = {}
+    if arkham_chain:
+        arkham_params["chains"] = arkham_chain
+    p4_task_names.append("arkham")
+    p4_coros.append(arkham_get(f"/flow/entity/{exchange.lower()}", arkham_params))
+
+    # ══ FIRE ALL PHASES IN PARALLEL — biggest speed win ══
+    # CoinGlass is rate-limited but Binance + Nansen + Arkham run concurrently
+    _cg_results, _bn_results, _p4_results = await asyncio.gather(
+        asyncio.gather(*cg_tasks, return_exceptions=True),
+        asyncio.gather(*bn_tasks, return_exceptions=True),
+        asyncio.gather(*p4_coros, return_exceptions=True),
+    )
+    raw_results = list(_cg_results)
+    bn_premium, bn_oi, bn_taker, bn_ls, bn_klines, bn_fut_klines = _bn_results
+    p4 = dict(zip(p4_task_names, _p4_results))
 
     # ── Auto-fallback: if Spot CVD is empty, try OKX then Bybit ──
     spot_cvd_idx = 0  # first call is always Spot CVD
@@ -3084,9 +3135,9 @@ async def coinglass_full_scan(
                 output += "**Empty dataset**\n\n"
             else:
                 # Fallback: compact JSON for unknown formats
-                if isinstance(data, list) and len(data) > 10:
-                    output += f"*(last 10 of {len(data)})*\n"
-                    output += json.dumps(data[-10:], indent=2, default=str) + "\n\n"
+                if isinstance(data, list) and len(data) > 15:
+                    output += f"*(last 15 of {len(data)})*\n"
+                    output += json.dumps(data[-15:], indent=2, default=str) + "\n\n"
                 else:
                     output += json.dumps(data, indent=2, default=str) + "\n\n"
 
@@ -3144,7 +3195,7 @@ async def coinglass_full_scan(
                 if w.get("symbol", "").upper() in (sym, raw_sym)
             ]
             if sym_whales:
-                for w in sym_whales[:5]:
+                for w in sym_whales[:10]:
                     direction = "LONG" if w.get("position_size", 0) > 0 else "SHORT"
                     action_type = "OPEN" if w.get("position_action") == 1 else "CLOSE"
                     size_usd = w.get("position_value_usd", 0)
@@ -3186,11 +3237,27 @@ async def coinglass_full_scan(
             ob_asks = latest.get("asks_usd", 0)
             dominant = "BIDS (buyers)" if ob_bids > ob_asks else "ASKS (sellers)"
             ratio = ob_bids / ob_asks if ob_asks > 0 else float("inf")
-            output += (
-                f"**OB Bidask ±1%:** Bids ${ob_bids / 1e6:.1f}M vs "
-                f"Asks ${ob_asks / 1e6:.1f}M → **{dominant}** "
-                f"(ratio {ratio:.2f})\n\n"
-            )
+            output += f"**OB Bidask ±1% (latest):** Bids ${ob_bids / 1e6:.1f}M vs Asks ${ob_asks / 1e6:.1f}M → **{dominant}** (ratio {ratio:.2f})\n\n"
+            # Trend table — show dominance shift over time
+            if len(ob_data) > 1:
+                output += "```\n"
+                output += f"{'Time':>6} | {'Bids':>10} | {'Asks':>10} | {'Ratio':>6} | {'Dominant':>8}\n"
+                output += f"{'─'*6} | {'─'*10} | {'─'*10} | {'─'*6} | {'─'*8}\n"
+                bid_dom_count = 0
+                for ob_row in ob_data:
+                    if not isinstance(ob_row, dict):
+                        continue
+                    ts = ob_row.get("t", ob_row.get("timestamp", ob_row.get("time", 0)))
+                    b = ob_row.get("bids_usd", 0)
+                    a = ob_row.get("asks_usd", 0)
+                    r = b / a if a > 0 else 0
+                    dom = "BIDS" if b > a else "ASKS"
+                    if b > a:
+                        bid_dom_count += 1
+                    ts_str = datetime.fromtimestamp(ts / 1000, tz=WIB).strftime("%H:%M") if ts > 1e9 else "?"
+                    output += f"{ts_str:>6} | {_fmt_num(b):>10} | {_fmt_num(a):>10} | {r:>6.2f} | {dom:>8}\n"
+                output += "```\n"
+                output += f"**Trend:** {bid_dom_count}/{len(ob_data)} bid-dominant\n\n"
         else:
             output += "**OB Bidask ±1%:** No data\n\n"
     elif isinstance(ob_result, Exception):
@@ -3209,45 +3276,67 @@ async def coinglass_full_scan(
             output += _age_banner(fp_result)
             fp_data = fp_result.data
             if isinstance(fp_data, list) and fp_data:
-                latest_candle = fp_data[-1]
-                # Footprint format: [timestamp, [[price_start, price_end,
-                #   buy_vol, sell_vol, buy_quote, sell_quote,
-                #   buy_usdt, sell_usdt, buy_count, sell_count], ...]]
-                if isinstance(latest_candle, list) and len(latest_candle) >= 2:
-                    levels = latest_candle[1]
-                    total_buy = 0.0
-                    total_sell = 0.0
-                    max_imbalance = 0.0
-                    imbalance_level = 0.0
-                    imbalance_side = "BUY"
+                # Multi-candle footprint table
+                output += "**Footprint (per-candle absorption):**\n```\n"
+                output += f"{'Time':>6} | {'Buy $':>10} | {'Sell $':>10} | {'Net':>10} | {'Top Imbalance':>20}\n"
+                output += f"{'─'*6} | {'─'*10} | {'─'*10} | {'─'*10} | {'─'*20}\n"
+                overall_buy = 0.0
+                overall_sell = 0.0
+                buy_candles = 0
+                for candle in fp_data[-10:]:
+                    if not isinstance(candle, list) or len(candle) < 2:
+                        continue
+                    ts = candle[0]
+                    levels = candle[1]
+                    ts_str = datetime.fromtimestamp(ts / 1000, tz=WIB).strftime("%H:%M") if ts > 1e9 else "?"
+                    c_buy = 0.0
+                    c_sell = 0.0
+                    c_max_imb = 0.0
+                    c_imb_price = 0.0
+                    c_imb_side = "BUY"
                     for level in levels:
                         if isinstance(level, list) and len(level) >= 8:
                             buy_usdt = level[6]
                             sell_usdt = level[7]
                             price_mid = (level[0] + level[1]) / 2
-                            total_buy += buy_usdt
-                            total_sell += sell_usdt
-                            imbalance = abs(buy_usdt - sell_usdt)
-                            if imbalance > max_imbalance:
-                                max_imbalance = imbalance
-                                imbalance_level = price_mid
-                                imbalance_side = (
-                                    "BUY" if buy_usdt > sell_usdt
-                                    else "SELL"
-                                )
-                    fp_direction = "BUY" if total_buy > total_sell else "SELL"
-                    output += (
-                        f"**Footprint:** Absorption **{imbalance_side}** kuat "
-                        f"di ${imbalance_level:,.0f} "
-                        f"(total buy ${total_buy / 1e6:.2f}M vs "
-                        f"sell ${total_sell / 1e6:.2f}M)\n\n"
-                    )
-                else:
-                    output += "**Footprint:** Unexpected data format\n"
-                    output += (
-                        json.dumps(fp_data[-1:], indent=2, default=str)
-                        + "\n\n"
-                    )
+                            c_buy += buy_usdt
+                            c_sell += sell_usdt
+                            imb = abs(buy_usdt - sell_usdt)
+                            if imb > c_max_imb:
+                                c_max_imb = imb
+                                c_imb_price = price_mid
+                                c_imb_side = "BUY" if buy_usdt > sell_usdt else "SELL"
+                    overall_buy += c_buy
+                    overall_sell += c_sell
+                    net = c_buy - c_sell
+                    if net > 0:
+                        buy_candles += 1
+                    imb_str = f"{c_imb_side} ${c_imb_price:,.0f}"
+                    output += f"{ts_str:>6} | {_fmt_num(c_buy):>10} | {_fmt_num(c_sell):>10} | {_fmt_num(net, signed=True):>10} | {imb_str:>20}\n"
+                output += "```\n"
+                fp_direction = "BUY" if overall_buy > overall_sell else "SELL"
+                n_candles = min(len(fp_data), 10)
+                output += (
+                    f"**Summary:** {buy_candles}/{n_candles} buy-dominant | "
+                    f"total buy ${overall_buy / 1e6:.2f}M vs sell ${overall_sell / 1e6:.2f}M → **{fp_direction}**\n"
+                )
+                # Top 5 imbalance levels from latest candle
+                latest_candle = fp_data[-1]
+                if isinstance(latest_candle, list) and len(latest_candle) >= 2:
+                    level_imbalances = []
+                    for level in latest_candle[1]:
+                        if isinstance(level, list) and len(level) >= 8:
+                            buy_u = level[6]
+                            sell_u = level[7]
+                            price_m = (level[0] + level[1]) / 2
+                            level_imbalances.append((abs(buy_u - sell_u), price_m, buy_u, sell_u))
+                    if level_imbalances:
+                        level_imbalances.sort(reverse=True)
+                        output += "\n**Top 5 imbalance levels (latest candle):**\n"
+                        for imb_val, price, b, s in level_imbalances[:5]:
+                            side = "BUY" if b > s else "SELL"
+                            output += f"- ${price:,.2f}: {side} imbalance ${imb_val:,.0f} (buy ${b:,.0f} vs sell ${s:,.0f})\n"
+                output += "\n"
             else:
                 output += "**Footprint:** No data\n\n"
         elif isinstance(fp_result, Exception):
@@ -3388,33 +3477,10 @@ async def coinglass_full_scan(
 
 
     # ═════════════════════════════════════════════════════════════════
-    # PHASE 3 — BINANCE DIRECT CROSS-CHECK
+    # PHASE 3 — BINANCE DIRECT CROSS-CHECK (data already fetched above)
     # ═════════════════════════════════════════════════════════════════
     output += "\n---\n\n"
     output += f"# PHASE 3 — BINANCE DIRECT CROSS-CHECK ({raw_sym})\n\n"
-
-    # Symbol mapping for Binance (some coins have different spot names)
-    BINANCE_SPOT_MAP = {"HYPE": "HYPER"}
-    bn_spot_sym = BINANCE_SPOT_MAP.get(sym, sym) + "USDT"
-    bn_fut_sym = pair  # e.g. SOLUSDT
-
-    # Fetch Binance data in parallel
-    bn_tasks = [
-        binance_futures_request("/fapi/v1/premiumIndex", {"symbol": bn_fut_sym}),
-        binance_futures_request("/fapi/v1/openInterest", {"symbol": bn_fut_sym}),
-        binance_futures_request(
-            "/futures/data/takerlongshortRatio",
-            {"symbol": bn_fut_sym, "period": interval if interval in ("5m","15m","30m","1h","2h","4h") else "5m", "limit": 5},
-        ),
-        binance_futures_request(
-            "/futures/data/globalLongShortAccountRatio",
-            {"symbol": bn_fut_sym, "period": interval if interval in ("5m","15m","30m","1h","2h","4h") else "5m", "limit": 3},
-        ),
-        binance_spot_request("/api/v3/klines", {"symbol": bn_spot_sym, "interval": interval, "limit": 10}, weight=2),
-        binance_futures_request("/fapi/v1/klines", {"symbol": bn_fut_sym, "interval": interval, "limit": 50}, weight=5),
-    ]
-    bn_results = await asyncio.gather(*bn_tasks, return_exceptions=True)
-    bn_premium, bn_oi, bn_taker, bn_ls, bn_klines, bn_fut_klines = bn_results
 
     # ── Futures Price + Funding Rate ──
     if isinstance(bn_premium, dict) and "markPrice" in bn_premium:
@@ -3447,7 +3513,8 @@ async def coinglass_full_scan(
         output += f"{'─'*6} | {'─'*10} | {'─'*10} | {'─'*10} | {'─'*6}\n"
         bn_buy_dom = 0
         bn_total_net = 0.0
-        for t in bn_taker[-5:]:
+        bn_taker_show = bn_taker[-10:]
+        for t in bn_taker_show:
             ratio = float(t.get("buySellRatio", 0))
             buy_qty = float(t.get("buyVol", 0))
             sell_qty = float(t.get("sellVol", 0))
@@ -3461,20 +3528,35 @@ async def coinglass_full_scan(
             ts_str = datetime.fromtimestamp(ts_ms / 1000, tz=WIB).strftime("%H:%M") if ts_ms else "?"
             output += f"{ts_str:>6} | {_fmt_num(buy_usd):>10} | {_fmt_num(sell_usd):>10} | {_fmt_num(net_usd, signed=True):>10} | {ratio:>6.3f}\n"
         output += "```\n"
-        output += f"**Stats:** {bn_buy_dom}/5 buy-dominant | total net: {_fmt_num(bn_total_net, signed=True)}\n\n"
+        output += f"**Stats:** {bn_buy_dom}/{len(bn_taker_show)} buy-dominant | total net: {_fmt_num(bn_total_net, signed=True)}\n\n"
 
     # ── Long/Short Account Ratio ──
     if isinstance(bn_ls, list) and bn_ls:
+        output += "**Binance L/S Ratio:**\n```\n"
+        output += f"{'Time':>6} | {'Long %':>8} | {'Short %':>8} | {'Ratio':>8}\n"
+        output += f"{'─'*6} | {'─'*8} | {'─'*8} | {'─'*8}\n"
+        for ls_row in bn_ls[-10:]:
+            ts_ms = ls_row.get("timestamp", 0)
+            ts_str = datetime.fromtimestamp(ts_ms / 1000, tz=WIB).strftime("%H:%M") if ts_ms else "?"
+            long_pct = float(ls_row.get("longAccount", 0)) * 100
+            short_pct = float(ls_row.get("shortAccount", 0)) * 100
+            ratio = float(ls_row.get("longShortRatio", 0))
+            output += f"{ts_str:>6} | {long_pct:>7.1f}% | {short_pct:>7.1f}% | {ratio:>8.3f}\n"
+        output += "```\n"
         latest_ls = bn_ls[-1]
-        long_pct = float(latest_ls.get("longAccount", 0)) * 100
-        ratio = float(latest_ls.get("longShortRatio", 0))
-        output += f"**Binance L/S Ratio:** {long_pct:.1f}% long (ratio {ratio:.3f})\n\n"
+        latest_ratio = float(latest_ls.get("longShortRatio", 0))
+        first_ratio = float(bn_ls[0].get("longShortRatio", 0))
+        shift = latest_ratio - first_ratio
+        shift_label = "more long" if shift > 0 else "more short"
+        output += f"**Shift:** {shift:+.3f} ({shift_label})\n\n"
 
     # ── Spot Klines CVD (taker buy vs sell) ──
     if isinstance(bn_klines, list) and bn_klines:
+        bn_klines_show = bn_klines[-10:]
         output += f"**Binance Spot CVD ({bn_spot_sym}):**\n"
         cumulative = 0.0
-        for c in bn_klines[-5:]:
+        buy_candles = 0
+        for c in bn_klines_show:
             ts_str = datetime.fromtimestamp(c[0] / 1000, tz=WIB).strftime("%H:%M")
             vol = float(c[5])
             buy = float(c[9])
@@ -3482,8 +3564,10 @@ async def coinglass_full_scan(
             delta = buy - sell
             cumulative += delta
             bias = "BUY" if delta > 0 else "SELL"
+            if delta > 0:
+                buy_candles += 1
             output += f"- {ts_str}: buy={buy:,.0f} sell={sell:,.0f} delta={delta:+,.0f} → **{bias}**\n"
-        output += f"- **Cumulative (5 candles): {cumulative:+,.0f} {sym}**\n\n"
+        output += f"- **Cumulative ({len(bn_klines_show)} candles): {cumulative:+,.0f} {sym} | {buy_candles}/{len(bn_klines_show)} buy-dominant**\n\n"
     elif isinstance(bn_klines, dict) and "error" in bn_klines:
         output += f"**Binance Spot:** {bn_spot_sym} — {bn_klines.get('error', 'not available')}\n\n"
 
@@ -3537,29 +3621,7 @@ async def coinglass_full_scan(
     output += "---\n\n"
     output += f"# PHASE 4 — ON-CHAIN LAYER ({raw_sym})\n\n"
 
-    # Fetch Nansen + Arkham in parallel
-    p4_tasks = []
-    # Nansen token flows
-    nansen_skip = raw_sym.upper() in NANSEN_UNSUPPORTED
-    nansen_has_map = raw_sym.upper() in NANSEN_TOKEN_MAP
-    if nansen_has_map and not nansen_skip:
-        p4_tasks.append(("nansen", nansen_token_flow_intelligence(raw_sym)))
-    else:
-        async def _noop():
-            return None
-        p4_tasks.append(("nansen", _noop()))
-
-    # Arkham exchange flow
-    arkham_chain = ARKHAM_CHAIN_MAP.get(raw_sym.upper(), "ethereum")
-    arkham_params: dict = {}
-    if arkham_chain:
-        arkham_params["chains"] = arkham_chain
-    p4_tasks.append(("arkham", arkham_get(f"/flow/entity/{exchange.lower()}", arkham_params)))
-
-    p4_results = await asyncio.gather(
-        *[t for _, t in p4_tasks], return_exceptions=True
-    )
-    p4 = dict(zip([n for n, _ in p4_tasks], p4_results))
+    # Phase 4 data already fetched in parallel above
 
     # ── Nansen On-Chain Flows ──
     nansen_result = p4.get("nansen")

@@ -22,7 +22,7 @@ import httpx
 WIB = timezone(timedelta(hours=7))
 
 NANSEN_BASE_URL = "https://api.nansen.ai"
-NANSEN_TIMEOUT = 20.0
+NANSEN_TIMEOUT = 10.0
 
 # Supported chains
 NANSEN_CHAINS = [

@@ -234,8 +234,8 @@ class CoinGlassClient:
         return hashlib.sha256(raw.encode()).hexdigest()
 
     @retry(
-        stop=stop_after_attempt(3) | stop_after_delay(60),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
+        stop=stop_after_attempt(2) | stop_after_delay(20),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
         retry=retry_if_exception_type(
             (httpx.TimeoutException, httpx.ConnectError, RateLimitError)
         ),
