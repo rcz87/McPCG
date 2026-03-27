@@ -564,7 +564,9 @@ def register_arkham_tools(mcp):
         if cheap:
             params["cheap"] = "true"
 
-        endpoint = f"/balances/entity/{entity}"
+        # /portfolio/entity/ requires timestamp — use current time for latest snapshot
+        endpoint = f"/portfolio/entity/{entity}"
+        params["time"] = str(int(time.time() * 1000))  # Unix ms
         result = await arkham_get(endpoint, params)
         output = f"## Arkham Entity Balance — {entity}\n\n"
         output += _header(endpoint)
@@ -573,24 +575,25 @@ def register_arkham_tools(mcp):
             return output + f"**ERROR:** {result['error']}"
 
         data = result["data"]
-        balances = []
 
+        # Arkham returns {chain: {token_id: {symbol, balance, price, usd}}}
+        # Flatten into a list of token balances
+        balances = []
         if isinstance(data, dict):
-            # Arkham may nest balances under "tokens", "balances", "holdings",
-            # or return {chain: [{token_data}]} like the flow endpoint
-            for key in ("tokens", "balances", "holdings"):
-                if key in data and isinstance(data[key], list):
-                    balances = data[key]
-                    break
-            if not balances:
-                # Try: response is {chain_name: [tokens]} (similar to flow endpoint)
-                for v in data.values():
-                    if isinstance(v, list) and v and isinstance(v[0], dict):
-                        balances = v
-                        break
-            if not balances and data:
-                # Last resort: flat dict values
-                balances = list(data.values())[:20] if data else []
+            for chain_key, chain_data in data.items():
+                if chain_key == "entities":
+                    continue
+                if isinstance(chain_data, dict):
+                    # {token_id: {symbol, balance, price, usd}} per chain
+                    for token_id, token_data in chain_data.items():
+                        if isinstance(token_data, dict) and "symbol" in token_data:
+                            token_data["_chain"] = chain_key
+                            balances.append(token_data)
+                elif isinstance(chain_data, list):
+                    for item in chain_data:
+                        if isinstance(item, dict):
+                            item["_chain"] = chain_key
+                            balances.append(item)
         elif isinstance(data, list):
             balances = data
 
@@ -599,15 +602,18 @@ def register_arkham_tools(mcp):
             output += f"**Debug raw:** `{json.dumps(data, default=str)[:1500]}`\n"
             return output
 
+        # Filter by coin if specified
         if coin:
             coin_upper = coin.upper()
             balances = [b for b in balances
                         if isinstance(b, dict) and
-                        b.get("symbol", b.get("tokenSymbol", b.get("token", ""))).upper() == coin_upper]
+                        b.get("symbol", "").upper() == coin_upper]
             if not balances:
                 output += f"**No {coin} balance found for {entity}.**\n"
-                output += f"**Debug raw keys:** `{json.dumps(data, default=str)[:1500]}`\n"
                 return output
+
+        # Sort by USD value descending
+        balances.sort(key=lambda b: float(b.get("usd", 0) or 0), reverse=True)
 
         output += f"**Entity:** {entity} | **Chains:** {chains or 'ALL'} | **Coin:** {coin or 'ALL'}\n\n"
 
@@ -615,18 +621,22 @@ def register_arkham_tools(mcp):
         for bal in balances[:20]:
             if not isinstance(bal, dict):
                 continue
-            # Try multiple field name patterns
-            symbol = bal.get("symbol", bal.get("tokenSymbol", bal.get("token", "?")))
-            usd = float(bal.get("usdValue", bal.get("balanceUSD", bal.get("balanceUsd",
-                    bal.get("usd", bal.get("value", 0))))) or 0)
-            amount = bal.get("amount", bal.get("balance", bal.get("balanceUnit",
-                     bal.get("quantity", "?"))))
-            chain_name = bal.get("chain", bal.get("chainType", bal.get("blockchain", "?")))
+            symbol = bal.get("symbol", "?").upper()
+            name = bal.get("name", "")
+            usd = float(bal.get("usd", 0) or 0)
+            amount = bal.get("balance", bal.get("amount", 0))
+            price = bal.get("price", 0)
+            chain_name = bal.get("_chain", "?")
             total_usd += usd
 
+            if usd < 1:
+                continue  # Skip dust
+
             output += f"- **{symbol}** ({chain_name}): {_format_usd(usd)}"
-            if amount and amount != "?":
-                output += f" | Amount: {amount}"
+            if amount:
+                output += f" | {float(amount):,.2f}"
+            if price:
+                output += f" @ ${float(price):,.4f}"
             output += "\n"
 
         output += f"\n**Total Value: {_format_usd(total_usd)}**\n"
@@ -712,7 +722,7 @@ def register_arkham_tools(mcp):
     async def arkham_balance_changes(
         entity_types: str = "exchange",
         pricing_ids: str = "",
-        interval: str = "day",
+        interval: str = "7d",
         order_by: str = "balanceUsdChange",
         order_dir: str = "desc",
         limit: int = 20,
@@ -727,7 +737,7 @@ def register_arkham_tools(mcp):
                           (exchange, fund, protocol, individual, mev, etc.)
             pricing_ids: Comma-separated CoinGecko IDs to filter (bitcoin, ethereum, solana)
                          Leave empty for all tokens.
-            interval: Time interval (hour, day, week, month)
+            interval: Time interval — 7d, 14d, or 30d
             order_by: Sort field — balanceUsd, balanceUsdChange, balanceUsdPctChange,
                       balanceUnit, balanceUnitChange, balanceUnitPctChange
             order_dir: Sort direction — "asc" or "desc"
