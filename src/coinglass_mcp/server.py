@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 from .arkham import register_arkham_tools
-from .nansen import register_nansen_tools
+from .nansen import register_nansen_tools, nansen_token_flow_intelligence, NANSEN_TOKEN_MAP
 from .binance_client import (
     close_client as close_binance_client,
     binance_futures_request,
@@ -734,6 +734,44 @@ def _fmt_p2_spot_large_orders(data: list) -> str:
         f"**Stats:** {bid_count} bids / {ask_count} asks | "
         f"Total BID: {_fmt_num(total_bid)} | Total ASK: {_fmt_num(total_ask)}\n\n"
     )
+    return out
+
+
+def _fmt_nansen_flows(data: dict, symbol: str) -> str:
+    """Format Nansen token flow intelligence — factual only, no interpretation."""
+    if not data:
+        return "**No flow data**\n\n"
+
+    segments = [
+        ("Whale", "whale"),
+        ("Smart Trader", "smart_trader"),
+        ("Top PnL", "top_pnl"),
+        ("Public Figure", "public_figure"),
+        ("Exchange", "exchange"),
+        ("Fresh Wallets", "fresh_wallets"),
+    ]
+
+    out = ""
+    for label, prefix in segments:
+        net = data.get(f"{prefix}_net_flow_usd")
+        avg = data.get(f"{prefix}_avg_flow_usd")
+        count = data.get(f"{prefix}_wallet_count", 0)
+
+        if net is None:
+            out += f"- {label:<16}: No data\n"
+            continue
+
+        net = float(net)
+        direction = "inflow" if net >= 0 else "outflow"
+        ratio = abs(net / avg) if avg and avg != 0 else 0
+        count_str = f", {count} wallets" if count else ""
+
+        out += (
+            f"- {label:<16}: net {direction} {_fmt_num(abs(net))} "
+            f"({ratio:.1f}x avg{count_str})\n"
+        )
+
+    out += "\n"
     return out
 
 
@@ -2790,7 +2828,18 @@ async def coinglass_full_scan(
     # Fetch ALL endpoints in one batch — rate limiter handles spacing
     all_calls = calls + precision_calls
     tasks = [client.get(ep, params) for _, ep, params in all_calls]
+    # Nansen flow intelligence runs in parallel (separate HTTP, not CoinGlass)
+    nansen_supported = raw_sym.upper() in NANSEN_TOKEN_MAP
+    if nansen_supported:
+        tasks.append(nansen_token_flow_intelligence(raw_sym))
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Pop Nansen result from the end (it's not a CoinGlass FetchResult)
+    nansen_flow_data = None
+    if nansen_supported:
+        nansen_raw = raw_results[-1]
+        raw_results = list(raw_results[:-1])
+        if isinstance(nansen_raw, dict):
+            nansen_flow_data = nansen_raw
 
     # ── Auto-fallback: if Spot CVD is empty, try OKX then Bybit ──
     spot_cvd_idx = 0  # first call is always Spot CVD
@@ -3144,6 +3193,13 @@ async def coinglass_full_scan(
         )
     else:
         output += "**Liq Orders:** Data expired or unavailable\n\n"
+
+    # ── Nansen On-Chain Flows ──
+    if nansen_flow_data:
+        output += f"## Nansen On-Chain Flows — {raw_sym}\n\n"
+        output += _fmt_nansen_flows(nansen_flow_data, raw_sym)
+    elif nansen_supported:
+        output += f"**Nansen Flows:** No data for {raw_sym}\n\n"
 
     # ── Hyperliquid L/S Ratio ──
     hl_result = p2.get("Hyperliquid L/S")

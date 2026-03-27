@@ -125,6 +125,63 @@ async def nansen_post(
         return {"data": None, "pagination": None, "status": "error", "error": _mask_key(str(e), os.getenv("NANSEN_API_KEY", ""))}
 
 
+# ─── Nansen Token Flow Intelligence (REST API) ──────────────────────────────
+
+NANSEN_TGM_URL = "https://api.nansen.ai/api/v1/tgm/flow-intelligence"
+
+# Token address mapping for common coins
+NANSEN_TOKEN_MAP = {
+    "SOL": ("solana", "So11111111111111111111111111111111111111112"),
+    "ETH": ("ethereum", "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+    "USDT": ("ethereum", "0xdac17f958d2ee523a2206206994597c13d831ec7"),
+    "USDC": ("ethereum", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+    "WBTC": ("ethereum", "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
+    "LINK": ("ethereum", "0x514910771af9ca656af840dff83e8264ecf986ca"),
+    "UNI": ("ethereum", "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"),
+    "AAVE": ("ethereum", "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9"),
+    "ARB": ("arbitrum", "0x912ce59144191c1204e64559fe8253a0e49e6548"),
+    "OP": ("optimism", "0x4200000000000000000000000000000000000042"),
+    "MATIC": ("polygon", "0x0000000000000000000000000000000000001010"),
+    "AVAX": ("avalanche", "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+    "BNB": ("bnb", "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+}
+
+
+async def nansen_token_flow_intelligence(symbol: str) -> dict | None:
+    """Call Nansen REST API tgm/flow-intelligence (1 credit).
+
+    Returns raw dict with segment flows, or None on failure.
+    """
+    sym = symbol.upper()
+    if sym not in NANSEN_TOKEN_MAP:
+        return None
+
+    chain, token_addr = NANSEN_TOKEN_MAP[sym]
+    try:
+        key = _get_nansen_key()
+    except ValueError:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=NANSEN_TIMEOUT) as c:
+            resp = await c.post(NANSEN_TGM_URL, headers={
+                "Content-Type": "application/json",
+                "apiKey": key,
+            }, json={
+                "chain": chain,
+                "token_address": token_addr,
+            })
+            if resp.status_code != 200:
+                return None
+            result = resp.json()
+            data = result.get("data", [])
+            if isinstance(data, list) and data:
+                return data[0]
+            return None
+    except Exception:
+        return None
+
+
 def _header(info: str) -> str:
     """Standard header for all Nansen responses."""
     ts = datetime.now(WIB).strftime("%H:%M:%S WIB")
