@@ -3175,13 +3175,31 @@ async def coinglass_full_scan(
     else:
         output += "**Top Position L/S:** Data expired or unavailable\n\n"
 
-    # ── Spot Large Orders ──
+    # ── Spot Large Orders (filtered ±20% from current price) ──
     slo_result = p2.get("Spot Large Orders")
     if isinstance(slo_result, FetchResult) and not slo_result.is_expired:
         output += _age_banner(slo_result)
         slo_data = slo_result.data
         if isinstance(slo_data, list) and slo_data:
-            output += f"## Spot Large Orders — {raw_sym} | {exchange}\n\n"
+            # Get current price from Phase 1 Price OHLC for filtering
+            current_price = 0.0
+            for (lbl, _, _), res in zip(calls, raw_results):
+                if lbl == "Price OHLC" and isinstance(res, FetchResult):
+                    pdata = res.data
+                    if isinstance(pdata, list) and pdata:
+                        last_c = pdata[-1]
+                        if isinstance(last_c, dict):
+                            current_price = float(_get(last_c, "c", "close", default=0))
+                    break
+            # Filter orders within ±20% of current price
+            if current_price > 0:
+                lo = current_price * 0.8
+                hi = current_price * 1.2
+                slo_data = [
+                    r for r in slo_data
+                    if isinstance(r, dict) and lo <= float(_get(r, "limit_price", "price", default=0)) <= hi
+                ]
+            output += f"## Spot Large Orders — {raw_sym} | {exchange} | ±20% from ${current_price:,.2f}\n\n"
             output += _fmt_p2_spot_large_orders(slo_data)
         else:
             output += f"**Spot Large Orders:** No large orders for {raw_sym}\n\n"
