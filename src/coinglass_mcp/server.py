@@ -78,6 +78,69 @@ register_arkham_tools(mcp)
 # ─── Register Nansen Smart Money Tools ────────────────────────────────────────
 register_nansen_tools(mcp)
 
+# ─── Register Chart Tool ─────────────────────────────────────────────────────
+import base64
+
+from mcp.types import ImageContent, TextContent
+
+from .chart import get_chart
+
+
+@mcp.tool(output_schema=None)
+async def coinglass_chart(
+    symbol: str = "BTC",
+    interval: str = "5m",
+    width: int = 1200,
+    height: int = 600,
+    theme: str = "dark",
+):
+    """Generate TradingView chart screenshot — EMA21 + EMA50 + VWAP + Volume.
+
+    Returns chart IMAGE directly (Claude can see it) + metadata text.
+    Setup: Ricoz chart (dark theme, EMA21 cyan, EMA50 white, VWAP yellow)
+    Auto-adapts to plan limits (paid: 1200x600 + Volume, free: 800x600).
+    Timezone: WIB (Asia/Jakarta)
+
+    Args:
+        symbol: Coin symbol (SOL, BTC, ETH, HYPE, AVAX, SUI, XRP, BNB, etc.)
+        interval: Candle interval (1m, 5m, 15m, 30m, 1h, 4h, 1d)
+        width: Chart width px (default 1200, auto-downsized on free plan)
+        height: Chart height px (default 600)
+        theme: dark or light (default dark)
+    """
+    result = await get_chart(
+        symbol=symbol, interval=interval,
+        width=width, height=height, theme=theme,
+    )
+    if "error" in result:
+        return f"## Chart Error — {symbol}\n\nError: {result['error']}"
+
+    # Download image so Claude can see it directly
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            img_resp = await client.get(result["url"])
+            img_resp.raise_for_status()
+            img_b64 = base64.b64encode(img_resp.content).decode("utf-8")
+    except Exception:
+        # Fallback to URL-only if download fails
+        return (
+            f"## TradingView Chart — {symbol} | {interval}\n\n"
+            f"**Chart URL:** {result['url']}\n"
+            f"*(Image download failed — open URL manually)*"
+        )
+
+    meta = (
+        f"## TradingView Chart — {symbol} | {interval}\n"
+        f"**Symbol:** {result['symbol_tv']} | "
+        f"**Setup:** EMA21 (cyan) + EMA50 (white) + VWAP (yellow) + Volume | "
+        f"**Theme:** {theme} | **Timezone:** WIB"
+    )
+    return [
+        TextContent(type="text", text=meta),
+        ImageContent(type="image", data=img_b64, mimeType="image/png"),
+    ]
+
 
 # ─── Formatting Helpers ──────────────────────────────────────────────────────
 
