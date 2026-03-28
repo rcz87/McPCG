@@ -4370,6 +4370,15 @@ async def data_binance(
         interval: Candle interval for klines/taker/LS (5m, 15m, 1h, 4h)
         limit: Data points for time-series (default 30, max 100)
     """
+    import asyncio
+
+    async def _capped(coro, timeout=10):
+        """Cap per-task execution time."""
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            return TimeoutError(f"Timed out after {timeout}s")
+
     sym = symbol.strip().upper()
     # Build Binance symbol pairs
     SPOT_MAP = {"HYPE": "HYPER"}
