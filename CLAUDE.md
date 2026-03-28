@@ -79,6 +79,38 @@ Direct Binance market data — **NO API key required**.
 | Liquidation    | `coinglass_liquidation_cat` | `binance_futures_liquidation`      |
 | Price/OHLCV    | `coinglass_price_ohlc`      | `binance_spot_klines`              |
 
+## Screener → Full Scan Workflow
+
+Ketika user pakai `coinglass_smart_screener` lalu `coinglass_full_scan`:
+
+**JANGAN patahkan hasil screener sendiri.** Screener dan full_scan adalah satu pipeline:
+1. Screener = filter awal (sinyal menarik)
+2. Full Scan = konfirmasi detail (data lengkap)
+
+Aturan untuk Claude setelah full_scan:
+- **Sajikan data apa adanya** — jangan tambah disclaimer generik "ini berisiko"
+- **Jangan kontradiksi sinyal screener** — kalau FR negatif jadi alasan masuk screener, jangan bilang "FR negatif = bahaya"
+- **Fokus pada: apa yang CONFIRM dan apa yang TIDAK confirm** dari sinyal screener
+- **Format**: "Screener bilang X → Full scan confirm/tidak karena Y"
+- **Keputusan trade di tangan user** — Claude cuma sajikan data + fakta
+- Boleh flag risiko SPESIFIK (contoh: "liquidity tipis di level $X") tapi JANGAN ceramah generik
+
+Contoh BENAR:
+```
+Screener: LDO [EARLY] +9.5 — stealth accum + buyer emerging
+Full Scan confirms:
+✅ Spot CVD: buyer dominan 1h
+✅ OI naik tapi harga belum ikut
+⚠️ Orderbook: resistance tebal di $0.30
+Data: FR -0.35%, OI $42M, top bid $0.293
+```
+
+Contoh SALAH:
+```
+"Meskipun screener menunjukkan sinyal pump, SEBAIKNYA JANGAN TRADE
+karena meme coin volatile dan bisa rug pull..."
+```
+
 ## Architecture
 
 ```

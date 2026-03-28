@@ -2556,32 +2556,42 @@ async def coinglass_smart_screener(
     mode: str = "all",
     top_n: int = 15,
     min_oi_usd: float = 10_000_000,
+    sensitivity: str = "normal",
 ) -> str:
     """Screen ALL coins for pump/dump signals BEFORE retail notices.
 
-    Fetches coins-markets + whale data + FR in parallel, then scores each coin.
+    v2 — Early Detection: prioritizes FRESH transitions over late signals.
+    Fetches coins-markets + whale data in parallel, then scores each coin
+    across 3 layers: EARLY (transitions), MID (building), LATE (already moved).
 
-    PUMP signals (positive score):
-    - OI rising while price flat/down = stealth accumulation
-    - Funding rate very negative = short squeeze setup
-    - Whale opening longs on Hyperliquid
-    - Short liquidation spike = shorts getting rekt
+    EARLY signals (highest weight):
+    - Fresh stealth accumulation/distribution (1h OI vs price divergence)
+    - Buyer/seller flow transition (L/S ratio flip 4h→1h)
+    - Compression detection (price flat + OI rising = breakout imminent)
 
-    DUMP signals (negative score):
-    - Funding rate extreme positive = longs overleveraged
-    - OI rising + price rising + extreme FR = leverage bubble about to pop
-    - Whale opening shorts
-    - Long liquidation spike = longs getting rekt
-    - OI dropping sharply = smart money exiting
+    MID signals (moderate weight):
+    - Building stealth (4h), FR tiered, whale positions, liquidation spikes
+
+    LATE signals + penalties:
+    - Bubble, OI exodus, "already moved" penalty, leverage health
 
     Args:
         mode: "pump" (only pump candidates), "dump" (only dump), "all" (both)
         top_n: Number of coins to return per category (default 15)
         min_oi_usd: Minimum OI in USD to filter noise (default $10M)
+        sensitivity: "high" (lower thresholds, more signals), "normal", "low" (higher thresholds, fewer but stronger signals)
     """
     import asyncio
 
     scan_time = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+
+    # ── Sensitivity multipliers ──
+    if sensitivity == "high":
+        th = 0.7   # lower thresholds by 30%
+    elif sensitivity == "low":
+        th = 1.5   # raise thresholds by 50%
+    else:
+        th = 1.0
 
     # Fetch data in parallel: coins_markets (page1+2) + whale alerts
     tasks = [
@@ -2598,20 +2608,25 @@ async def coinglass_smart_screener(
     else:
         return f"**ERROR:** Failed to fetch coins-markets data. {markets_result}"
 
-    # Parse whale data
-    whale_longs = {}   # symbol -> total USD long
-    whale_shorts = {}  # symbol -> total USD short
+    # Parse whale data — track opens AND closes separately
+    whale_longs = {}    # symbol -> total USD long open
+    whale_shorts = {}   # symbol -> total USD short open
+    whale_closes = {}   # symbol -> total USD close (any direction)
     if isinstance(whale_result, FetchResult) and isinstance(whale_result.data, list):
         for w in whale_result.data:
             sym = w.get("symbol", "").upper()
             action = w.get("position_action")  # 1=open, 2=close
             size = abs(w.get("position_value_usd", 0) or 0)
             is_long = (w.get("position_size", 0) or 0) > 0
-            if action == 1 and size > 500_000:  # Only open positions > $500K
+            if size < 500_000:
+                continue
+            if action == 1:  # Open
                 if is_long:
                     whale_longs[sym] = whale_longs.get(sym, 0) + size
                 else:
                     whale_shorts[sym] = whale_shorts.get(sym, 0) + size
+            elif action == 2:  # Close
+                whale_closes[sym] = whale_closes.get(sym, 0) + size
 
     # Score each coin
     scored = []
@@ -2622,124 +2637,229 @@ async def coinglass_smart_screener(
             continue
 
         price = coin.get("current_price") or 0
-        score = 0.0
-        signals = []
+        pump_score = 0.0
+        dump_score = 0.0
+        signals = []  # list of (timing, text) tuples
+        has_early = False
 
-        # ── OI Changes ──
-        oi_chg_1h = coin.get("open_interest_change_percent_1h") or 0
-        oi_chg_4h = coin.get("open_interest_change_percent_4h") or 0
-        oi_chg_24h = coin.get("open_interest_change_percent_24h") or 0
+        # ── Extract all fields ──
+        oi_5m = coin.get("open_interest_change_percent_5m") or 0
+        oi_1h = coin.get("open_interest_change_percent_1h") or 0
+        oi_4h = coin.get("open_interest_change_percent_4h") or 0
 
-        # ── Price Changes ──
-        price_chg_1h = coin.get("price_change_percent_1h") or 0
-        price_chg_4h = coin.get("price_change_percent_4h") or 0
-        price_chg_24h = coin.get("price_change_percent_24h") or 0
+        price_1h = coin.get("price_change_percent_1h") or 0
+        price_4h = coin.get("price_change_percent_4h") or 0
 
-        # ── Funding Rate ──
-        fr = coin.get("avg_funding_rate_by_oi") or 0
+        vol_1h = coin.get("volume_change_percent_1h") or 0
 
-        # ── Liquidation ──
+        fr_raw = coin.get("avg_funding_rate_by_oi") or 0  # decimal, e.g. -0.001013
+        fr_pct = fr_raw * 100  # percentage, e.g. -0.1013%
+
+        ls_5m = coin.get("long_short_ratio_5m") or 1.0
+        ls_1h = coin.get("long_short_ratio_1h") or 1.0
+        ls_4h = coin.get("long_short_ratio_4h") or 1.0
+        ls_24h = coin.get("long_short_ratio_24h") or 1.0
+
         long_liq_4h = coin.get("long_liquidation_usd_4h") or 0
         short_liq_4h = coin.get("short_liquidation_usd_4h") or 0
-        long_liq_24h = coin.get("long_liquidation_usd_24h") or 0
-        short_liq_24h = coin.get("short_liquidation_usd_24h") or 0
 
-        # ── Long/Short Ratio ──
-        ls_ratio_4h = coin.get("long_short_ratio_4h") or 0
+        oi_mcap = coin.get("open_interest_market_cap_ratio") or 0
+        oi_vol_ratio = coin.get("open_interest_volume_ratio") or 0
 
-        # ═══════════════════════════════════════════
-        # PUMP SCORING (positive = pump potential)
-        # ═══════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════
+        # LAYER 1: EARLY DETECTION (highest priority)
+        # ═══════════════════════════════════════════════════════
 
-        # 1. Stealth accumulation: OI rising + price flat/down
-        if oi_chg_4h > 3 and price_chg_4h < 0.5:
-            score += 3
-            signals.append(f"STEALTH ACCUM: OI+{oi_chg_4h:.1f}% price{price_chg_4h:+.1f}% (4h)")
-        elif oi_chg_1h > 2 and price_chg_1h < 0.3:
-            score += 2
-            signals.append(f"ACCUM 1h: OI+{oi_chg_1h:.1f}% price{price_chg_1h:+.1f}%")
+        # 1A. FRESH STEALTH ACCUMULATION — PUMP
+        if oi_1h > 0.3 * th and -0.5 / th <= price_1h <= 0.2 * th:
+            s = 3.0
+            if oi_5m > 0.1 * th:
+                s += 0.5
+            if ls_1h > 1.05:
+                s += 0.5
+            pump_score += s
+            signals.append(("EARLY", f"⚡ FRESH STEALTH ACCUM: OI 1h +{oi_1h:.1f}% / Price 1h {price_1h:+.1f}%"))
+            has_early = True
 
-        # 2. Short squeeze setup: extreme negative FR
-        if fr < -0.01:
-            score += 3
-            signals.append(f"SHORT SQUEEZE: FR={fr:.4f}% (extreme neg)")
-        elif fr < -0.005:
-            score += 1.5
-            signals.append(f"NEG FR: {fr:.4f}%")
+        # 1B. FRESH STEALTH DISTRIBUTION — DUMP
+        if oi_1h > 0.3 * th and -0.2 / th <= price_1h <= 0.5 * th and ls_1h < 0.9 * th:
+            s = -3.0
+            if ls_5m < 0.85 * th:
+                s -= 0.5
+            dump_score += s
+            signals.append(("EARLY", f"⚡ STEALTH DISTRIBUTION: OI 1h +{oi_1h:.1f}% / Seller ratio {ls_1h:.2f}"))
+            has_early = True
 
-        # 3. Short liquidation cascade (shorts getting rekt = pump fuel)
-        if short_liq_4h > 1_000_000:
-            score += 2
-            signals.append(f"SHORT LIQ: ${short_liq_4h/1e6:.1f}M (4h)")
-        elif short_liq_4h > 500_000:
-            score += 1
-            signals.append(f"short liq: ${short_liq_4h/1e6:.1f}M (4h)")
+        # 2A. BUYER FLOW TRANSITION — PUMP
+        if ls_4h < 0.95 * th and ls_1h > 1.05 / th:
+            s = 2.5
+            if ls_5m > 1.15 / th:
+                s += 1.0
+            pump_score += s
+            signals.append(("EARLY", f"⚡ BUYER EMERGING: L/S 4h={ls_4h:.2f} → 1h={ls_1h:.2f}"))
+            has_early = True
 
-        # 4. Whale longs on Hyperliquid
+        # 2B. SELLER FLOW TRANSITION — DUMP
+        if ls_4h > 1.05 / th and ls_1h < 0.95 * th:
+            s = -2.5
+            if ls_5m < 0.85 * th:
+                s -= 1.0
+            dump_score += s
+            signals.append(("EARLY", f"⚡ SELLER EMERGING: L/S 4h={ls_4h:.2f} → 1h={ls_1h:.2f}"))
+            has_early = True
+
+        # 3. COMPRESSION DETECTION — PUMP/DUMP
+        if abs(price_1h) < 0.3 * th and oi_1h > 0.3 * th:
+            if ls_1h > 1.05:
+                pump_score += 2.0
+                signals.append(("EARLY", f"⚡ COMPRESSION BULLISH: Price 1h {price_1h:+.1f}% / OI +{oi_1h:.1f}%"))
+            elif ls_1h < 0.95:
+                dump_score -= 2.0
+                signals.append(("EARLY", f"⚡ COMPRESSION BEARISH: Price 1h {price_1h:+.1f}% / OI +{oi_1h:.1f}%"))
+            else:
+                pump_score += 1.0
+                dump_score -= 1.0
+                signals.append(("EARLY", f"⚡ COMPRESSION NEUTRAL: Price 1h {price_1h:+.1f}% / OI +{oi_1h:.1f}% — direction unclear"))
+            has_early = True
+
+        # ═══════════════════════════════════════════════════════
+        # LAYER 2: EXISTING SIGNALS (reduced weight)
+        # ═══════════════════════════════════════════════════════
+
+        # 4. BUILDING STEALTH (4h) — PUMP
+        if oi_4h > 1.5 * th and price_4h < 0.5 * th:
+            pump_score += 2.0
+            signals.append(("MID", f"🟡 BUILDING STEALTH: OI 4h +{oi_4h:.1f}% / Price 4h {price_4h:+.1f}%"))
+
+        # 5. FR TIERED — PUMP/DUMP
+        if fr_pct < -0.15 / th:
+            pump_score += 2.5
+            signals.append(("MID", f"🟡 EXTREME NEG FR: {fr_pct:.4f}%"))
+        elif fr_pct < -0.05 / th:
+            pump_score += 2.0
+            signals.append(("MID", f"🟡 MODERATE NEG FR: {fr_pct:.4f}%"))
+        elif fr_pct < -0.01 / th:
+            pump_score += 1.0
+            signals.append(("MID", f"🟡 MILD NEG FR: {fr_pct:.4f}%"))
+        elif fr_pct > 0.15 / th:
+            dump_score -= 2.5
+            signals.append(("MID", f"🟡 EXTREME HIGH FR: +{fr_pct:.4f}%"))
+        elif fr_pct > 0.05 / th:
+            dump_score -= 2.0
+            signals.append(("MID", f"🟡 MODERATE HIGH FR: +{fr_pct:.4f}%"))
+        elif fr_pct > 0.01 / th:
+            dump_score -= 1.0
+            signals.append(("MID", f"🟡 MILD HIGH FR: +{fr_pct:.4f}%"))
+
+        # 6. WHALE POSITIONS — PUMP/DUMP
         wl = whale_longs.get(sym, 0)
-        if wl > 2_000_000:
-            score += 3
-            signals.append(f"WHALE LONG: ${wl/1e6:.1f}M")
-        elif wl > 500_000:
-            score += 1.5
-            signals.append(f"whale long: ${wl/1e6:.1f}M")
-
-        # ═══════════════════════════════════════════
-        # DUMP SCORING (negative = dump potential)
-        # ═══════════════════════════════════════════
-
-        # 5. Overleveraged longs: extreme positive FR
-        if fr > 0.05:
-            score -= 3
-            signals.append(f"OVERLEVERAGED: FR=+{fr:.4f}% (extreme pos)")
-        elif fr > 0.02:
-            score -= 1.5
-            signals.append(f"HIGH FR: +{fr:.4f}%")
-
-        # 6. Leverage bubble: OI + price + FR all rising
-        if oi_chg_4h > 3 and price_chg_4h > 3 and fr > 0.01:
-            score -= 3
-            signals.append(f"BUBBLE: OI+{oi_chg_4h:.1f}% price+{price_chg_4h:.1f}% FR+{fr:.4f}%")
-
-        # 7. Long liquidation cascade (longs getting rekt = dump fuel)
-        if long_liq_4h > 1_000_000:
-            score -= 2
-            signals.append(f"LONG LIQ: ${long_liq_4h/1e6:.1f}M (4h)")
-        elif long_liq_4h > 500_000:
-            score -= 1
-            signals.append(f"long liq: ${long_liq_4h/1e6:.1f}M (4h)")
-
-        # 8. Smart money exit: OI dropping sharply
-        if oi_chg_4h < -3:
-            score -= 2
-            signals.append(f"OI EXODUS: {oi_chg_4h:.1f}% (4h)")
-        elif oi_chg_1h < -2:
-            score -= 1.5
-            signals.append(f"OI drop: {oi_chg_1h:.1f}% (1h)")
-
-        # 9. Whale shorts on Hyperliquid
         ws = whale_shorts.get(sym, 0)
-        if ws > 2_000_000:
-            score -= 3
-            signals.append(f"WHALE SHORT: ${ws/1e6:.1f}M")
+        wc = whale_closes.get(sym, 0)
+        whale_count = sum(1 for w_sym in [whale_longs, whale_shorts] if sym in w_sym)
+        whale_multi = 1.3 if whale_count >= 2 else 1.0
+
+        if wl > 1_000_000:
+            pump_score += 3.0 * whale_multi
+            signals.append(("MID", f"🐋 WHALE LONG: ${wl/1e6:.1f}M"))
+        elif wl > 500_000:
+            pump_score += 2.0
+            signals.append(("MID", f"🐋 whale long: ${wl/1e6:.1f}M"))
+
+        if ws > 1_000_000:
+            dump_score -= 3.0 * whale_multi
+            signals.append(("MID", f"🐋 WHALE SHORT: ${ws/1e6:.1f}M"))
         elif ws > 500_000:
-            score -= 1.5
-            signals.append(f"whale short: ${ws/1e6:.1f}M")
+            dump_score -= 2.0
+            signals.append(("MID", f"🐋 whale short: ${ws/1e6:.1f}M"))
 
-        # 10. Crowded longs (>70% long = contrarian dump signal)
-        if ls_ratio_4h > 3.0:
-            score -= 1.5
-            signals.append(f"CROWDED LONG: L/S={ls_ratio_4h:.2f}")
+        if wc > 1_000_000:
+            # Close = less directional, lower weight
+            signals.append(("MID", f"🐋 whale CLOSE: ${wc/1e6:.1f}M"))
 
-        if abs(score) >= 1 and signals:
+        # 7. LIQUIDATION SPIKE
+        if short_liq_4h > 500_000 and long_liq_4h > 0 and short_liq_4h > 2 * long_liq_4h:
+            pump_score += 1.5
+            signals.append(("MID", f"🟡 SHORT LIQ SPIKE: ${short_liq_4h/1e6:.1f}M (4h)"))
+        if long_liq_4h > 500_000 and short_liq_4h > 0 and long_liq_4h > 2 * short_liq_4h:
+            dump_score -= 1.5
+            signals.append(("MID", f"🟡 LONG LIQ SPIKE: ${long_liq_4h/1e6:.1f}M (4h)"))
+
+        # 8. OI EXODUS — DUMP
+        if oi_4h < -3.0 * th:
+            dump_score -= 2.0
+            signals.append(("LATE", f"🔴 OI EXODUS: {oi_4h:.1f}% (4h)"))
+
+        # 9. BUBBLE — DUMP
+        if oi_4h > 3.0 * th and price_4h > 3.0 * th and fr_pct > 0.05 / th:
+            dump_score -= 3.0
+            signals.append(("LATE", f"🔴 BUBBLE: OI+{oi_4h:.1f}% Price+{price_4h:.1f}% FR+{fr_pct:.4f}%"))
+
+        # ═══════════════════════════════════════════════════════
+        # LAYER 3: PENALTIES & CONTEXT
+        # ═══════════════════════════════════════════════════════
+
+        # 10. "ALREADY MOVED" PENALTY
+        if price_4h > 8:
+            pump_score -= 4.0
+            signals.append(("LATE", f"⛔ ALREADY PUMPED: Price 4h {price_4h:+.1f}% (may be late)"))
+        elif price_4h > 5:
+            pump_score -= 3.0
+            signals.append(("LATE", f"⛔ ALREADY PUMPED: Price 4h {price_4h:+.1f}% (may be late)"))
+        elif price_4h > 3:
+            pump_score -= 2.0
+            signals.append(("LATE", f"⛔ ALREADY PUMPED: Price 4h {price_4h:+.1f}% (may be late)"))
+
+        if price_4h < -8:
+            dump_score += 4.0
+            signals.append(("LATE", f"⛔ ALREADY DUMPED: Price 4h {price_4h:+.1f}% (may be late)"))
+        elif price_4h < -5:
+            dump_score += 3.0
+            signals.append(("LATE", f"⛔ ALREADY DUMPED: Price 4h {price_4h:+.1f}% (may be late)"))
+        elif price_4h < -3:
+            dump_score += 2.0
+            signals.append(("LATE", f"⛔ ALREADY DUMPED: Price 4h {price_4h:+.1f}% (may be late)"))
+
+        # 11. LEVERAGE HEALTH
+        if oi_mcap > 0.25:
+            dump_score -= 2.0
+            signals.append(("MID", f"📊 VERY OVERLEVERAGED: OI/Mcap {oi_mcap*100:.1f}%"))
+        elif oi_mcap > 0.15:
+            dump_score -= 1.0
+            signals.append(("MID", f"📊 OVERLEVERAGED: OI/Mcap {oi_mcap*100:.1f}%"))
+
+        # 12. L/S CROWDING
+        if ls_24h > 3.0:
+            dump_score -= 1.5
+            signals.append(("MID", f"📊 CROWDED LONG: L/S 24h={ls_24h:.2f}"))
+
+        # 13. VOLUME / LIQUIDITY FLAG
+        if oi_vol_ratio > 2.0:
+            signals.append(("MID", f"⚠️ LOW LIQUIDITY: OI/Vol ratio {oi_vol_ratio:.1f}x"))
+
+        # ── Final score ──
+        total_score = pump_score + dump_score
+
+        if abs(total_score) >= 1 and signals:
+            # Determine overall timing label
+            timings = [t for t, _ in signals]
+            if "EARLY" in timings:
+                timing_label = "EARLY"
+            elif "MID" in timings:
+                timing_label = "MID"
+            else:
+                timing_label = "LATE"
+
             scored.append({
                 "symbol": sym,
-                "score": round(score, 1),
+                "score": round(total_score, 1),
+                "pump_score": round(pump_score, 1),
+                "dump_score": round(dump_score, 1),
                 "price": price,
                 "oi_usd": oi_usd,
-                "fr": fr,
-                "oi_chg_4h": oi_chg_4h,
-                "price_chg_4h": price_chg_4h,
+                "fr_pct": fr_pct,
+                "oi_chg_4h": oi_4h,
+                "price_chg_4h": price_4h,
+                "timing": timing_label,
                 "signals": signals,
             })
 
@@ -2747,50 +2867,55 @@ async def coinglass_smart_screener(
     pump_list = sorted([c for c in scored if c["score"] > 0], key=lambda x: x["score"], reverse=True)
     dump_list = sorted([c for c in scored if c["score"] < 0], key=lambda x: x["score"])
 
-    output = f"# SMART SCREENER — Pump/Dump Early Detection\n"
-    output += f"**Scan time:** {scan_time}\n"
-    output += f"**Coins scanned:** {len(coins)} | **Filtered (OI>${min_oi_usd/1e6:.0f}M):** {len([c for c in coins if (c.get('open_interest_usd') or 0) >= min_oi_usd])}\n"
-    output += f"**Signals detected:** {len(pump_list)} pump, {len(dump_list)} dump\n\n"
+    filtered_count = len([c for c in coins if (c.get("open_interest_usd") or 0) >= min_oi_usd])
+    early_count = len([c for c in scored if c["timing"] == "EARLY"])
+
+    output = f"# SMART SCREENER v2 — Early Detection\n"
+    output += f"**Scan time:** {scan_time} | **Sensitivity:** {sensitivity}\n"
+    output += f"**Coins scanned:** {len(coins)} | **Filtered (OI>${min_oi_usd/1e6:.0f}M):** {filtered_count}\n"
+    output += f"**Signals:** {len(pump_list)} pump, {len(dump_list)} dump | **⚡ Early:** {early_count}\n\n"
+
+    def _fmt_coin(i: int, c: dict) -> str:
+        """Format a single coin entry."""
+        sign = "+" if c["score"] > 0 else ""
+        block = (
+            f"### {i}. {c['symbol']} — Score: {sign}{c['score']} [{c['timing']}]\n"
+            f"Price: ${c['price']:,.4f} | OI: ${c['oi_usd']/1e6:,.0f}M | "
+            f"FR: {c['fr_pct']:.4f}% | OI 4h: {c['oi_chg_4h']:+.1f}% | "
+            f"Price 4h: {c['price_chg_4h']:+.1f}%\n"
+        )
+        for timing, sig_text in c["signals"]:
+            block += f"  {sig_text}  [{timing}]\n"
+        # Status line
+        p4h = c["price_chg_4h"]
+        if abs(p4h) <= 3:
+            block += f"  ✅ NOT moved yet: Price 4h {p4h:+.1f}%\n"
+        block += "\n"
+        return block
 
     if mode in ("all", "pump"):
-        output += f"## PUMP CANDIDATES (top {top_n})\n\n"
+        output += f"## ⬆️ PUMP CANDIDATES (top {top_n})\n\n"
         if pump_list:
             for i, c in enumerate(pump_list[:top_n], 1):
-                output += (
-                    f"### {i}. {c['symbol']} — Score: +{c['score']}\n"
-                    f"Price: ${c['price']:,.4f} | OI: ${c['oi_usd']/1e6:,.0f}M | "
-                    f"FR: {c['fr']:.4f}% | OI 4h: {c['oi_chg_4h']:+.1f}% | "
-                    f"Price 4h: {c['price_chg_4h']:+.1f}%\n"
-                )
-                for sig in c["signals"]:
-                    output += f"- {sig}\n"
-                output += "\n"
+                output += _fmt_coin(i, c)
         else:
             output += "*No pump signals detected right now.*\n\n"
 
     if mode in ("all", "dump"):
-        output += f"## DUMP CANDIDATES (top {top_n})\n\n"
+        output += f"## ⬇️ DUMP CANDIDATES (top {top_n})\n\n"
         if dump_list:
             for i, c in enumerate(dump_list[:top_n], 1):
-                output += (
-                    f"### {i}. {c['symbol']} — Score: {c['score']}\n"
-                    f"Price: ${c['price']:,.4f} | OI: ${c['oi_usd']/1e6:,.0f}M | "
-                    f"FR: {c['fr']:.4f}% | OI 4h: {c['oi_chg_4h']:+.1f}% | "
-                    f"Price 4h: {c['price_chg_4h']:+.1f}%\n"
-                )
-                for sig in c["signals"]:
-                    output += f"- {sig}\n"
-                output += "\n"
+                output += _fmt_coin(i, c)
         else:
             output += "*No dump signals detected right now.*\n\n"
 
     output += (
         "---\n\n"
         "## Cara Pakai\n\n"
-        "1. Pilih coin dari list di atas\n"
-        "2. Jalankan `coinglass_full_scan` pada coin tersebut\n"
-        "3. Confirm dengan Phase 1 (CVD+OI) + Phase 2 (Whale+OB) + Phase 3 (Binance)\n"
-        "4. Score tinggi = sinyal kuat, tapi SELALU confirm sebelum entry\n"
+        "1. Prioritaskan coin berlabel **[EARLY]** — sinyal paling fresh\n"
+        "2. Coin dengan ⛔ ALREADY MOVED sudah jalan — hati-hati chase\n"
+        "3. Jalankan `coinglass_full_scan` pada coin pilihan untuk konfirmasi detail\n"
+        "4. Confirm: Phase 1 (CVD+OI) → Phase 2 (Whale+OB) → Phase 3 (Binance)\n"
     )
 
     return output
@@ -2826,17 +2951,15 @@ async def coinglass_full_scan(
     interval: str = "5m",
     exchange: str = DEFAULT_EXCHANGE,
 ) -> str:
-    """ALL-IN-ONE 2-phase scan — Ricoz Scalping Framework (12 endpoints).
+    """ALL-IN-ONE 4-phase scan — Ricoz Scalping Framework (~24 endpoints).
 
-    Phase 1 — Quick Scan (8 core endpoints):
-    - CRITICAL (SpotCVD + FutCVD + OI): ALL must succeed or analysis BLOCKED
-    - SUPPLEMENTARY (FR, OB, Price, Taker, L/S): partial OK
+    Optimized for speed: per-task timeout caps (12s), reduced data limits.
+    Targets <30s total execution — safe for Claude AI MCP.
 
-    Phase 2 — Pre-Entry Precision Check (4 endpoints, auto):
-    - Whale Alert: Hyperliquid whale positions >$1M (filtered by coin)
-    - OB Bidask ±1%: Real-time bids vs asks depth
-    - Footprint: Buy/sell absorption per price level (Standard+ plan)
-    - RSI: Overbought/oversold confirmation (>70 OB, <30 OS)
+    Phase 1 — Quick Scan (8 core CoinGlass endpoints)
+    Phase 2 — Precision Check (7 endpoints: Whale, OB, Footprint, RSI, etc.)
+    Phase 3 — Binance Direct Cross-Check (6 endpoints)
+    Phase 4 — On-Chain Layer (Nansen + Arkham)
 
     Args:
         symbol: Coin symbol (BTC, ETH, SOL, HYPE, AVAX, etc.)
@@ -2845,10 +2968,17 @@ async def coinglass_full_scan(
     """
     import asyncio
 
+    async def _capped(coro, timeout=12):
+        """Cap per-task execution time — prevents slow retries from blocking scan."""
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            return TimeoutError(f"Timed out after {timeout}s")
+
     sym = to_cg_symbol(symbol)  # PEPE→1000PEPE, BTC→BTC
     raw_sym = normalize_symbol(symbol)  # Always base symbol for display
     pair = to_pair(symbol)
-    limit = 100
+    limit = 30  # formatters only show last 15 — keep lean for speed
 
     # Define all endpoints with their labels and criticality
     # V4 API: some endpoints need coin-level (1000PEPE), some need pair-level (1000PEPEUSDT)
@@ -2921,37 +3051,37 @@ async def coinglass_full_scan(
     )
 
     # ── Prepare ALL phases for parallel execution ──
-    # Phase 1+2: CoinGlass endpoints
+    # Phase 1+2: CoinGlass endpoints — capped at 12s per task (prevents 20s retry chains)
     all_calls = calls + precision_calls
-    cg_tasks = [client.get(ep, params) for _, ep, params in all_calls]
+    cg_tasks = [_capped(client.get(ep, params), timeout=12) for _, ep, params in all_calls]
 
-    # Phase 3: Binance direct (no API key, separate rate limiter)
+    # Phase 3: Binance direct (no API key, separate rate limiter) — capped at 10s
     BINANCE_SPOT_MAP = {"HYPE": "HYPER"}
     bn_spot_sym = BINANCE_SPOT_MAP.get(sym, sym) + "USDT"
     bn_fut_sym = pair  # e.g. SOLUSDT
     bn_tasks = [
-        binance_futures_request("/fapi/v1/premiumIndex", {"symbol": bn_fut_sym}),
-        binance_futures_request("/fapi/v1/openInterest", {"symbol": bn_fut_sym}),
-        binance_futures_request(
+        _capped(binance_futures_request("/fapi/v1/premiumIndex", {"symbol": bn_fut_sym}), timeout=10),
+        _capped(binance_futures_request("/fapi/v1/openInterest", {"symbol": bn_fut_sym}), timeout=10),
+        _capped(binance_futures_request(
             "/futures/data/takerlongshortRatio",
             {"symbol": bn_fut_sym, "period": interval if interval in ("5m","15m","30m","1h","2h","4h") else "5m", "limit": 10},
-        ),
-        binance_futures_request(
+        ), timeout=10),
+        _capped(binance_futures_request(
             "/futures/data/globalLongShortAccountRatio",
             {"symbol": bn_fut_sym, "period": interval if interval in ("5m","15m","30m","1h","2h","4h") else "5m", "limit": 10},
-        ),
-        binance_spot_request("/api/v3/klines", {"symbol": bn_spot_sym, "interval": interval, "limit": 20}, weight=2),
-        binance_futures_request("/fapi/v1/klines", {"symbol": bn_fut_sym, "interval": interval, "limit": 50}, weight=5),
+        ), timeout=10),
+        _capped(binance_spot_request("/api/v3/klines", {"symbol": bn_spot_sym, "interval": interval, "limit": 15}, weight=2), timeout=10),
+        _capped(binance_futures_request("/fapi/v1/klines", {"symbol": bn_fut_sym, "interval": interval, "limit": 30}, weight=5), timeout=10),
     ]
 
-    # Phase 4: Nansen + Arkham (external APIs)
+    # Phase 4: Nansen + Arkham (external APIs) — capped at 12s
     p4_task_names = []
     p4_coros = []
     nansen_skip = raw_sym.upper() in NANSEN_UNSUPPORTED
     nansen_has_map = raw_sym.upper() in NANSEN_TOKEN_MAP
     if nansen_has_map and not nansen_skip:
         p4_task_names.append("nansen")
-        p4_coros.append(nansen_token_flow_intelligence(raw_sym))
+        p4_coros.append(_capped(nansen_token_flow_intelligence(raw_sym), timeout=12))
     else:
         async def _noop():
             return None
@@ -2963,10 +3093,10 @@ async def coinglass_full_scan(
     if arkham_chain:
         arkham_params["chains"] = arkham_chain
     p4_task_names.append("arkham")
-    p4_coros.append(arkham_get(f"/flow/entity/{exchange.lower()}", arkham_params))
+    p4_coros.append(_capped(arkham_get(f"/flow/entity/{exchange.lower()}", arkham_params), timeout=12))
 
     # ══ FIRE ALL PHASES IN PARALLEL — biggest speed win ══
-    # CoinGlass is rate-limited but Binance + Nansen + Arkham run concurrently
+    # Per-task timeouts cap slow endpoints. Total scan targets <30s.
     _cg_results, _bn_results, _p4_results = await asyncio.gather(
         asyncio.gather(*cg_tasks, return_exceptions=True),
         asyncio.gather(*bn_tasks, return_exceptions=True),
@@ -3631,6 +3761,11 @@ async def coinglass_full_scan(
         output += (
             f"## Nansen On-Chain Flows — {raw_sym} | 1h\n\n"
             f"*(Not supported — BTC and Hyperliquid chain excluded)*\n\n"
+        )
+    elif isinstance(nansen_result, Exception):
+        output += (
+            f"## Nansen On-Chain Flows — {raw_sym} | 1h\n\n"
+            f"**FAILED:** {str(nansen_result)[:200]}\n\n"
         )
     elif isinstance(nansen_result, dict) and nansen_result:
         output += f"## Nansen On-Chain Flows — {raw_sym} | 1h\n\n"
