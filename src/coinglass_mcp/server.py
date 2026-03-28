@@ -167,8 +167,86 @@ def _age_banner(result: FetchResult) -> str:
         return f"Data: {result.age_label} | Source: {src} | {ts}\n\n"
 
 
+def _fmt_cell(val) -> str:
+    """Format a cell value for auto-table."""
+    if val is None:
+        return "—"
+    if isinstance(val, bool):
+        return str(val)
+    if isinstance(val, (int, float)):
+        v = float(val)
+        av = abs(v)
+        if av >= 1e9:
+            return f"{v / 1e9:,.2f}B"
+        if av >= 1e6:
+            return f"{v / 1e6:,.2f}M"
+        if av >= 1e3:
+            return f"{v / 1e3:,.1f}K"
+        if av >= 1:
+            return f"{v:,.2f}"
+        if av >= 0.0001:
+            return f"{v:.4f}"
+        if av > 0:
+            return f"{v:.8f}"
+        return "0"
+    s = str(val)
+    return s[:20] if len(s) > 20 else s
+
+
+def _auto_table(data: list) -> str:
+    """Auto-generate a markdown table from a list of dicts."""
+    if not data or not isinstance(data[0], dict):
+        return json.dumps(data[:20], indent=2, default=str)
+
+    # Collect keys from first few items
+    all_keys = []
+    seen = set()
+    for d in data[:5]:
+        for k in d.keys():
+            if k not in seen:
+                all_keys.append(k)
+                seen.add(k)
+
+    # Filter out nested values, limit columns to 8
+    simple_keys = [k for k in all_keys
+                   if not isinstance(data[0].get(k), (list, dict))]
+    if not simple_keys:
+        return json.dumps(data[:20], indent=2, default=str)
+
+    if len(simple_keys) > 8:
+        prio, rest = [], []
+        for k in simple_keys:
+            kl = k.lower()
+            if kl in ("symbol", "exchange", "exchangename", "pair", "name",
+                       "side", "action", "classification"):
+                prio.append(k)
+            elif any(t in kl for t in ("time", "date", "timestamp")):
+                prio.append(k)
+            else:
+                rest.append(k)
+        simple_keys = (prio + rest)[:8]
+
+    show = data[-20:] if len(data) > 20 else data
+    prefix = f"*(showing last {len(show)} of {len(data)})*\n\n" if len(data) > 20 else ""
+
+    # Calculate column widths
+    widths = {}
+    for k in simple_keys:
+        hlen = len(str(k))
+        vlen = max((len(_fmt_cell(d.get(k))) for d in show[:10]), default=0)
+        widths[k] = max(hlen, min(vlen, 18))
+
+    table = prefix + "```\n"
+    table += " | ".join(f"{k:>{widths[k]}}" for k in simple_keys) + "\n"
+    table += " | ".join(f"{'─' * widths[k]}" for k in simple_keys) + "\n"
+    for d in show:
+        table += " | ".join(f"{_fmt_cell(d.get(k)):>{widths[k]}}" for k in simple_keys) + "\n"
+    table += "```\n"
+    return table
+
+
 def fmt(result: FetchResult, title: str = "") -> str:
-    """Format API response with age banner and staleness warnings."""
+    """Format API response with age banner — smart auto-table for dicts/lists."""
     data = result.data
     header = ""
     if title:
@@ -181,12 +259,25 @@ def fmt(result: FetchResult, title: str = "") -> str:
     if isinstance(data, list):
         if len(data) == 0:
             return f"{header}**WARNING: Empty dataset.** No data points returned."
-        if len(data) > 20:
-            total = len(data)
-            data = data[-20:]
-            header += f"*(showing last 20 of {total} entries)*\n\n"
-        return header + json.dumps(data, indent=2, default=str)
+        # String list (supported coins/exchanges)
+        if isinstance(data[0], str):
+            return header + ", ".join(data)
+        # List of dicts → auto-table
+        if isinstance(data[0], dict):
+            return header + _auto_table(data)
+        # List of lists (kline arrays, heatmap) → compact JSON
+        show = data[-20:] if len(data) > 20 else data
+        prefix = f"*(showing last {len(show)} of {len(data)})*\n\n" if len(data) > 20 else ""
+        return header + prefix + json.dumps(show, indent=1, default=str)
     elif isinstance(data, dict):
+        # Single dict → key-value format
+        lines = []
+        for k, v in data.items():
+            if isinstance(v, (list, dict)):
+                continue
+            lines.append(f"- **{k}:** {_fmt_cell(v)}")
+        if lines:
+            return header + "\n".join(lines) + "\n"
         return header + json.dumps(data, indent=2, default=str)
     else:
         return header + str(data)
@@ -952,13 +1043,175 @@ def _fmt_fr_exchange_list(result: FetchResult, label: str) -> str:
     # If already compacted (list of dicts with 'exchange' key)
     if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
         if "exchange" in data[0]:
-            return header + json.dumps(data, indent=2, default=str)
+            return header + _fmt_scan_fr(data)
     # Raw format — compact it
     compacted = _format_fr_compact(data, label)
     if not compacted:
         return f"{header}**No active funding rate entries.**"
-    return header + json.dumps(compacted, indent=2, default=str)
+    return header + _fmt_scan_fr(compacted)
 
+
+def _fmt_funding_rate_all(data: list) -> str:
+    """Format funding rate list for ALL coins (standalone tool)."""
+    if not data:
+        return "**Empty dataset**\n\n"
+    out = "```\n"
+    out += f" {'Symbol':<8} | {'Exchange':<12} | {'FR':>10} | {'Interval':>8} | {'Next':>6}\n"
+    out += f" {'─' * 8} | {'─' * 12} | {'─' * 10} | {'─' * 8} | {'─' * 6}\n"
+    for row in data:
+        sym = row.get("symbol", "?")
+        ex = row.get("exchange", "?")
+        fr = row.get("funding_rate", 0)
+        interval = row.get("interval_h", 8)
+        nf = row.get("next_funding")
+        nf_str = _ts_wib(nf) if nf else "N/A"
+        fr_pct = float(fr) * 100 if fr else 0
+        out += f" {sym:<8} | {ex:<12} | {fr_pct:>+9.4f}% | {interval:>7}h | {nf_str:>6}\n"
+    out += "```\n\n"
+    return out
+
+
+def _fmt_fr_arbitrage(data: list) -> str:
+    """Format FR arbitrage opportunities."""
+    if not data:
+        return "**Empty dataset**\n\n"
+    out = "```\n"
+    out += f" {'Symbol':<10} | {'FR':>10} | {'APR':>8} | {'Est.Income':>12} | {'Exchange':>10}\n"
+    out += f" {'─' * 10} | {'─' * 10} | {'─' * 8} | {'─' * 12} | {'─' * 10}\n"
+    for row in data:
+        sym = _get(row, "symbol", "coin", default="?")
+        fr = float(_get(row, "fundingRate", "funding_rate", "fr", default=0))
+        apr = float(_get(row, "apr", "annualRate", default=0))
+        income = float(_get(row, "income", "estimatedIncome", "est_income", default=0))
+        ex = _get(row, "exchangeName", "exchange", default="?")
+        out += f" {sym:<10} | {fr * 100:>+9.4f}% | {apr:>+7.2f}% | {_fmt_num(income):>12} | {ex:>10}\n"
+    out += "```\n\n"
+    return out
+
+
+def _fmt_fear_greed(data: list) -> str:
+    """Format Fear & Greed Index history."""
+    if not data:
+        return "**Empty dataset**\n\n"
+    show = data[-20:] if len(data) > 20 else data
+    out = ""
+    if len(data) > 20:
+        out += f"*(showing last {len(show)} of {len(data)})*\n\n"
+    out += "```\n"
+    out += f" {'Date':>12} | {'Value':>6} | Classification\n"
+    out += f" {'─' * 12} | {'─' * 6} | ──────────────\n"
+    for row in show:
+        t = _get(row, "t", "time", "timestamp", "date", default=0)
+        val = _get(row, "value", "v", default=0)
+        cls = _get(row, "classification", "valueClassification",
+                   "value_classification", default="—")
+        if t:
+            try:
+                ts = float(t)
+                if ts > 1e12:
+                    ts /= 1000
+                date_str = datetime.fromtimestamp(ts, tz=WIB).strftime("%Y-%m-%d")
+            except (ValueError, OSError):
+                date_str = str(t)[:12]
+        else:
+            date_str = "—"
+        out += f" {date_str:>12} | {int(float(val)):>6} | {cls}\n"
+    out += "```\n\n"
+    # Latest value summary
+    if show:
+        latest = show[-1]
+        v = int(float(_get(latest, "value", "v", default=0)))
+        c = _get(latest, "classification", "valueClassification",
+                 "value_classification", default="?")
+        out += f"**Current:** {v} — {c}\n\n"
+    return out
+
+
+def _fmt_coins_markets(data: list) -> str:
+    """Format coins-markets overview (futures market data)."""
+    if not data:
+        return "**Empty dataset**\n\n"
+    out = "```\n"
+    out += (f" {'Symbol':<8} | {'Price':>12} | {'24h %':>8} | {'OI':>10}"
+            f" | {'Vol 24h':>10} | {'FR':>9}\n")
+    out += (f" {'─' * 8} | {'─' * 12} | {'─' * 8} | {'─' * 10}"
+            f" | {'─' * 10} | {'─' * 9}\n")
+    for row in data:
+        sym = _get(row, "symbol", default="?")
+        price = float(_get(row, "price", "lastPrice", default=0))
+        pct = float(_get(row, "priceChangePercent", "priceChange24h",
+                         "price_change_percent", default=0))
+        oi = float(_get(row, "openInterest", "oi", "open_interest", default=0))
+        vol = float(_get(row, "vol24h", "volume24h", "quoteVolume",
+                         "turnover24h", default=0))
+        fr = float(_get(row, "fundingRate", "funding_rate", "fr", default=0))
+        out += (f" {sym:<8} | {_fmt_num(price):>12} | {pct:>+7.2f}% | {_fmt_num(oi):>10}"
+                f" | {_fmt_num(vol):>10} | {fr * 100:>+8.4f}%\n")
+    out += "```\n\n"
+    return out
+
+
+def _fmt_indicator_ts(data: list) -> str:
+    """Format indicator time-series (RSI, MA, EMA, MACD, ATR, Whale Index)."""
+    if not data:
+        return "**Empty dataset**\n\n"
+    show = data[-20:] if len(data) > 20 else data
+    out = ""
+    if len(data) > 20:
+        out += f"*(showing last {len(show)} of {len(data)})*\n\n"
+    # Detect fields from first row
+    sample = show[0] if isinstance(show[0], dict) else {}
+    val_keys = [k for k in sample.keys()
+                if k not in ("t", "time", "timestamp", "createTime")
+                and not isinstance(sample[k], (list, dict))][:4]
+    out += "```\n"
+    header = f" {'Time':>6}"
+    for k in val_keys:
+        header += f" | {k:>12}"
+    out += header + "\n"
+    sep = f" {'─' * 6}"
+    for k in val_keys:
+        sep += f" | {'─' * 12}"
+    out += sep + "\n"
+    for row in show:
+        if not isinstance(row, dict):
+            continue
+        t = _get(row, "t", "time", "timestamp", "createTime", default=0)
+        line = f" {_ts_wib(t):>6}"
+        for k in val_keys:
+            v = row.get(k)
+            if v is not None:
+                line += f" | {_fmt_num(float(v)):>12}"
+            else:
+                line += f" | {'—':>12}"
+        out += line + "\n"
+    out += "```\n\n"
+    return out
+
+
+def _fmt_news(data: list) -> str:
+    """Format crypto news articles."""
+    if not data:
+        return "**No news articles.**\n\n"
+    out = ""
+    for i, article in enumerate(data[:20], 1):
+        title = _get(article, "title", "headline", default="Untitled")
+        source = _get(article, "source", "sourceName", default="")
+        t = _get(article, "createTime", "time", "timestamp", "publishedAt", default=0)
+        date_str = ""
+        if t:
+            try:
+                ts = float(t)
+                if ts > 1e12:
+                    ts /= 1000
+                date_str = datetime.fromtimestamp(ts, tz=WIB).strftime("%m-%d %H:%M")
+            except (ValueError, OSError):
+                date_str = ""
+        out += f"**{i}.** {title}\n"
+        if source or date_str:
+            out += f"   _{source}_ | {date_str}\n"
+        out += "\n"
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1070,7 +1323,7 @@ async def coinglass_funding_rate(symbol: str = "") -> str:
                 data=top50, age_seconds=result.age_seconds,
                 is_cached=result.is_cached, fetched_at=result.fetched_at,
             )
-    return fmt(result, f"Funding Rate — Top 50 Extreme FR (of {total} active)")
+    return fmt_parsed(result, f"Funding Rate — Top 50 Extreme FR (of {total} active)", _fmt_funding_rate_all)
 
 
 @mcp.tool()
@@ -1323,15 +1576,8 @@ async def coinglass_fr_arbitrage(
             data=top20, age_seconds=result.age_seconds,
             is_cached=result.is_cached, fetched_at=result.fetched_at,
         )
-        output = fmt(result, f"Funding Rate Arbitrage — ${usd} position")
-        if total > 20:
-            output = output.replace(
-                f"## Funding Rate Arbitrage",
-                f"## Funding Rate Arbitrage (top 20 of {total} by APR)",
-                1,
-            )
-        return output
-    return fmt(result, f"Funding Rate Arbitrage — ${usd} position")
+        return fmt_parsed(result, f"Funding Rate Arbitrage — top 20 of {total} by APR (${usd} position)", _fmt_fr_arbitrage)
+    return fmt_parsed(result, f"Funding Rate Arbitrage — ${usd} position", _fmt_fr_arbitrage)
 
 
 @mcp.tool()
@@ -1356,7 +1602,7 @@ async def coinglass_coins_markets(
     if exchange:
         params["exchange_list"] = exchange
     result = await client.get("/api/futures/coins-markets", params)
-    return fmt(result, f"Futures Market Overview — page {page}")
+    return fmt_parsed(result, f"Futures Market Overview — page {page}", _fmt_coins_markets)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1396,7 +1642,7 @@ async def coinglass_fear_greed(symbol: str = "") -> str:
         symbol: Ignored — index is market-wide. Accepted for compatibility.
     """
     result = await client.get("/api/index/fear-greed-history")
-    return fmt(result, "Fear & Greed Index")
+    return fmt_parsed(result, "Fear & Greed Index", _fmt_fear_greed)
 
 
 @mcp.tool()
@@ -1588,7 +1834,7 @@ async def coinglass_trading_market(
         if exchange:
             params["exchange_list"] = exchange
         result = await client.get("/api/futures/coins-markets", params)
-        return fmt(result, f"Futures — Coins Markets (page {page})")
+        return fmt_parsed(result, f"Futures — Coins Markets (page {page})", _fmt_coins_markets)
 
     elif action == "pairs_markets":
         if not symbol:
@@ -1611,7 +1857,7 @@ async def coinglass_trading_market(
             "interval": interval,
             "limit": limit,
         })
-        return fmt(result, f"Futures — Price OHLC ({normalize_symbol(symbol)} {interval})")
+        return fmt_parsed(result, f"Futures — Price OHLC ({normalize_symbol(symbol)} {interval})", _fmt_scan_price)
 
     elif action == "delisted_pairs":
         result = await client.get("/api/futures/delisted-exchange-pairs")
@@ -1814,14 +2060,14 @@ async def coinglass_funding_rate_cat(
                     data=filtered, age_seconds=result.age_seconds,
                     is_cached=result.is_cached, fetched_at=result.fetched_at,
                 )
-        return fmt(result, f"Cumulative FR — {sym or 'All Coins'} ({range})")
+        return fmt(result, f"Cumulative FR — {sym or 'All Coins'} ({range})")  # auto-table
 
     elif action == "arbitrage":
         params: dict = {"usd": usd}
         if exchange and exchange != DEFAULT_EXCHANGE:
             params["exchange_list"] = exchange
         result = await client.get("/api/futures/funding-rate/arbitrage", params)
-        return fmt(result, f"FR Arbitrage — ${usd} position")
+        return fmt_parsed(result, f"FR Arbitrage — ${usd} position", _fmt_fr_arbitrage)
 
     else:
         return (
@@ -2258,7 +2504,7 @@ Args:
             "/api/spot/coins-markets",
             {"page": page, "per_page": per_page},
         )
-        return fmt(result, f"Spot Coins Markets (page {page})")
+        return fmt_parsed(result, f"Spot Coins Markets (page {page})", _fmt_coins_markets)
 
     elif action == "pairs_markets":
         result = await client.get(
@@ -2433,7 +2679,7 @@ Args:
             {"exchange": exchange, "symbol": pair, "interval": interval,
              "limit": limit, "window": window, "series_type": series_type},
         )
-        return fmt(result, f"RSI — {pair} ({exchange}, {interval}, w{window})")
+        return fmt_parsed(result, f"RSI — {pair} ({exchange}, {interval}, w{window})", _fmt_indicator_ts)
 
     elif action == "pair_ma":
         result = await client.get(
@@ -2441,7 +2687,7 @@ Args:
             {"exchange": exchange, "symbol": pair, "interval": interval,
              "limit": limit, "window": window, "series_type": series_type},
         )
-        return fmt(result, f"MA — {pair} ({exchange}, {interval}, w{window})")
+        return fmt_parsed(result, f"MA — {pair} ({exchange}, {interval}, w{window})", _fmt_indicator_ts)
 
     elif action == "pair_ema":
         result = await client.get(
@@ -2449,7 +2695,7 @@ Args:
             {"exchange": exchange, "symbol": pair, "interval": interval,
              "limit": limit, "window": window, "series_type": series_type},
         )
-        return fmt(result, f"EMA — {pair} ({exchange}, {interval}, w{window})")
+        return fmt_parsed(result, f"EMA — {pair} ({exchange}, {interval}, w{window})", _fmt_indicator_ts)
 
     elif action == "pair_macd":
         result = await client.get(
@@ -2459,7 +2705,7 @@ Args:
              "fast_window": fast_window, "slow_window": slow_window,
              "signal_window": signal_window},
         )
-        return fmt(result, f"MACD — {pair} ({exchange}, {interval}, {fast_window}/{slow_window}/{signal_window})")
+        return fmt_parsed(result, f"MACD — {pair} ({exchange}, {interval}, {fast_window}/{slow_window}/{signal_window})", _fmt_indicator_ts)
 
     elif action == "pair_atr":
         result = await client.get(
@@ -2467,14 +2713,14 @@ Args:
             {"exchange": exchange, "symbol": pair, "interval": interval,
              "limit": limit, "window": window},
         )
-        return fmt(result, f"ATR — {pair} ({exchange}, {interval}, w{window})")
+        return fmt_parsed(result, f"ATR — {pair} ({exchange}, {interval}, w{window})", _fmt_indicator_ts)
 
     elif action == "whale_index":
         result = await client.get(
             "/api/futures/whale-index/history",
             {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit},
         )
-        return fmt(result, f"Whale Index — {pair} ({exchange}, {interval})")
+        return fmt_parsed(result, f"Whale Index — {pair} ({exchange}, {interval})", _fmt_indicator_ts)
 
     else:
         return (
@@ -2522,7 +2768,7 @@ Args:
 
     if action == "altcoin_season":
         result = await client.get("/api/index/altcoin-season", {})
-        return fmt(result, "Altcoin Season Index")
+        return fmt_parsed(result, "Altcoin Season Index", _fmt_indicator_ts)
 
     elif action == "futures_spot_ratio":
         result = await client.get(
@@ -2530,14 +2776,14 @@ Args:
             {"exchange_list": exchange, "symbol": sym,
              "interval": interval, "limit": limit},
         )
-        return fmt(result, f"Futures/Spot Volume Ratio — {sym} ({exchange}, {interval})")
+        return fmt_parsed(result, f"Futures/Spot Volume Ratio — {sym} ({exchange}, {interval})", _fmt_indicator_ts)
 
     elif action == "news":
         result = await client.get(
             "/api/article/list",
             {"language": language, "page": page, "per_page": per_page},
         )
-        return fmt(result, f"Crypto News ({language}, page {page})")
+        return fmt_parsed(result, f"Crypto News ({language}, page {page})", _fmt_news)
 
     else:
         return (
