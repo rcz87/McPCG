@@ -2832,12 +2832,16 @@ async def coinglass_smart_screener(
     top_n: int = 15,
     min_oi_usd: float = 10_000_000,
     sensitivity: str = "normal",
+    deep_scan: bool = False,
 ) -> str:
     """Screen ALL coins for pump/dump signals BEFORE retail notices.
 
-    v2 — Early Detection: prioritizes FRESH transitions over late signals.
-    Fetches coins-markets + whale data in parallel, then scores each coin
-    across 3 layers: EARLY (transitions), MID (building), LATE (already moved).
+    v3 — Deep Scan: Phase 1 (coins_markets + whale) → Phase 2 (CVD + OB + Taker for top candidates).
+
+    When deep_scan=False (default): Fast mode, same as v2.
+    When deep_scan=True: After initial filter, fetches Spot CVD, Futures CVD,
+    Taker flow, and Orderbook for top candidates. Scores 0-100 with 6 dimensions.
+    Classifies each coin (ACCUMULATION, DISTRIBUTION, SQUEEZE, etc.)
 
     EARLY signals (highest weight):
     - Fresh stealth accumulation/distribution (1h OI vs price divergence)
@@ -2855,6 +2859,7 @@ async def coinglass_smart_screener(
         top_n: Number of coins to return per category (default 15)
         min_oi_usd: Minimum OI in USD to filter noise (default $10M)
         sensitivity: "high" (lower thresholds, more signals), "normal", "low" (higher thresholds, fewer but stronger signals)
+        deep_scan: True = fetch CVD/OB/Taker for top candidates, score 0-100 (slower, ~40 extra API calls)
     """
     import asyncio
 
@@ -3134,6 +3139,9 @@ async def coinglass_smart_screener(
                 "fr_pct": fr_pct,
                 "oi_chg_4h": oi_4h,
                 "price_chg_4h": price_4h,
+                "_ls_1h": ls_1h,
+                "_ls_4h": ls_4h,
+                "_oi_mcap": oi_mcap,
                 "timing": timing_label,
                 "signals": signals,
             })
@@ -3145,6 +3153,416 @@ async def coinglass_smart_screener(
     filtered_count = len([c for c in coins if (c.get("open_interest_usd") or 0) >= min_oi_usd])
     early_count = len([c for c in scored if c["timing"] == "EARLY"])
 
+    # ═══════════════════════════════════════════════════════════════
+    # PHASE 2: DEEP SCAN — CVD + OB + Taker for top candidates
+    # ═══════════════════════════════════════════════════════════════
+    if deep_scan and (pump_list or dump_list):
+        # Select top candidates for deep scan
+        deep_n = min(5, top_n)
+        candidates = []
+        for c in pump_list[:deep_n]:
+            candidates.append(c)
+        for c in dump_list[:deep_n]:
+            candidates.append(c)
+
+        # Fetch 4 metrics per candidate in parallel
+        deep_tasks = []
+        deep_map = []  # track which task belongs to which coin+metric
+        for c in candidates:
+            sym = c["symbol"]
+            deep_tasks.append(client.get("/api/spot/aggregated-cvd/history",
+                {"exchange_list": "Binance", "symbol": sym, "interval": "5m", "limit": 15}))
+            deep_map.append((sym, "spot_cvd"))
+
+            deep_tasks.append(client.get("/api/futures/aggregated-cvd/history",
+                {"exchange_list": "Binance", "symbol": sym, "interval": "5m", "limit": 15}))
+            deep_map.append((sym, "fut_cvd"))
+
+            deep_tasks.append(client.get("/api/futures/aggregated-taker-buy-sell-volume/history",
+                {"exchange_list": "Binance", "symbol": sym, "interval": "5m", "limit": 15}))
+            deep_map.append((sym, "taker"))
+
+            deep_tasks.append(client.get("/api/futures/orderbook/aggregated-ask-bids-history",
+                {"exchange_list": "Binance", "symbol": sym, "interval": "5m", "limit": 15, "range": "1"}))
+            deep_map.append((sym, "ob"))
+
+        deep_results = await asyncio.gather(*deep_tasks, return_exceptions=True)
+
+        # Parse deep scan results per coin
+        deep_data = {}  # symbol -> {spot_cvd, fut_cvd, taker, ob}
+        for i, res in enumerate(deep_results):
+            sym, metric = deep_map[i]
+            if sym not in deep_data:
+                deep_data[sym] = {}
+            if isinstance(res, FetchResult) and isinstance(res.data, list) and res.data:
+                deep_data[sym][metric] = res.data
+            else:
+                deep_data[sym][metric] = None
+
+        # Score 0-100 per coin using 6 dimensions
+        def _deep_score(c: dict) -> dict:
+            sym = c["symbol"]
+            dd = deep_data.get(sym, {})
+            dims = {}  # dimension -> score (0-100 for that dimension)
+
+            # --- OI Trend (20%) ---
+            oi_4h = c["oi_chg_4h"]
+            p4h = c["price_chg_4h"]
+            is_pump = c["score"] > 0
+            if is_pump:
+                if oi_4h > 3:
+                    dims["oi"] = 90
+                elif oi_4h > 1:
+                    dims["oi"] = 70
+                elif oi_4h > 0:
+                    dims["oi"] = 50
+                else:
+                    dims["oi"] = 20
+            else:
+                if oi_4h < -3:
+                    dims["oi"] = 90
+                elif oi_4h < -1:
+                    dims["oi"] = 70
+                elif oi_4h < 0:
+                    dims["oi"] = 50
+                else:
+                    dims["oi"] = 20
+
+            # --- CVD Alignment (25%) ---
+            spot_rows = dd.get("spot_cvd")
+            fut_rows = dd.get("fut_cvd")
+            spot_dir = 0  # +1 rising, -1 falling
+            fut_dir = 0
+            spot_summary = "N/A"
+            fut_summary = "N/A"
+
+            if spot_rows and len(spot_rows) >= 3:
+                vals = [float(r.get("cvd", 0) or 0) for r in spot_rows]
+                if vals[-1] > vals[0]:
+                    spot_dir = 1
+                    spot_summary = f"+{_fmt_num(vals[-1] - vals[0])}"
+                else:
+                    spot_dir = -1
+                    spot_summary = f"{_fmt_num(vals[-1] - vals[0])}"
+                pos_deltas = sum(1 for i in range(1, len(vals)) if vals[i] > vals[i-1])
+                spot_summary += f" ({pos_deltas}/{len(vals)-1} up)"
+
+            if fut_rows and len(fut_rows) >= 3:
+                vals = [float(r.get("cvd", 0) or 0) for r in fut_rows]
+                if vals[-1] > vals[0]:
+                    fut_dir = 1
+                    fut_summary = f"+{_fmt_num(vals[-1] - vals[0])}"
+                else:
+                    fut_dir = -1
+                    fut_summary = f"{_fmt_num(vals[-1] - vals[0])}"
+                pos_deltas = sum(1 for i in range(1, len(vals)) if vals[i] > vals[i-1])
+                fut_summary += f" ({pos_deltas}/{len(vals)-1} up)"
+
+            if is_pump:
+                if spot_dir == 1 and fut_dir == 1:
+                    dims["cvd"] = 95  # both rising = strong
+                elif spot_dir == 1:
+                    dims["cvd"] = 65  # spot rising only
+                elif fut_dir == 1:
+                    dims["cvd"] = 45  # futures only
+                else:
+                    dims["cvd"] = 15  # neither
+            else:
+                if spot_dir == -1 and fut_dir == -1:
+                    dims["cvd"] = 95
+                elif spot_dir == -1:
+                    dims["cvd"] = 65
+                elif fut_dir == -1:
+                    dims["cvd"] = 45
+                else:
+                    dims["cvd"] = 15
+
+            # --- Taker Flow (15%) ---
+            taker_rows = dd.get("taker")
+            taker_summary = "N/A"
+            if taker_rows and len(taker_rows) >= 3:
+                buy_dominant = 0
+                total_buy = 0
+                total_sell = 0
+                for r in taker_rows:
+                    b = float(_get(r, "aggregated_buy_volume_usd", "taker_buy_volume_usd",
+                                   "buyVol", "buy", default=0))
+                    s = float(_get(r, "aggregated_sell_volume_usd", "taker_sell_volume_usd",
+                                   "sellVol", "sell", default=0))
+                    total_buy += b
+                    total_sell += s
+                    if b > s:
+                        buy_dominant += 1
+                net = total_buy - total_sell
+                taker_summary = f"Buy {_fmt_num(total_buy)} vs Sell {_fmt_num(total_sell)} | Net {_fmt_num(net, signed=True)}"
+                ratio = buy_dominant / len(taker_rows)
+                if is_pump:
+                    dims["taker"] = min(95, int(ratio * 100) + (20 if net > 0 else -10))
+                else:
+                    dims["taker"] = min(95, int((1 - ratio) * 100) + (20 if net < 0 else -10))
+            else:
+                dims["taker"] = 40  # neutral if missing
+
+            # --- Positioning (15%) — from L/S ratio already in coins_markets ---
+            ls = c.get("_ls_1h", 1.0)
+            ls_4h = c.get("_ls_4h", 1.0)
+            if is_pump:
+                if ls > 1.1 and ls > ls_4h:
+                    dims["pos"] = 80
+                elif ls > 1.0:
+                    dims["pos"] = 55
+                else:
+                    dims["pos"] = 30
+            else:
+                if ls < 0.9 and ls < ls_4h:
+                    dims["pos"] = 80
+                elif ls < 1.0:
+                    dims["pos"] = 55
+                else:
+                    dims["pos"] = 30
+
+            # --- Funding Rate (10%) ---
+            fr = c["fr_pct"]
+            if is_pump:
+                if fr < -0.05:
+                    dims["fr"] = 90  # extreme neg = squeeze fuel
+                elif fr < -0.01:
+                    dims["fr"] = 70
+                elif fr < 0.01:
+                    dims["fr"] = 50  # neutral
+                else:
+                    dims["fr"] = 25  # positive = headwind for longs
+            else:
+                if fr > 0.05:
+                    dims["fr"] = 90
+                elif fr > 0.01:
+                    dims["fr"] = 70
+                elif fr > -0.01:
+                    dims["fr"] = 50
+                else:
+                    dims["fr"] = 25
+
+            # --- Orderbook (15%) ---
+            ob_rows = dd.get("ob")
+            ob_summary = "N/A"
+            if ob_rows and len(ob_rows) >= 3:
+                bid_dom = 0
+                total_bids = 0
+                total_asks = 0
+                for r in ob_rows:
+                    b = float(_get(r, "aggregated_bids_usd", "bids_usd", "bids", default=0))
+                    a = float(_get(r, "aggregated_asks_usd", "asks_usd", "asks", default=0))
+                    total_bids += b
+                    total_asks += a
+                    if b > a:
+                        bid_dom += 1
+                ob_ratio = total_bids / total_asks if total_asks > 0 else 1.0
+                ob_summary = f"Bids {_fmt_num(total_bids)} vs Asks {_fmt_num(total_asks)} | Ratio {ob_ratio:.2f}"
+                if is_pump:
+                    if ob_ratio > 1.2:
+                        dims["ob"] = 85
+                    elif ob_ratio > 1.0:
+                        dims["ob"] = 60
+                    else:
+                        dims["ob"] = 25
+                else:
+                    if ob_ratio < 0.8:
+                        dims["ob"] = 85
+                    elif ob_ratio < 1.0:
+                        dims["ob"] = 60
+                    else:
+                        dims["ob"] = 25
+            else:
+                dims["ob"] = 40
+
+            # --- Weighted total score 0-100 ---
+            weights = {"oi": 0.20, "cvd": 0.25, "taker": 0.15, "pos": 0.15, "fr": 0.10, "ob": 0.15}
+            total = sum(dims.get(k, 40) * w for k, w in weights.items())
+
+            # Penalties
+            if abs(p4h) > 5:
+                total *= 0.7  # already moved penalty
+            elif abs(p4h) > 3:
+                total *= 0.85
+
+            total = max(0, min(100, round(total)))
+
+            # Classification
+            if total >= 70 and is_pump and spot_dir == 1:
+                if c["timing"] == "EARLY":
+                    classification = "EARLY ACCUMULATION"
+                elif fr < -0.05:
+                    classification = "SQUEEZE SETUP"
+                elif dims.get("ob", 0) >= 70:
+                    classification = "PASSIVE ABSORPTION"
+                else:
+                    classification = "ACCUMULATION"
+            elif total >= 70 and not is_pump and spot_dir == -1:
+                if c["timing"] == "EARLY":
+                    classification = "EARLY DISTRIBUTION"
+                else:
+                    classification = "DISTRIBUTION"
+            elif total >= 50 and is_pump:
+                classification = "ACCUMULATION"
+            elif total >= 50 and not is_pump:
+                classification = "DISTRIBUTION"
+            elif abs(p4h) > 5:
+                classification = "POST-MOVE"
+            else:
+                oi_mcap = c.get("_oi_mcap", 0)
+                if oi_mcap > 0.25:
+                    classification = "OI TRAP"
+                elif total < 30:
+                    classification = "FAKE STRENGTH" if is_pump else "NEUTRAL"
+                else:
+                    classification = "NEUTRAL"
+
+            return {
+                **c,
+                "deep_score": total,
+                "dims": dims,
+                "classification": classification,
+                "spot_cvd_summary": spot_summary,
+                "fut_cvd_summary": fut_summary,
+                "taker_summary": taker_summary,
+                "ob_summary": ob_summary,
+            }
+
+        # Apply deep scoring
+        pump_list = [_deep_score(c) for c in pump_list[:deep_n]]
+        dump_list = [_deep_score(c) for c in dump_list[:deep_n]]
+        pump_list.sort(key=lambda x: x["deep_score"], reverse=True)
+        dump_list.sort(key=lambda x: x["deep_score"], reverse=True)
+
+        # ── Format deep scan output ──
+        output = f"# SMART SCREENER v3 — Deep Scan\n"
+        output += f"**Scan time:** {scan_time} | **Sensitivity:** {sensitivity} | **Mode:** DEEP\n"
+        output += f"**Phase 1:** {len(coins)} coins → {filtered_count} filtered → {len(pump_list)+len(dump_list)} deep scanned\n"
+        output += f"**Phase 2:** CVD + Taker + Orderbook fetched ({len(candidates)*4} API calls)\n"
+        output += f"**Derivatives:** ✅ | **Whale:** {'✅' if whale_longs or whale_shorts else '⚠️ None'}\n\n"
+
+        # Large cap vs small/mid cap split
+        large_cap = [c for c in pump_list + dump_list if c["oi_usd"] >= 40_000_000]
+        small_mid = [c for c in pump_list + dump_list if 5_000_000 <= c["oi_usd"] < 100_000_000]
+
+        if large_cap:
+            output += "## 🔵 LARGE CAP — MARKET DIRECTION (OI ≥ $40M)\n\n"
+            output += "| # | Coin | Bias | Score | Classification | OI | FR | Key Signal |\n"
+            output += "|---|------|------|-------|----------------|----|----|------------|\n"
+            for i, c in enumerate(sorted(large_cap, key=lambda x: x["deep_score"], reverse=True), 1):
+                bias = "PUMP" if c["score"] > 0 else "DUMP"
+                sig0 = c["signals"][0][1] if c["signals"] else ""
+                output += (f"| {i} | **{c['symbol']}** | {bias} | {c['deep_score']}/100 | "
+                           f"{c['classification']} | ${c['oi_usd']/1e6:,.0f}M | "
+                           f"{c['fr_pct']:.4f}% | {sig0} |\n")
+            output += "\n"
+
+        if small_mid:
+            output += "## 🟡 SMALL/MID CAP — EARLY SETUPS ($5M–$100M)\n\n"
+            output += "| # | Coin | Type | Score | OI | Vol Δ4h | Key Signal |\n"
+            output += "|---|------|------|-------|----|---------|-----------|\n"
+            for i, c in enumerate(sorted(small_mid, key=lambda x: x["deep_score"], reverse=True), 1):
+                output += (f"| {i} | **{c['symbol']}** | {c['classification']} | {c['deep_score']}/100 | "
+                           f"${c['oi_usd']/1e6:,.0f}M | {c['oi_chg_4h']:+.1f}% | "
+                           f"{c['signals'][0][1] if c['signals'] else ''} |\n")
+            output += "\n"
+
+        # Detailed breakdown per coin
+        output += "## 📊 DEEP SCAN BREAKDOWN\n\n"
+        all_deep = pump_list + dump_list
+        all_deep.sort(key=lambda x: x["deep_score"], reverse=True)
+        for c in all_deep:
+            bias = "⬆️ PUMP" if c["score"] > 0 else "⬇️ DUMP"
+            output += f"### {c['symbol']} — {c['deep_score']}/100 [{c['classification']}] {bias}\n"
+            output += f"Price: ${c['price']:,.4f} | OI: ${c['oi_usd']/1e6:,.0f}M | FR: {c['fr_pct']:.4f}%\n\n"
+
+            # Dimension scores
+            d = c["dims"]
+            output += "```\n"
+            output += f" OI Trend   (20%): {d.get('oi', 0):>3}/100  |  CVD Align (25%): {d.get('cvd', 0):>3}/100\n"
+            output += f" Taker Flow (15%): {d.get('taker', 0):>3}/100  |  Positioning(15%): {d.get('pos', 0):>3}/100\n"
+            output += f" Funding    (10%): {d.get('fr', 0):>3}/100  |  Orderbook  (15%): {d.get('ob', 0):>3}/100\n"
+            output += "```\n\n"
+
+            output += f"- **Spot CVD:** {c['spot_cvd_summary']}\n"
+            output += f"- **Futures CVD:** {c['fut_cvd_summary']}\n"
+            output += f"- **Taker:** {c['taker_summary']}\n"
+            output += f"- **Orderbook:** {c['ob_summary']}\n"
+
+            # Signals
+            for timing, sig_text in c["signals"]:
+                output += f"- {sig_text}\n"
+            output += "\n"
+
+        # Distribution / Trap / Watchlist
+        distro = [c for c in all_deep if "DISTRIBUTION" in c["classification"]]
+        traps = [c for c in all_deep if c["classification"] in ("OI TRAP", "FAKE STRENGTH", "POST-MOVE")]
+
+        if distro:
+            output += "## 🔴 DISTRIBUTION / SHORT BIAS\n\n"
+            output += "| Coin | Score | Classification | Reason |\n"
+            output += "|------|-------|----------------|--------|\n"
+            for c in distro:
+                output += f"| {c['symbol']} | {c['deep_score']}/100 | {c['classification']} | {c['signals'][0][1] if c['signals'] else ''} |\n"
+            output += "\n"
+
+        if traps:
+            output += "## ⚠️ TRAP / NOISE\n\n"
+            output += "| Coin | Flag | Reason |\n"
+            output += "|------|------|--------|\n"
+            for c in traps:
+                output += f"| {c['symbol']} | {c['classification']} | {c['signals'][0][1] if c['signals'] else ''} |\n"
+            output += "\n"
+
+        # Sniper watchlist
+        watch = [c for c in all_deep if c["deep_score"] >= 55 and abs(c["price_chg_4h"]) <= 3]
+        if watch:
+            output += "## 👀 SNIPER WATCHLIST\n\n"
+            output += "| Coin | Score | Trigger Condition |\n"
+            output += "|------|-------|-------------------|\n"
+            for c in watch:
+                if c["score"] > 0:
+                    trigger = f"Confirm Spot CVD rising + OB bid dominant → long"
+                else:
+                    trigger = f"Confirm Spot CVD falling + OB ask dominant → short"
+                output += f"| **{c['symbol']}** | {c['deep_score']}/100 | {trigger} |\n"
+            output += "\n"
+
+        # Final summary
+        best_pump = pump_list[0] if pump_list else None
+        best_dump = dump_list[0] if dump_list else None
+        most_trap = max(traps, key=lambda x: x.get("_oi_mcap", 0)) if traps else None
+
+        output += "## 🧾 FINAL SUMMARY\n\n"
+        output += "| Category | Pick |\n"
+        output += "|----------|------|\n"
+        if best_pump:
+            output += f"| Best Clean Setup | **{best_pump['symbol']}** — {best_pump['deep_score']}/100 [{best_pump['classification']}] |\n"
+        if best_dump:
+            output += f"| Strongest Distribution | **{best_dump['symbol']}** — {best_dump['deep_score']}/100 [{best_dump['classification']}] |\n"
+        squeeze = [c for c in all_deep if c["classification"] == "SQUEEZE SETUP"]
+        if squeeze:
+            output += f"| Best Squeeze Setup | **{squeeze[0]['symbol']}** — {squeeze[0]['deep_score']}/100 |\n"
+        if most_trap:
+            output += f"| Most Dangerous Trap | **{most_trap['symbol']}** — {most_trap['classification']} |\n"
+
+        # Market phase
+        pump_count = len([c for c in scored if c["score"] > 0])
+        dump_count = len([c for c in scored if c["score"] < 0])
+        if dump_count > pump_count * 2:
+            phase = "DISTRIBUTION — majority dump signals"
+        elif pump_count > dump_count * 2:
+            phase = "ACCUMULATION — majority pump signals"
+        else:
+            phase = "MIXED — no clear macro bias"
+        output += f"| Market Phase | {phase} |\n"
+        output += "\n"
+
+        return output
+
+    # ═══════════════════════════════════════════════════════════════
+    # FAST MODE (v2) — No deep scan
+    # ═══════════════════════════════════════════════════════════════
     output = f"# SMART SCREENER v2 — Early Detection\n"
     output += f"**Scan time:** {scan_time} | **Sensitivity:** {sensitivity}\n"
     output += f"**Coins scanned:** {len(coins)} | **Filtered (OI>${min_oi_usd/1e6:.0f}M):** {filtered_count}\n"
@@ -3190,7 +3608,7 @@ async def coinglass_smart_screener(
         "1. Prioritaskan coin berlabel **[EARLY]** — sinyal paling fresh\n"
         "2. Coin dengan ⛔ ALREADY MOVED sudah jalan — hati-hati chase\n"
         "3. Jalankan `coinglass_full_scan` pada coin pilihan untuk konfirmasi detail\n"
-        "4. Confirm: Phase 1 (CVD+OI) → Phase 2 (Whale+OB) → Phase 3 (Binance)\n"
+        "4. Atau jalankan `coinglass_smart_screener` dengan `deep_scan=true` untuk analisis 6 dimensi\n"
     )
 
     return output
