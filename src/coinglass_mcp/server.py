@@ -3237,7 +3237,7 @@ async def coinglass_smart_screener(
             fut_summary = "N/A"
 
             if spot_rows and len(spot_rows) >= 3:
-                vals = [float(r.get("cvd", 0) or 0) for r in spot_rows]
+                vals = [float(_get(r, "cvd", "cum_vol_delta", "cumVolDelta", default=0) or 0) for r in spot_rows]
                 if vals[-1] > vals[0]:
                     spot_dir = 1
                     spot_summary = f"+{_fmt_num(vals[-1] - vals[0])}"
@@ -3248,7 +3248,7 @@ async def coinglass_smart_screener(
                 spot_summary += f" ({pos_deltas}/{len(vals)-1} up)"
 
             if fut_rows and len(fut_rows) >= 3:
-                vals = [float(r.get("cvd", 0) or 0) for r in fut_rows]
+                vals = [float(_get(r, "cvd", "cum_vol_delta", "cumVolDelta", default=0) or 0) for r in fut_rows]
                 if vals[-1] > vals[0]:
                     fut_dir = 1
                     fut_summary = f"+{_fmt_num(vals[-1] - vals[0])}"
