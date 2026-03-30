@@ -1128,26 +1128,55 @@ def _fmt_fear_greed(data: list) -> str:
 
 
 def _fmt_coins_markets(data: list) -> str:
-    """Format coins-markets overview (futures market data)."""
+    """Format coins-markets overview (futures or spot market data).
+
+    Handles both futures fields (open_interest_usd, avg_funding_rate_by_oi)
+    and spot fields (volume_usd_24h, volume_flow_usd_24h).
+    """
     if not data:
         return "**Empty dataset**\n\n"
-    out = "```\n"
-    out += (f" {'Symbol':<8} | {'Price':>12} | {'24h %':>8} | {'OI':>10}"
-            f" | {'Vol 24h':>10} | {'FR':>9}\n")
-    out += (f" {'─' * 8} | {'─' * 12} | {'─' * 8} | {'─' * 10}"
-            f" | {'─' * 10} | {'─' * 9}\n")
-    for row in data:
-        sym = _get(row, "symbol", default="?")
-        price = float(_get(row, "price", "lastPrice", default=0))
-        pct = float(_get(row, "priceChangePercent", "priceChange24h",
-                         "price_change_percent", default=0))
-        oi = float(_get(row, "openInterest", "oi", "open_interest", default=0))
-        vol = float(_get(row, "vol24h", "volume24h", "quoteVolume",
-                         "turnover24h", default=0))
-        fr = float(_get(row, "fundingRate", "funding_rate", "fr", default=0))
-        out += (f" {sym:<8} | {_fmt_num(price):>12} | {pct:>+7.2f}% | {_fmt_num(oi):>10}"
-                f" | {_fmt_num(vol):>10} | {fr * 100:>+8.4f}%\n")
-    out += "```\n\n"
+
+    # Detect if this is futures data (has OI fields) or spot data
+    sample = data[0] if isinstance(data[0], dict) else {}
+    is_futures = "open_interest_usd" in sample
+
+    if is_futures:
+        out = "```\n"
+        out += (f" {'Symbol':<8} | {'Price':>12} | {'24h %':>8} | {'OI':>12}"
+                f" | {'OI Δ24h':>8} | {'FR':>9} | {'L/S 24h':>8} | {'Liq 24h':>10}\n")
+        out += (f" {'─' * 8} | {'─' * 12} | {'─' * 8} | {'─' * 12}"
+                f" | {'─' * 8} | {'─' * 9} | {'─' * 8} | {'─' * 10}\n")
+        for row in data:
+            sym = _get(row, "symbol", default="?")
+            price = float(_get(row, "current_price", "price", "lastPrice", default=0))
+            pct = float(_get(row, "price_change_percent_24h", "priceChangePercent", default=0))
+            oi = float(_get(row, "open_interest_usd", "openInterest", default=0))
+            oi_chg = float(_get(row, "open_interest_change_percent_24h", default=0))
+            fr = float(_get(row, "avg_funding_rate_by_oi", "fundingRate", default=0))
+            ls = float(_get(row, "long_short_ratio_24h", default=0))
+            liq = float(_get(row, "liquidation_usd_24h", default=0))
+            out += (f" {sym:<8} | {_fmt_num(price):>12} | {pct:>+7.2f}% | {_fmt_num(oi):>12}"
+                    f" | {oi_chg:>+7.2f}% | {fr * 100:>+8.4f}% | {ls:>8.4f} | {_fmt_num(liq):>10}\n")
+        out += "```\n\n"
+    else:
+        # Spot market data
+        out = "```\n"
+        out += (f" {'Symbol':<8} | {'Price':>12} | {'24h %':>8} | {'Vol 24h':>12}"
+                f" | {'Buy Vol':>12} | {'Sell Vol':>12} | {'Net Flow':>12}\n")
+        out += (f" {'─' * 8} | {'─' * 12} | {'─' * 8} | {'─' * 12}"
+                f" | {'─' * 12} | {'─' * 12} | {'─' * 12}\n")
+        for row in data:
+            sym = _get(row, "symbol", default="?")
+            price = float(_get(row, "current_price", "price", default=0))
+            pct = float(_get(row, "price_change_percent_24h", default=0))
+            vol = float(_get(row, "volume_usd_24h", "vol24h", default=0))
+            buy_vol = float(_get(row, "buy_volume_usd_24h", default=0))
+            sell_vol = float(_get(row, "sell_volume_usd_24h", default=0))
+            flow = float(_get(row, "volume_flow_usd_24h", default=0))
+            out += (f" {sym:<8} | {_fmt_num(price):>12} | {pct:>+7.2f}% | {_fmt_num(vol):>12}"
+                    f" | {_fmt_num(buy_vol):>12} | {_fmt_num(sell_vol):>12} | {_fmt_num(flow):>12}\n")
+        out += "```\n\n"
+
     return out
 
 
