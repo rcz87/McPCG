@@ -525,13 +525,13 @@ def _fmt_scan_fr(data: list) -> str:
             nf_str = _ts_wib(nf) if nf else "N/A"
             if fr is not None:
                 fr_values.append(float(fr))
-            fr_pct = float(fr) * 100 if fr else 0
+            fr_pct = float(fr) if fr else 0  # CoinGlass already returns %
             out += f"{ex:<12} | {fr_pct:>+10.4f}% | {interval:>7}h | {nf_str:>14}\n"
 
         out += "```\n\n"
 
         if fr_values:
-            avg_fr = sum(fr_values) / len(fr_values) * 100
+            avg_fr = sum(fr_values) / len(fr_values)
             out += f"**Summary:** Avg FR: {avg_fr:+.4f}% across {len(fr_values)} exchanges\n\n"
         return out
     else:
@@ -1065,7 +1065,7 @@ def _fmt_funding_rate_all(data: list) -> str:
         interval = row.get("interval_h", 8)
         nf = row.get("next_funding")
         nf_str = _ts_wib(nf) if nf else "N/A"
-        fr_pct = float(fr) * 100 if fr else 0
+        fr_pct = float(fr) if fr else 0  # CoinGlass already returns %
         out += f" {sym:<8} | {ex:<12} | {fr_pct:>+9.4f}% | {interval:>7}h | {nf_str:>6}\n"
     out += "```\n\n"
     return out
@@ -1084,7 +1084,7 @@ def _fmt_fr_arbitrage(data: list) -> str:
         apr = float(_get(row, "apr", "annualRate", default=0))
         income = float(_get(row, "income", "estimatedIncome", "est_income", default=0))
         ex = _get(row, "exchangeName", "exchange", default="?")
-        out += f" {sym:<10} | {fr * 100:>+9.4f}% | {apr:>+7.2f}% | {_fmt_num(income):>12} | {ex:>10}\n"
+        out += f" {sym:<10} | {fr:>+9.4f}% | {apr:>+7.2f}% | {_fmt_num(income):>12} | {ex:>10}\n"
     out += "```\n\n"
     return out
 
@@ -1156,7 +1156,7 @@ def _fmt_coins_markets(data: list) -> str:
             ls = float(_get(row, "long_short_ratio_24h", default=0))
             liq = float(_get(row, "liquidation_usd_24h", default=0))
             out += (f" {sym:<8} | {_fmt_num(price):>12} | {pct:>+7.2f}% | {_fmt_num(oi):>12}"
-                    f" | {oi_chg:>+7.2f}% | {fr * 100:>+8.4f}% | {ls:>8.4f} | {_fmt_num(liq):>10}\n")
+                    f" | {oi_chg:>+7.2f}% | {fr:>+8.4f}% | {ls:>8.4f} | {_fmt_num(liq):>10}\n")
         out += "```\n\n"
     else:
         # Spot market data
@@ -2927,8 +2927,8 @@ async def coinglass_smart_screener(
 
         vol_1h = coin.get("volume_change_percent_1h") or 0
 
-        fr_raw = coin.get("avg_funding_rate_by_oi") or 0  # decimal, e.g. -0.001013
-        fr_pct = fr_raw * 100  # percentage, e.g. -0.1013%
+        fr_raw = coin.get("avg_funding_rate_by_oi") or 0  # CoinGlass already returns %, e.g. -0.028
+        fr_pct = fr_raw  # already percentage, e.g. -0.028%
 
         ls_5m = coin.get("long_short_ratio_5m") or 1.0
         ls_1h = coin.get("long_short_ratio_1h") or 1.0
