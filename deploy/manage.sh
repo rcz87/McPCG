@@ -70,21 +70,38 @@ async def check():
 asyncio.run(check())
 "
         ;;
+    webhook-start)
+        echo "Starting webhook auto-deploy listener..."
+        pm2 start ecosystem.config.js --only webhook
+        pm2 save
+        echo "✓ Webhook started on port ${WEBHOOK_PORT:-9000}"
+        echo ""
+        echo "Next: Add webhook in GitHub repo → Settings → Webhooks:"
+        echo "  URL: http://YOUR_VPS_IP:${WEBHOOK_PORT:-9000}/webhook"
+        echo "  Content type: application/json"
+        echo "  Secret: (same as WEBHOOK_SECRET in .env)"
+        echo "  Events: Just the push event"
+        ;;
+    webhook-logs)
+        pm2 logs webhook --lines "${2:-50}"
+        ;;
     help|*)
         echo "CoinGlass MCP Server — Management"
         echo ""
         echo "Usage: bash deploy/manage.sh [command]"
         echo ""
         echo "Commands:"
-        echo "  start    — Start the server via PM2"
-        echo "  stop     — Stop the server"
-        echo "  restart  — Restart the server"
-        echo "  status   — Show PM2 process status"
-        echo "  logs     — View server logs (optional: number of lines)"
-        echo "  update   — Pull latest code, install deps, restart"
-        echo "  test     — Run test suite"
-        echo "  health   — Check if MCP server is responding"
-        echo "  tools    — List all registered MCP tools"
-        echo "  help     — Show this help message"
+        echo "  start          — Start the server via PM2"
+        echo "  stop           — Stop the server"
+        echo "  restart        — Restart the server"
+        echo "  status         — Show PM2 process status"
+        echo "  logs           — View server logs (optional: number of lines)"
+        echo "  update         — Pull latest code, install deps, restart"
+        echo "  test           — Run test suite"
+        echo "  health         — Check if MCP server is responding"
+        echo "  tools          — List all registered MCP tools"
+        echo "  webhook-start  — Start GitHub webhook auto-deploy listener"
+        echo "  webhook-logs   — View webhook logs"
+        echo "  help           — Show this help message"
         ;;
 esac

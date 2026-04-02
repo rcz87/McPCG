@@ -104,26 +104,47 @@ pm2 delete coinglass-mcp 2>/dev/null || true
 # Create PM2 ecosystem config
 cat > ecosystem.config.js << 'PMEOF'
 module.exports = {
-  apps: [{
-    name: "coinglass-mcp",
-    script: ".venv/bin/python",
-    args: "-m coinglass_mcp.server",
-    cwd: process.env.HOME + "/coinglass-mcp",
-    env: {
-      MCP_TRANSPORT: "streamable-http",
-      MCP_HOST: "0.0.0.0",
-      MCP_PORT: "8787"
+  apps: [
+    {
+      name: "coinglass-mcp",
+      script: ".venv/bin/python",
+      args: "-m coinglass_mcp.server",
+      cwd: process.env.HOME + "/coinglass-mcp",
+      env: {
+        MCP_TRANSPORT: "streamable-http",
+        MCP_HOST: "0.0.0.0",
+        MCP_PORT: "8787"
+      },
+      max_memory_restart: "200M",
+      autorestart: true,
+      watch: false,
+      max_restarts: 10,
+      restart_delay: 5000,
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "logs/error.log",
+      out_file: "logs/output.log",
+      merge_logs: true
     },
-    max_memory_restart: "200M",
-    autorestart: true,
-    watch: false,
-    max_restarts: 10,
-    restart_delay: 5000,
-    log_date_format: "YYYY-MM-DD HH:mm:ss",
-    error_file: "logs/error.log",
-    out_file: "logs/output.log",
-    merge_logs: true
-  }]
+    {
+      name: "webhook",
+      script: "deploy/webhook.py",
+      interpreter: ".venv/bin/python",
+      cwd: process.env.HOME + "/coinglass-mcp",
+      env: {
+        WEBHOOK_PORT: "9000",
+        WEBHOOK_SECRET: "",
+        DEPLOY_BRANCH: "claude/divisional-map-cloud-sync-ZYH5I"
+      },
+      max_memory_restart: "50M",
+      autorestart: true,
+      max_restarts: 5,
+      restart_delay: 3000,
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "logs/webhook-error.log",
+      out_file: "logs/webhook.log",
+      merge_logs: true
+    }
+  ]
 };
 PMEOF
 
