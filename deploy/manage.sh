@@ -70,20 +70,22 @@ async def check():
 asyncio.run(check())
 "
         ;;
-    webhook-start)
-        echo "Starting webhook auto-deploy listener..."
-        pm2 start ecosystem.config.js --only webhook
-        pm2 save
-        echo "✓ Webhook started on port ${WEBHOOK_PORT:-9000}"
-        echo ""
-        echo "Next: Add webhook in GitHub repo → Settings → Webhooks:"
-        echo "  URL: http://YOUR_VPS_IP:${WEBHOOK_PORT:-9000}/webhook"
-        echo "  Content type: application/json"
-        echo "  Secret: (same as WEBHOOK_SECRET in .env)"
-        echo "  Events: Just the push event"
+    autodeploy)
+        echo "Setting up auto-deploy cron (every 2 minutes)..."
+        CRON_CMD="*/2 * * * * bash $APP_DIR/deploy/autodeploy.sh >> $APP_DIR/logs/autodeploy.log 2>&1"
+        # Remove existing autodeploy cron if any, then add new one
+        (crontab -l 2>/dev/null | grep -v "autodeploy.sh"; echo "$CRON_CMD") | crontab -
+        echo "✓ Cron installed! Checking GitHub every 2 minutes."
+        echo "  Log: tail -f $APP_DIR/logs/autodeploy.log"
+        echo "  Remove: bash deploy/manage.sh autodeploy-off"
         ;;
-    webhook-logs)
-        pm2 logs webhook --lines "${2:-50}"
+    autodeploy-off)
+        echo "Removing auto-deploy cron..."
+        crontab -l 2>/dev/null | grep -v "autodeploy.sh" | crontab -
+        echo "✓ Auto-deploy cron removed"
+        ;;
+    autodeploy-logs)
+        tail -f "$APP_DIR/logs/autodeploy.log" 2>/dev/null || echo "No autodeploy logs yet"
         ;;
     help|*)
         echo "CoinGlass MCP Server — Management"
@@ -100,8 +102,9 @@ asyncio.run(check())
         echo "  test           — Run test suite"
         echo "  health         — Check if MCP server is responding"
         echo "  tools          — List all registered MCP tools"
-        echo "  webhook-start  — Start GitHub webhook auto-deploy listener"
-        echo "  webhook-logs   — View webhook logs"
+        echo "  autodeploy     — Setup cron auto-deploy (check GitHub every 2 min)"
+        echo "  autodeploy-off — Remove auto-deploy cron"
+        echo "  autodeploy-logs— View auto-deploy logs"
         echo "  help           — Show this help message"
         ;;
 esac
