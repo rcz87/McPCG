@@ -88,8 +88,9 @@ class FetchResult:
 class RateLimiter:
     """Async rate limiter — prevents 429 errors from CoinGlass API.
 
-    - Enforces 200ms minimum spacing between requests
+    - Enforces minimum spacing between requests (adaptive under load)
     - Tracks requests per minute against plan limit
+    - Cooldown mode: when API returns 429, pauses ALL requests for 30s
     - Warns at 80% capacity
     - Serializes concurrent requests (safe for asyncio.gather)
     """
@@ -99,11 +100,24 @@ class RateLimiter:
         self._min_spacing = min_spacing
         self._max_per_minute = max_per_minute
         self._request_times: list[float] = []
+        self._cooldown_until: float = 0.0  # Unix timestamp — pause all requests until this time
+        self._consecutive_429s: int = 0  # Escalating cooldown on repeated 429s
 
     async def acquire(self) -> dict[str, Any]:
         """Acquire permission to make a request. Blocks if rate limited."""
         async with self._gate:
             now = time.time()
+
+            # ── Cooldown check: if API returned 429, pause ALL requests ──
+            if now < self._cooldown_until:
+                wait = self._cooldown_until - now
+                logger.warning(
+                    "Rate limit cooldown active, waiting %.1fs before next request",
+                    wait,
+                )
+                await asyncio.sleep(wait)
+                now = time.time()
+
             # Clean timestamps older than 60s
             self._request_times = [t for t in self._request_times if now - t < 60]
 
@@ -124,11 +138,21 @@ class RateLimiter:
                         t for t in self._request_times if now - t < 60
                     ]
 
-            # Enforce minimum spacing between requests
+            # ── Adaptive spacing: slow down when >60% capacity used ──
+            used_count = len(self._request_times)
+            usage_pct = used_count / self._max_per_minute if self._max_per_minute else 0
+            if usage_pct > 0.6:
+                # Scale spacing: 60%→1.5x, 80%→2.5x, 90%→4x
+                scale = 1.0 + (usage_pct - 0.6) * 10  # 0.6→1x, 0.8→3x, 1.0→5x
+                effective_spacing = self._min_spacing * scale
+            else:
+                effective_spacing = self._min_spacing
+
+            # Enforce spacing between requests
             if self._request_times:
                 elapsed = now - self._request_times[-1]
-                if elapsed < self._min_spacing:
-                    await asyncio.sleep(self._min_spacing - elapsed)
+                if elapsed < effective_spacing:
+                    await asyncio.sleep(effective_spacing - elapsed)
 
             self._request_times.append(time.time())
 
@@ -146,15 +170,38 @@ class RateLimiter:
                 "pct": pct,
             }
 
+    def notify_429(self) -> None:
+        """Called when API returns 429 — activates cooldown for all requests.
+
+        Escalating cooldown: 15s → 30s → 60s on consecutive 429s.
+        Resets after a successful request.
+        """
+        self._consecutive_429s += 1
+        cooldown_secs = min(15 * self._consecutive_429s, 60)
+        self._cooldown_until = time.time() + cooldown_secs
+        logger.warning(
+            "429 received (consecutive=%d) — cooldown %ds, no requests until %.0f",
+            self._consecutive_429s,
+            cooldown_secs,
+            self._cooldown_until,
+        )
+
+    def notify_success(self) -> None:
+        """Called on successful API response — resets consecutive 429 counter."""
+        if self._consecutive_429s > 0:
+            self._consecutive_429s = 0
+
     @property
     def usage(self) -> dict[str, Any]:
         """Current rate limit usage (non-blocking check)."""
         now = time.time()
         used = sum(1 for t in self._request_times if now - t < 60)
+        cooldown_remaining = max(0, self._cooldown_until - now)
         return {
             "used": used,
             "limit": self._max_per_minute,
             "remaining": self._max_per_minute - used,
+            "cooldown": round(cooldown_remaining, 1),
         }
 
 
@@ -235,9 +282,9 @@ class CoinGlassClient:
 
     @retry(
         stop=stop_after_attempt(2) | stop_after_delay(20),
-        wait=wait_exponential(multiplier=1, min=1, max=5),
+        wait=wait_exponential(multiplier=1, min=2, max=8),
         retry=retry_if_exception_type(
-            (httpx.TimeoutException, httpx.ConnectError, RateLimitError)
+            (httpx.TimeoutException, httpx.ConnectError)
         ),
         reraise=True,
     )
@@ -248,6 +295,9 @@ class CoinGlassClient:
 
         Returns FetchResult with data + age metadata.
         Every response carries its age so stale data is never invisible.
+
+        429 errors are NOT retried — the cooldown mechanism in RateLimiter
+        handles backoff. Retries only happen for timeouts and connection errors.
         """
         if not self._http:
             raise RuntimeError("Client not started. Call start() first.")
@@ -275,7 +325,7 @@ class CoinGlassClient:
                 fetched_at=cache_row["fetched_at"],
             )
 
-        # Rate limit — wait if needed
+        # Rate limit — wait if needed (includes cooldown after 429)
         if self._rate_limiter:
             await self._rate_limiter.acquire()
 
@@ -284,10 +334,27 @@ class CoinGlassClient:
         fetch_time = time.time()
 
         if response.status_code == 429:
+            # Activate cooldown — pauses ALL queued requests
+            if self._rate_limiter:
+                self._rate_limiter.notify_429()
+                usage = self._rate_limiter.usage
+                logger.error(
+                    "429 on %s — local counter: %d/%d req/min, cooldown %.0fs",
+                    endpoint,
+                    usage["used"],
+                    usage["limit"],
+                    usage["cooldown"],
+                )
             raise RateLimitError(
-                f"Rate limit exceeded. Your {self.config.plan} plan allows "
-                f"{self.config.rate_limit} req/min. Wait and retry."
+                f"Rate limit exceeded on {endpoint}. "
+                f"Plan '{self.config.plan}' allows {self.config.rate_limit} req/min. "
+                f"Cooldown activated — queued requests will wait automatically."
             )
+
+        # Successful response — reset 429 counter
+        if self._rate_limiter:
+            self._rate_limiter.notify_success()
+
         if response.status_code == 403:
             raise PlanLimitError(
                 f"This endpoint requires a higher plan than '{self.config.plan}'. "
