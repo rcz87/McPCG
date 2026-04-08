@@ -36,6 +36,7 @@ from .config import (
     STALE_EXPIRED_THRESHOLD,
     STALE_WARNING_THRESHOLD,
     Config,
+    make_envelope,
     normalize_symbol,
     to_cg_symbol,
     to_pair,
@@ -117,7 +118,7 @@ async def coinglass_chart(
         width=width, height=height, theme=theme,
     )
     if "error" in result:
-        return f"## Chart Error — {symbol}\n\nError: {result['error']}"
+        return _err(f"## Chart Error — {symbol}\n\nError: {result['error']}")
 
     # Download image so Claude can see it directly
     import httpx
@@ -147,6 +148,11 @@ async def coinglass_chart(
 
 
 # ─── Formatting Helpers ──────────────────────────────────────────────────────
+
+
+def _err(msg: str, source: str = "coinglass", fallback: str = "") -> str:
+    """Wrap an error message in standard envelope."""
+    return make_envelope("failed", source, msg, fallback_suggestion=fallback)
 
 
 def _age_banner(result: FetchResult) -> str:
@@ -249,30 +255,43 @@ def _auto_table(data: list) -> str:
     return table
 
 
-def fmt(result: FetchResult, title: str = "") -> str:
-    """Format API response with age banner — smart auto-table for dicts/lists."""
+def fmt(result: FetchResult, title: str = "", source: str = "coinglass",
+        extra_warnings: list[str] | None = None) -> str:
+    """Format API response with envelope — smart auto-table for dicts/lists."""
     data = result.data
+    warnings = list(extra_warnings or [])
     header = ""
     if title:
         header = f"## {title}\n\n"
-    header += _age_banner(result)
+
+    # Staleness warnings
+    if result.is_expired:
+        warnings.append(f"DATA EXPIRED ({result.age_seconds:.0f}s old) — DO NOT USE FOR ENTRY")
+    elif result.is_stale:
+        warnings.append(f"DATA STALE ({result.age_seconds:.0f}s old)")
 
     if data is None:
-        return f"{header}**ERROR: No data returned.** The symbol may not exist."
+        return make_envelope("failed", source,
+                             f"{header}**ERROR: No data returned.** The symbol may not exist.",
+                             data_age_seconds=result.age_seconds, warnings=warnings,
+                             fallback_suggestion="Try data_binance or coinglass_price_ohlc")
 
     if isinstance(data, list):
         if len(data) == 0:
-            return f"{header}**WARNING: Empty dataset.** No data points returned."
+            return make_envelope("failed", source,
+                                 f"{header}**WARNING: Empty dataset.** No data points returned.",
+                                 data_age_seconds=result.age_seconds, warnings=warnings)
         # String list (supported coins/exchanges)
         if isinstance(data[0], str):
-            return header + ", ".join(data)
+            content = header + ", ".join(data)
         # List of dicts → auto-table
-        if isinstance(data[0], dict):
-            return header + _auto_table(data)
-        # List of lists (kline arrays, heatmap) → compact JSON
-        show = data[-20:] if len(data) > 20 else data
-        prefix = f"*(showing last {len(show)} of {len(data)})*\n\n" if len(data) > 20 else ""
-        return header + prefix + json.dumps(show, indent=1, default=str)
+        elif isinstance(data[0], dict):
+            content = header + _auto_table(data)
+        else:
+            # List of lists (kline arrays, heatmap) → compact JSON
+            show = data[-20:] if len(data) > 20 else data
+            prefix = f"*(showing last {len(show)} of {len(data)})*\n\n" if len(data) > 20 else ""
+            content = header + prefix + json.dumps(show, indent=1, default=str)
     elif isinstance(data, dict):
         # Single dict → key-value format
         lines = []
@@ -281,27 +300,51 @@ def fmt(result: FetchResult, title: str = "") -> str:
                 continue
             lines.append(f"- **{k}:** {_fmt_cell(v)}")
         if lines:
-            return header + "\n".join(lines) + "\n"
-        return header + json.dumps(data, indent=2, default=str)
+            content = header + "\n".join(lines) + "\n"
+        else:
+            content = header + json.dumps(data, indent=2, default=str)
     else:
-        return header + str(data)
+        content = header + str(data)
+
+    status = "failed" if result.is_expired else "success"
+    return make_envelope(status, source, content,
+                         data_age_seconds=result.age_seconds, warnings=warnings)
 
 
-def fmt_parsed(result: FetchResult, title: str, formatter) -> str:
+def fmt_parsed(result: FetchResult, title: str, formatter,
+               source: str = "coinglass",
+               extra_warnings: list[str] | None = None) -> str:
     """Format API response using a parsed formatter instead of raw JSON.
     formatter(data) should return a formatted string."""
+    warnings = list(extra_warnings or [])
     header = ""
     if title:
         header = f"## {title}\n\n"
-    header += _age_banner(result)
+
+    # Staleness warnings
+    if result.is_expired:
+        warnings.append(f"DATA EXPIRED ({result.age_seconds:.0f}s old) — DO NOT USE FOR ENTRY")
+    elif result.is_stale:
+        warnings.append(f"DATA STALE ({result.age_seconds:.0f}s old)")
+
     data = result.data
     if data is None:
-        return f"{header}**ERROR: No data returned.** The symbol may not exist."
+        return make_envelope("failed", source,
+                             f"{header}**ERROR: No data returned.** The symbol may not exist.",
+                             data_age_seconds=result.age_seconds, warnings=warnings,
+                             fallback_suggestion="Try data_binance or coinglass_price_ohlc")
     if isinstance(data, list) and len(data) == 0:
-        return f"{header}**WARNING: Empty dataset.** No data points returned."
+        return make_envelope("failed", source,
+                             f"{header}**WARNING: Empty dataset.** No data points returned.",
+                             data_age_seconds=result.age_seconds, warnings=warnings)
     if isinstance(data, (list, dict)) and data:
-        return header + formatter(data)
-    return header + str(data)
+        content = header + formatter(data)
+    else:
+        content = header + str(data)
+
+    status = "failed" if result.is_expired else "success"
+    return make_envelope(status, source, content,
+                         data_age_seconds=result.age_seconds, warnings=warnings)
 
 
 def _format_fr_compact(coins: list, symbol: str) -> list:
@@ -1037,22 +1080,39 @@ _SCAN_FORMATTERS = {
 }
 
 
-def _fmt_fr_exchange_list(result: FetchResult, label: str) -> str:
+def _fmt_fr_exchange_list(result: FetchResult, label: str,
+                          extra_warnings: list[str] | None = None) -> str:
     """Format FR exchange-list with compact per-exchange breakdown."""
+    warnings = list(extra_warnings or [])
     header = f"## Funding Rate — {label}\n\n"
-    header += _age_banner(result)
+
+    if result.is_expired:
+        warnings.append(f"DATA EXPIRED ({result.age_seconds:.0f}s old) — DO NOT USE FOR ENTRY")
+    elif result.is_stale:
+        warnings.append(f"DATA STALE ({result.age_seconds:.0f}s old)")
+
     data = result.data
     if not data:
-        return f"{header}**No funding rate data found.**"
+        return make_envelope("failed", "coinglass",
+                             f"{header}**No funding rate data found.**",
+                             data_age_seconds=result.age_seconds, warnings=warnings)
     # If already compacted (list of dicts with 'exchange' key)
     if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
         if "exchange" in data[0]:
-            return header + _fmt_scan_fr(data)
+            content = header + _fmt_scan_fr(data)
+            status = "failed" if result.is_expired else "success"
+            return make_envelope(status, "coinglass", content,
+                                 data_age_seconds=result.age_seconds, warnings=warnings)
     # Raw format — compact it
     compacted = _format_fr_compact(data, label)
     if not compacted:
-        return f"{header}**No active funding rate entries.**"
-    return header + _fmt_scan_fr(compacted)
+        return make_envelope("failed", "coinglass",
+                             f"{header}**No active funding rate entries.**",
+                             data_age_seconds=result.age_seconds, warnings=warnings)
+    content = header + _fmt_scan_fr(compacted)
+    status = "failed" if result.is_expired else "success"
+    return make_envelope(status, "coinglass", content,
+                         data_age_seconds=result.age_seconds, warnings=warnings)
 
 
 def _fmt_funding_rate_all(data: list) -> str:
@@ -1327,6 +1387,9 @@ async def coinglass_funding_rate(symbol: str = "") -> str:
 
     Returns data for all coins — only coins with active FR data shown.
     """
+    _sym_warn = []
+    if symbol:
+        _sym_warn.append("Symbol parameter is ignored — this endpoint returns global data for all coins.")
     result = await client.get("/api/futures/funding-rate/exchange-list")
     # Flatten to clean format: one row per coin+exchange with active FR
     if isinstance(result.data, list):
@@ -1356,7 +1419,8 @@ async def coinglass_funding_rate(symbol: str = "") -> str:
                 data=top50, age_seconds=result.age_seconds,
                 is_cached=result.is_cached, fetched_at=result.fetched_at,
             )
-    return fmt_parsed(result, f"Funding Rate — Top 50 Extreme FR (of {total} active)", _fmt_funding_rate_all)
+    return fmt_parsed(result, f"Funding Rate — Top 50 Extreme FR (of {total} active)",
+                      _fmt_funding_rate_all, extra_warnings=_sym_warn)
 
 
 @mcp.tool()
@@ -1413,10 +1477,7 @@ async def coinglass_liquidation_map(
         range: Time range (12h, 24h, 3d, 7d, 30d, 90d, 180d, 1y)
     """
     if not config.has_feature("liquidation_heatmap"):
-        return (
-            f"**ERROR:** Liquidation Heatmap requires Professional or Enterprise plan.\n"
-            f"Current plan: {config.plan}"
-        )
+        return _err(f"Liquidation Heatmap requires Professional or Enterprise plan. Current plan: {config.plan}")
     pair = to_pair(symbol)
     result = await client.get("/api/futures/liquidation/heatmap/model1", {
         "exchange": exchange,
@@ -1656,8 +1717,12 @@ async def coinglass_whale_alert(symbol: str = "") -> str:
     Args:
         symbol: Ignored — returns all whales. Accepted for compatibility.
     """
+    _sym_warn = []
+    if symbol:
+        _sym_warn.append("Symbol parameter is ignored — this endpoint returns all whale positions globally.")
     result = await client.get("/api/hyperliquid/whale-alert")
-    return fmt_parsed(result, "Whale Alerts — Hyperliquid", _fmt_whale_alert)
+    return fmt_parsed(result, "Whale Alerts — Hyperliquid", _fmt_whale_alert,
+                      extra_warnings=_sym_warn)
 
 
 @mcp.tool()
@@ -1674,8 +1739,12 @@ async def coinglass_fear_greed(symbol: str = "") -> str:
     Args:
         symbol: Ignored — index is market-wide. Accepted for compatibility.
     """
+    _sym_warn = []
+    if symbol:
+        _sym_warn.append("Symbol parameter is ignored — Fear & Greed Index is market-wide.")
     result = await client.get("/api/index/fear-greed-history")
-    return fmt_parsed(result, "Fear & Greed Index", _fmt_fear_greed)
+    return fmt_parsed(result, "Fear & Greed Index", _fmt_fear_greed,
+                      extra_warnings=_sym_warn)
 
 
 @mcp.tool()
@@ -1713,16 +1782,24 @@ async def coinglass_footprint(
     })
 
     header = f"## Footprint — {sym} ({interval}, {exchange})\n\n"
-    header += _age_banner(result)
+    _fp_warnings = []
+    if result.is_expired:
+        _fp_warnings.append(f"DATA EXPIRED ({result.age_seconds:.0f}s old) — DO NOT USE FOR ENTRY")
+    elif result.is_stale:
+        _fp_warnings.append(f"DATA STALE ({result.age_seconds:.0f}s old)")
 
     data = result.data
     if not isinstance(data, list) or len(data) == 0:
-        return header + "**No footprint data available.**"
+        return make_envelope("failed", "coinglass",
+                             header + "**No footprint data available.**",
+                             data_age_seconds=result.age_seconds, warnings=_fp_warnings)
 
     # Filter out null candles (still forming)
     valid = [c for c in data if c is not None and isinstance(c, list) and len(c) >= 2]
     if not valid:
-        return header + "**All candles still forming (null). Try larger limit.**"
+        return make_envelope("failed", "coinglass",
+                             header + "**All candles still forming (null). Try larger limit.**",
+                             data_age_seconds=result.age_seconds, warnings=_fp_warnings)
 
     output = header
     for candle in valid[-5:]:  # Show last 5 completed candles
@@ -1751,7 +1828,9 @@ async def coinglass_footprint(
                 output += f"- ${mid:,.2f}: buy ${l[6]:,.0f} vs sell ${l[7]:,.0f} → **{side}** ${abs(l[6]-l[7]):,.0f}\n"
         output += "\n"
 
-    return output
+    _fp_status = "failed" if result.is_expired else "success"
+    return make_envelope(_fp_status, "coinglass", output,
+                         data_age_seconds=result.age_seconds, warnings=_fp_warnings)
 
 
 @mcp.tool()
@@ -1871,7 +1950,7 @@ async def coinglass_trading_market(
 
     elif action == "pairs_markets":
         if not symbol:
-            return "**ERROR:** `symbol` is required for pairs_markets (e.g., BTC, ETH)"
+            return _err("`symbol` is required for pairs_markets (e.g., BTC, ETH)")
         sym = normalize_symbol(symbol)
         result = await client.get("/api/futures/pairs-markets", {"symbol": sym})
         return fmt(result, f"Futures — Pairs Markets ({sym})")
@@ -1882,7 +1961,7 @@ async def coinglass_trading_market(
 
     elif action == "price_history":
         if not symbol:
-            return "**ERROR:** `symbol` is required for price_history (e.g., BTC, ETH)"
+            return _err("`symbol` is required for price_history (e.g., BTC, ETH)")
         pair = to_pair(symbol)
         result = await client.get("/api/futures/price/history", {
             "exchange": exchange,
@@ -1901,11 +1980,7 @@ async def coinglass_trading_market(
         return fmt(result, "Futures — Exchange Ranking")
 
     else:
-        return (
-            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
-            "supported_coins, supported_exchanges, supported_pairs, coins_markets, "
-            "pairs_markets, price_change, price_history, delisted_pairs, exchange_rank"
-        )
+        return _err(f"Unknown action '{action}'. Available: supported_coins, supported_exchanges, supported_pairs, coins_markets, pairs_markets, price_change, price_history, delisted_pairs, exchange_rank")
 
 
 @mcp.tool()
@@ -1986,11 +2061,7 @@ async def coinglass_open_interest_cat(
         return fmt(result, f"OI Exchange Chart — {sym}")
 
     else:
-        return (
-            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
-            "history, aggregated_history, stablecoin_margin, coin_margin, "
-            "exchange_list, exchange_chart"
-        )
+        return _err(f"Unknown action '{action}'. Available: history, aggregated_history, stablecoin_margin, coin_margin, exchange_list, exchange_chart")
 
 
 @mcp.tool()
@@ -2043,13 +2114,10 @@ async def coinglass_funding_rate_cat(
             "interval": interval,
             "limit": limit,
         })
-        output = fmt(result, f"FR OI-Weighted — {pair} ({exchange})")
+        _w = []
         if isinstance(result.data, list) and len(result.data) == 0:
-            output += (
-                "\n\n**NOTE:** Empty result. This endpoint may require "
-                "Professional or Enterprise plan. Use `history` action instead."
-            )
-        return output
+            _w.append("Empty result — may require Professional/Enterprise plan. Use 'history' action instead.")
+        return fmt(result, f"FR OI-Weighted — {pair} ({exchange})", extra_warnings=_w)
 
     elif action == "vol_weight":
         pair = to_pair(symbol)
@@ -2059,13 +2127,10 @@ async def coinglass_funding_rate_cat(
             "interval": interval,
             "limit": limit,
         })
-        output = fmt(result, f"FR Vol-Weighted — {pair} ({exchange})")
+        _w = []
         if isinstance(result.data, list) and len(result.data) == 0:
-            output += (
-                "\n\n**NOTE:** Empty result. This endpoint may require "
-                "Professional or Enterprise plan. Use `history` action instead."
-            )
-        return output
+            _w.append("Empty result — may require Professional/Enterprise plan. Use 'history' action instead.")
+        return fmt(result, f"FR Vol-Weighted — {pair} ({exchange})", extra_warnings=_w)
 
     elif action == "exchange_list":
         result = await client.get("/api/futures/funding-rate/exchange-list")
@@ -2073,7 +2138,7 @@ async def coinglass_funding_rate_cat(
         if sym and isinstance(result.data, list):
             filtered = [c for c in result.data if c.get("symbol", "").upper() == sym]
             if not filtered:
-                return f"**ERROR:** No funding rate data found for {sym}."
+                return _err(f"No funding rate data found for {sym}.")
             result = FetchResult(
                 data=filtered, age_seconds=result.age_seconds,
                 is_cached=result.is_cached, fetched_at=result.fetched_at,
@@ -2103,10 +2168,7 @@ async def coinglass_funding_rate_cat(
         return fmt_parsed(result, f"FR Arbitrage — ${usd} position", _fmt_fr_arbitrage)
 
     else:
-        return (
-            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
-            "history, oi_weight, vol_weight, exchange_list, cumulative, arbitrage"
-        )
+        return _err(f"Unknown action '{action}'. Available: history, oi_weight, vol_weight, exchange_list, cumulative, arbitrage")
 
 
 @mcp.tool()
@@ -2193,11 +2255,7 @@ async def coinglass_long_short_cat(
         return fmt(result, f"Net L/S Position v2 — {sym} ({exchange})")
 
     else:
-        return (
-            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
-            "global_account, top_account, top_position, taker_exchange, "
-            "net_position, net_position_v2"
-        )
+        return _err(f"Unknown action '{action}'. Available: global_account, top_account, top_position, taker_exchange, net_position, net_position_v2")
 
 
 @mcp.tool()
@@ -2272,10 +2330,7 @@ async def coinglass_liquidation_cat(
         return fmt_parsed(result, f"Liq Orders — {sym} ({exchange}, min ${min_amount:,})", _fmt_scan_liq_orders)
 
     else:
-        return (
-            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
-            "pair_history, coin_history, coin_list, exchange_list, order"
-        )
+        return _err(f"Unknown action '{action}'. Available: pair_history, coin_history, coin_list, exchange_list, order")
 
 
 @mcp.tool()
@@ -2362,10 +2417,7 @@ async def coinglass_orderbook_cat(
         return fmt(result, f"Large Orders History — {pair} ({exchange}, {state_label})")
 
     else:
-        return (
-            f"**ERROR:** Unknown action '{action}'. Available actions:\n"
-            "pair_bidask, aggregated_bidask, heatmap, large_orders, large_orders_history"
-        )
+        return _err(f"Unknown action '{action}'. Available: pair_bidask, aggregated_bidask, heatmap, large_orders, large_orders_history")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2419,10 +2471,7 @@ Args:
         return fmt(result, f"Hyperliquid Positions — {sym} (page {current_page})")
 
     else:
-        return (
-            f"Unknown action '{action}'. Available: "
-            "long_short_ratio, wallet_distribution, positions"
-        )
+        return _err(f"Unknown action '{action}'. Available: long_short_ratio, wallet_distribution, positions")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2489,10 +2538,7 @@ Args:
         return fmt_parsed(result, f"Pair Taker Buy/Sell — {pair} ({exchange}, {interval})", _fmt_scan_taker)
 
     else:
-        return (
-            f"Unknown action '{action}'. Available: "
-            "cvd_pair, footprint, coin_taker, pair_taker"
-        )
+        return _err(f"Unknown action '{action}'. Available: cvd_pair, footprint, coin_taker, pair_taker")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2546,10 +2592,7 @@ Args:
         return fmt(result, f"Spot Pairs Markets — {sym}")
 
     else:
-        return (
-            f"Unknown action '{action}'. Available: "
-            "supported_coins, supported_pairs, coins_markets, pairs_markets"
-        )
+        return _err(f"Unknown action '{action}'. Available: supported_coins, supported_pairs, coins_markets, pairs_markets")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2633,10 +2676,7 @@ Args:
         return fmt(result, f"Spot Large Orders History — {pair} ({exchange}, {state_labels.get(state, state)})")
 
     else:
-        return (
-            f"Unknown action '{action}'. Available: "
-            "pair_bidask, aggregated_bidask, heatmap, large_orders, large_orders_history"
-        )
+        return _err(f"Unknown action '{action}'. Available: pair_bidask, aggregated_bidask, heatmap, large_orders, large_orders_history")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2756,11 +2796,7 @@ Args:
         return fmt_parsed(result, f"Whale Index — {pair} ({exchange}, {interval})", _fmt_indicator_ts)
 
     else:
-        return (
-            f"Unknown action '{action}'. Available: "
-            "rsi_list, ma_list, ema_list, macd_list, "
-            "pair_rsi, pair_ma, pair_ema, pair_macd, pair_atr, whale_index"
-        )
+        return _err(f"Unknown action '{action}'. Available: rsi_list, ma_list, ema_list, macd_list, pair_rsi, pair_ma, pair_ema, pair_macd, pair_atr, whale_index")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2819,10 +2855,7 @@ Args:
         return fmt_parsed(result, f"Crypto News ({language}, page {page})", _fmt_news)
 
     else:
-        return (
-            f"Unknown action '{action}'. Available: "
-            "altcoin_season, futures_spot_ratio, news"
-        )
+        return _err(f"Unknown action '{action}'. Available: altcoin_season, futures_spot_ratio, news")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2890,7 +2923,7 @@ async def coinglass_smart_screener(
     if isinstance(markets_result, FetchResult) and isinstance(markets_result.data, list):
         coins = markets_result.data
     else:
-        return f"**ERROR:** Failed to fetch coins-markets data. {markets_result}"
+        return _err(f"Failed to fetch coins-markets data. {markets_result}")
 
     # Parse whale data — track opens AND closes separately
     whale_longs = {}    # symbol -> total USD long open
@@ -3562,7 +3595,7 @@ async def coinglass_smart_screener(
         output += f"| Market Phase | {phase} |\n"
         output += "\n"
 
-        return output
+        return make_envelope("success", "coinglass", output)
 
     # ═══════════════════════════════════════════════════════════════
     # FAST MODE (v2) — No deep scan
@@ -3615,7 +3648,7 @@ async def coinglass_smart_screener(
         "4. Atau jalankan `coinglass_smart_screener` dengan `deep_scan=true` untuk analisis 6 dimensi\n"
     )
 
-    return output
+    return make_envelope("success", "coinglass", output)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3943,7 +3976,11 @@ async def coinglass_full_scan(
         )
         if supplementary_failed:
             output += f"Also failed (supplementary): {', '.join(supplementary_failed)}\n\n"
-        return output
+        return make_envelope("failed", "coinglass", output,
+                             data_age_seconds=max_age,
+                             warnings=[f"CRITICAL METRICS FAILED: {', '.join(critical_failed)}"],
+                             failed_endpoints=critical_failed + supplementary_failed,
+                             fallback_suggestion="Try data_binance for Binance-only scan")
 
     # Data sections — formatted as readable tables (data values unchanged)
     for (label, _, _), result in zip(calls, raw_results):
@@ -4537,7 +4574,17 @@ async def coinglass_full_scan(
         output += "**No data**\n\n"
 
     output += "\n"
-    return output
+
+    # Build envelope with partial failure tracking
+    _scan_warnings = []
+    if supplementary_failed:
+        _scan_warnings.append(f"Missing supplementary metrics: {', '.join(supplementary_failed)}")
+    if max_age > STALE_WARNING_THRESHOLD:
+        _scan_warnings.append(f"Oldest data in scan: {max_age:.0f}s — some metrics may be stale")
+    _scan_status = "partial" if supplementary_failed else "success"
+    return make_envelope(_scan_status, "coinglass", output,
+                         data_age_seconds=max_age, warnings=_scan_warnings,
+                         failed_endpoints=supplementary_failed or None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4581,7 +4628,7 @@ async def coinglass_compare(
     endpoint = ENDPOINT_MAP.get(metric)
     if not endpoint:
         available = ", ".join(ENDPOINT_MAP.keys())
-        return f"**ERROR:** Unknown metric '{metric}'. Available: {available}"
+        return _err(f"Unknown metric '{metric}'. Available: {available}")
 
     sym = normalize_symbol(symbol)
     pair = to_pair(symbol)
@@ -4667,7 +4714,15 @@ async def coinglass_compare(
             f"Keep querying periodically to build history for comparison.\n\n"
         )
 
-    return output
+    _cmp_age = current.age_seconds if current else 0
+    _cmp_warnings = []
+    if current and current.is_stale:
+        _cmp_warnings.append(f"Current data is stale ({current.age_seconds:.0f}s old)")
+    if historical is None:
+        _cmp_warnings.append(f"No historical snapshot from ~{hours_ago}h ago")
+    return make_envelope(
+        "partial" if historical is None else "success",
+        "coinglass", output, data_age_seconds=_cmp_age, warnings=_cmp_warnings)
 
 
 @mcp.tool()
@@ -4692,7 +4747,7 @@ async def coinglass_trend(
     endpoint = ENDPOINT_MAP.get(metric)
     if not endpoint:
         available = ", ".join(ENDPOINT_MAP.keys())
-        return f"Unknown metric '{metric}'. Available: {available}"
+        return _err(f"Unknown metric '{metric}'. Available: {available}")
 
     sym = normalize_symbol(symbol)
     snapshots = await client.storage.aget_trend(endpoint, sym, hours, interval)
@@ -4706,7 +4761,8 @@ async def coinglass_trend(
             "Use the individual tools periodically to build up historical "
             "snapshots for trend analysis.\n"
         )
-        return output
+        return make_envelope("partial", "coinglass", output,
+                             warnings=[f"No stored snapshots for {sym} {metric} in last {hours}h"])
 
     output += f"**{len(snapshots)} snapshots found**\n\n"
 
@@ -4748,7 +4804,7 @@ async def coinglass_trend(
                         f"Verify against raw chart before interpreting.\n\n"
                     )
 
-    return output
+    return make_envelope("success", "coinglass", output)
 
 
 @mcp.tool()
@@ -4782,7 +4838,7 @@ async def coinglass_storage_stats(symbol: str = "") -> str:
         "- Use `coinglass_trend` to see how a metric changed over time\n"
         "- More queries = more history = better trend analysis\n"
     )
-    return output
+    return make_envelope("success", "coinglass", output)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5148,7 +5204,7 @@ async def data_binance(
         except (IndexError, TypeError, ValueError):
             pass
 
-    return output
+    return make_envelope("success", "binance", output)
 
 
 from .binance_spot import (

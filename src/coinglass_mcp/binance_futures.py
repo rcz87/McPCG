@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from .binance_client import binance_futures_request
+from .config import make_envelope
 
 WIB = timezone(timedelta(hours=7))
 
@@ -73,12 +74,19 @@ def _price(val: float) -> str:
 
 
 def _err_check(data: Any, hdr: str) -> str | None:
-    """Return full error string if data is error/empty, else None."""
+    """Return envelope error string if data is error/empty, else None."""
     if isinstance(data, dict) and "error" in data:
-        return hdr + f"**ERROR:** {data['error']}"
+        fallback = "Try coinglass equivalent tools"
+        return make_envelope("failed", "binance", hdr + f"**ERROR:** {data['error']}",
+                             fallback_suggestion=fallback)
     if isinstance(data, list) and len(data) == 0:
-        return hdr + "**WARNING: Empty dataset.**"
+        return make_envelope("failed", "binance", hdr + "**WARNING: Empty dataset.**")
     return None
+
+
+def _ok(content: str) -> str:
+    """Wrap success content in Binance envelope."""
+    return make_envelope("success", "binance", content)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -122,14 +130,14 @@ async def binance_futures_price(symbol: str = "") -> str:
         next_t = _dt(d.get("nextFundingTime", 0))
         fr_tag = "NEGATIF (shorts pay)" if fr < 0 else "POSITIF (longs pay)" if fr > 0 else "NEUTRAL"
 
-        return hdr + "\n".join([
+        return _ok(hdr + "\n".join([
             f"- **Mark Price:** {_price(mark)}",
             f"- **Index Price:** {_price(index)}",
             f"- **Est. Settle Price:** {_price(settle)}",
             f"- **Funding Rate:** {fr:+.4f}% — {fr_tag}",
             f"- **Interest Rate:** {interest:.4f}%",
             f"- **Next Funding:** {next_t}",
-        ]) + "\n"
+        ]) + "\n")
 
     # Multiple symbols — table view
     if len(items) > 30:
@@ -147,7 +155,7 @@ async def binance_futures_price(symbol: str = "") -> str:
         next_t = _dt(d.get("nextFundingTime", 0))
         table += f" {sym:<14} | {_price(mark):>13} | {fr:>+8.4f}% | {next_t}\n"
     table += "```\n"
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -192,7 +200,7 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
     avg_fr = sum(rates) / len(rates) if rates else 0
     table += f"\n**Summary:** Avg FR: {avg_fr:+.4f}% over {len(items)} periods"
 
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -221,11 +229,11 @@ async def binance_futures_open_interest(symbol: str) -> str:
     sym = d.get("symbol", symbol.upper())
     t = _dt(d.get("time", 0))
 
-    return hdr + "\n".join([
+    return _ok(hdr + "\n".join([
         f"- **Symbol:** {sym}",
         f"- **Open Interest:** {oi:,.3f} contracts",
         f"- **Time:** {t}",
-    ]) + "\n"
+    ]) + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -274,7 +282,7 @@ async def binance_futures_oi_history(symbol: str, period: str = "5m", limit: int
         pct = (change / first_val * 100) if first_val else 0
         table += f"\n**Summary:** {_dollar(first_val)} → {_dollar(last_val)} (change: {_dollar(change)}, {pct:+.2f}%)"
 
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -314,7 +322,7 @@ def _fmt_ls(data: Any, title: str) -> str:
     else:
         table += f"\n**Summary:** Ratio: {avg_r:.3f}"
 
-    return hdr + table
+    return _ok(hdr + table)
 
 
 async def binance_futures_long_short_ratio(symbol: str, period: str = "5m", limit: int = 100) -> str:
@@ -404,7 +412,7 @@ async def binance_futures_taker_volume(symbol: str, period: str = "5m", limit: i
     net_str = f"+{_dollar(total_net)}" if total_net >= 0 else _dollar(total_net)
     table += f"\n**Summary:** {buy_count}/{len(items)} buy-dominant | Buy {_dollar(total_buy)} vs Sell {_dollar(total_sell)} | Net {net_str}"
 
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -444,7 +452,7 @@ async def binance_futures_klines(symbol: str, interval: str = "5m", limit: int =
 
     items = data if isinstance(data, list) else []
     if not items:
-        return hdr + "**WARNING: Empty dataset.**"
+        return make_envelope("failed", "binance", hdr + "**WARNING: Empty dataset.**")
 
     if len(items) > 30:
         total = len(items)
@@ -470,7 +478,7 @@ async def binance_futures_klines(symbol: str, interval: str = "5m", limit: int =
     total_vol = sum(_f(c[7]) for c in items)
     table += f"\n**Summary:** Range {_price(low)}-{_price(high)} | {_price(first_o)} → {_price(last_c)} ({pct:+.2f}%) | Total vol: {_dollar(total_vol)}"
 
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -501,7 +509,7 @@ async def binance_futures_depth(symbol: str, limit: int = 100) -> str:
         return e
 
     if not isinstance(data, dict) or "bids" not in data:
-        return hdr + "**WARNING: Unexpected response format.**"
+        return make_envelope("failed", "binance", hdr + "**WARNING: Unexpected response format.**")
 
     bids = data.get("bids", [])
     asks = data.get("asks", [])
@@ -528,7 +536,7 @@ async def binance_futures_depth(symbol: str, limit: int = 100) -> str:
     table += f"\n**Summary:** {len(bids)} bids ({_dollar(total_bid_val)}) vs {len(asks)} asks ({_dollar(total_ask_val)}) → **{dominant}** (ratio {ratio:.2f})"
     table += f"\n**Spread:** {_price(spread)} ({spread_pct:.4f}%)"
 
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -570,7 +578,7 @@ async def binance_futures_ticker_24h(symbol: str = "") -> str:
         vwap = _f(d.get("weightedAvgPrice"))
         trades = int(_f(d.get("count")))
 
-        return hdr + "\n".join([
+        return _ok(hdr + "\n".join([
             f"- **Last Price:** {_price(last)}",
             f"- **24h Change:** {change_pct:+.2f}% ({_price(abs(change))})",
             f"- **24h High:** {_price(high)}",
@@ -578,7 +586,7 @@ async def binance_futures_ticker_24h(symbol: str = "") -> str:
             f"- **24h Volume:** {_dollar(vol)}",
             f"- **VWAP:** {_price(vwap)}",
             f"- **Trades:** {trades:,}",
-        ]) + "\n"
+        ]) + "\n")
 
     # Multi-ticker: sort by volume, show top 30
     if len(items) > 30:
@@ -597,7 +605,7 @@ async def binance_futures_ticker_24h(symbol: str = "") -> str:
         vol = _f(d.get("quoteVolume"))
         table += f" {sym:<14} | {_price(last):>13} | {pct:>+7.2f}% | {_dollar(vol):>12}\n"
     table += "```\n"
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -659,4 +667,4 @@ async def binance_futures_liquidation(symbol: str = "", limit: int = 100) -> str
 
     table += f"\n**Summary:** LONG liq: {_dollar(total_long_val)} | SHORT liq: {_dollar(total_short_val)}"
 
-    return hdr + table
+    return _ok(hdr + table)

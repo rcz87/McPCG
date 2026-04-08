@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json as _json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
 
 # ─── Plan Tiers ───────────────────────────────────────────────────────────────
 
@@ -198,3 +200,43 @@ class Config:
                 f"Available: {allowed}"
             )
         return INTERVAL_MAP.get(interval, interval)
+
+
+# ─── Standard Response Envelope ─────────────────────────────────────────────
+
+_WIB = timezone(timedelta(hours=7))
+
+
+def make_envelope(
+    status: str,
+    source: str,
+    data: str,
+    data_age_seconds: float = 0.0,
+    warnings: list[str] | None = None,
+    failed_endpoints: list[str] | None = None,
+    fallback_suggestion: str = "",
+) -> str:
+    """Wrap tool output in standard response envelope.
+
+    Args:
+        status: "success" | "partial" | "failed"
+        source: "coinglass" | "binance" | "arkham" | "nansen"
+        data: The formatted content (markdown text)
+        data_age_seconds: How old the data is (0 = live)
+        warnings: List of warning messages
+        failed_endpoints: For partial failures — which endpoints failed
+        fallback_suggestion: Suggested alternative tool on failure
+    """
+    envelope: dict = {
+        "status": status,
+        "source": source,
+        "timestamp": datetime.now(_WIB).isoformat(),
+        "data_age_seconds": round(data_age_seconds, 1),
+        "warnings": warnings or [],
+        "data": data,
+    }
+    if failed_endpoints:
+        envelope["failed_endpoints"] = failed_endpoints
+    if fallback_suggestion:
+        envelope["fallback_suggestion"] = fallback_suggestion
+    return _json.dumps(envelope, ensure_ascii=False)

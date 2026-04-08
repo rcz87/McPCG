@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from .binance_client import binance_spot_request
+from .config import make_envelope
 
 WIB = timezone(timedelta(hours=7))
 
@@ -72,12 +73,19 @@ def _price(val: float) -> str:
 
 
 def _err_check(data: Any, hdr: str) -> str | None:
-    """Return full error string if data is error/empty, else None."""
+    """Return envelope error string if data is error/empty, else None."""
     if isinstance(data, dict) and "error" in data:
-        return hdr + f"**ERROR:** {data['error']}"
+        fallback = "Try coinglass_price_ohlc or coinglass_spot_cvd"
+        return make_envelope("failed", "binance", hdr + f"**ERROR:** {data['error']}",
+                             fallback_suggestion=fallback)
     if isinstance(data, list) and len(data) == 0:
-        return hdr + "**WARNING: Empty dataset.**"
+        return make_envelope("failed", "binance", hdr + "**WARNING: Empty dataset.**")
     return None
+
+
+def _ok(content: str) -> str:
+    """Wrap success content in Binance envelope."""
+    return make_envelope("success", "binance", content)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -111,7 +119,7 @@ async def binance_spot_price(symbol: str = "") -> str:
     if len(items) == 1:
         d = items[0]
         p = _f(d.get("price"))
-        return hdr + f"- **{d.get('symbol', '')}:** {_price(p)}\n"
+        return _ok(hdr + f"- **{d.get('symbol', '')}:** {_price(p)}\n")
 
     # Multiple symbols — table
     if len(items) > 30:
@@ -127,7 +135,7 @@ async def binance_spot_price(symbol: str = "") -> str:
         p = _f(d.get("price"))
         table += f" {sym:<14} | {_price(p):>13}\n"
     table += "```\n"
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -161,7 +169,7 @@ async def binance_spot_depth(symbol: str, limit: int = 100) -> str:
         return e
 
     if not isinstance(data, dict) or "bids" not in data:
-        return hdr + "**WARNING: Unexpected response format.**"
+        return make_envelope("failed", "binance", hdr + "**WARNING: Unexpected response format.**")
 
     bids = data.get("bids", [])
     asks = data.get("asks", [])
@@ -188,7 +196,7 @@ async def binance_spot_depth(symbol: str, limit: int = 100) -> str:
     table += f"\n**Summary:** {len(bids)} bids ({_dollar(total_bid_val)}) vs {len(asks)} asks ({_dollar(total_ask_val)}) → **{dominant}** (ratio {ratio:.2f})"
     table += f"\n**Spread:** {_price(spread)} ({spread_pct:.4f}%)"
 
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -219,7 +227,7 @@ async def binance_spot_klines(symbol: str, interval: str = "5m", limit: int = 10
 
     items = data if isinstance(data, list) else []
     if not items:
-        return hdr + "**WARNING: Empty dataset.**"
+        return make_envelope("failed", "binance", hdr + "**WARNING: Empty dataset.**")
 
     if len(items) > 30:
         total = len(items)
@@ -245,7 +253,7 @@ async def binance_spot_klines(symbol: str, interval: str = "5m", limit: int = 10
     total_vol = sum(_f(c[7]) for c in items)
     table += f"\n**Summary:** Range {_price(low)}-{_price(high)} | {_price(first_o)} → {_price(last_c)} ({pct:+.2f}%) | Total vol: {_dollar(total_vol)}"
 
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -302,7 +310,7 @@ async def binance_spot_trades(symbol: str, limit: int = 500) -> str:
     buy_count = sum(1 for d in items if not d.get("isBuyerMaker", False))
     table += f"\n**Summary:** {buy_count}/{len(items)} taker BUY | Buy {_dollar(total_buy_val)} vs Sell {_dollar(total_sell_val)}"
 
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -357,7 +365,7 @@ async def binance_spot_agg_trades(symbol: str, limit: int = 500) -> str:
     buy_count = sum(1 for d in items if not d.get("m", False))
     table += f"\n**Summary:** {buy_count}/{len(items)} taker BUY | Buy {_dollar(total_buy_val)} vs Sell {_dollar(total_sell_val)}"
 
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -399,7 +407,7 @@ async def binance_spot_ticker_24h(symbol: str = "") -> str:
         vwap = _f(d.get("weightedAvgPrice"))
         trades = int(_f(d.get("count")))
 
-        return hdr + "\n".join([
+        return _ok(hdr + "\n".join([
             f"- **Last Price:** {_price(last)}",
             f"- **24h Change:** {change_pct:+.2f}% ({_price(abs(change))})",
             f"- **24h High:** {_price(high)}",
@@ -407,7 +415,7 @@ async def binance_spot_ticker_24h(symbol: str = "") -> str:
             f"- **24h Volume:** {_dollar(vol)}",
             f"- **VWAP:** {_price(vwap)}",
             f"- **Trades:** {trades:,}",
-        ]) + "\n"
+        ]) + "\n")
 
     # Multi-ticker: sort by volume, show top 30
     if len(items) > 30:
@@ -426,7 +434,7 @@ async def binance_spot_ticker_24h(symbol: str = "") -> str:
         vol = _f(d.get("quoteVolume"))
         table += f" {sym:<14} | {_price(last):>13} | {pct:>+7.2f}% | {_dollar(vol):>12}\n"
     table += "```\n"
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -466,11 +474,11 @@ async def binance_spot_book_ticker(symbol: str = "") -> str:
         spread = ask_p - bid_p
         spread_pct = (spread / bid_p * 100) if bid_p else 0
 
-        return hdr + "\n".join([
+        return _ok(hdr + "\n".join([
             f"- **Best Bid:** {_price(bid_p)} × {bid_q:,.4f} ({_dollar(bid_p * bid_q)})",
             f"- **Best Ask:** {_price(ask_p)} × {ask_q:,.4f} ({_dollar(ask_p * ask_q)})",
             f"- **Spread:** {_price(spread)} ({spread_pct:.4f}%)",
-        ]) + "\n"
+        ]) + "\n")
 
     # Multiple — table
     if len(items) > 30:
@@ -490,7 +498,7 @@ async def binance_spot_book_ticker(symbol: str = "") -> str:
         sp = ((ap - bp) / bp * 100) if bp else 0
         table += f" {sym:<14} | {_price(bp):>13} | {bq:>10,.4f} | {_price(ap):>13} | {aq:>10,.4f} | {sp:>7.4f}%\n"
     table += "```\n"
-    return hdr + table
+    return _ok(hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -517,7 +525,7 @@ async def binance_spot_avg_price(symbol: str) -> str:
     p = _f(d.get("price"))
     t = _dt(d.get("closeTime", 0))
 
-    return hdr + "\n".join([
+    return _ok(hdr + "\n".join([
         f"- **Avg Price ({mins}min):** {_price(p)}",
         f"- **Close Time:** {t}",
-    ]) + "\n"
+    ]) + "\n")
