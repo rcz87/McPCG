@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 from .arkham import register_arkham_tools, arkham_get
+from .backtest import register_backtest_tools
 from .nansen import register_nansen_tools, nansen_token_flow_intelligence, NANSEN_TOKEN_MAP
 from .binance_client import (
     close_client as close_binance_client,
@@ -77,6 +78,9 @@ register_arkham_tools(mcp)
 
 # ─── Register Nansen Smart Money Tools ────────────────────────────────────────
 register_nansen_tools(mcp)
+
+# ─── Register SMC Backtest Tools ─────────────────────────────────────────────
+register_backtest_tools(mcp)
 
 # ─── Register Chart Tool ─────────────────────────────────────────────────────
 import base64
