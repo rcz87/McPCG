@@ -215,6 +215,7 @@ def make_envelope(
     warnings: list[str] | None = None,
     failed_endpoints: list[str] | None = None,
     fallback_suggestion: str = "",
+    access: dict[str, str] | None = None,
 ) -> str:
     """Wrap tool output in standard response envelope.
 
@@ -226,6 +227,7 @@ def make_envelope(
         warnings: List of warning messages
         failed_endpoints: For partial failures — which endpoints failed
         fallback_suggestion: Suggested alternative tool on failure
+        access: Plan-gated metadata {required_plan, fallback_tool}
     """
     envelope: dict = {
         "status": status,
@@ -239,4 +241,6 @@ def make_envelope(
         envelope["failed_endpoints"] = failed_endpoints
     if fallback_suggestion:
         envelope["fallback_suggestion"] = fallback_suggestion
+    if access:
+        envelope["access"] = access
     return _json.dumps(envelope, ensure_ascii=False)

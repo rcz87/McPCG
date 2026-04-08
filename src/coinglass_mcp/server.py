@@ -11,6 +11,8 @@ AUDIT COMPLIANCE:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import os
 from contextlib import asynccontextmanager
@@ -30,7 +32,7 @@ from .binance_client import (
     binance_futures_request,
     binance_spot_request,
 )
-from .client import CoinGlassClient, FetchResult
+from .client import APIError, CoinGlassClient, FetchResult, PlanLimitError, RateLimitError
 from .config import (
     DEFAULT_EXCHANGE,
     STALE_EXPIRED_THRESHOLD,
@@ -83,6 +85,65 @@ register_nansen_tools(mcp)
 # ─── Register SMC Backtest Tools ─────────────────────────────────────────────
 register_backtest_tools(mcp)
 
+# ─── Plan Access Fallback Map ───────────────────────────────────────────────
+
+PLAN_FALLBACK_MAP: dict[str, dict[str, str]] = {
+    "coinglass_footprint": {
+        "required_plan": "standard+",
+        "fallback_tool": "coinglass_orderbook",
+    },
+    "coinglass_liquidation_map": {
+        "required_plan": "professional+",
+        "fallback_tool": "coinglass_liquidation_cat",
+    },
+    "coinglass_orderbook_heatmap": {
+        "required_plan": "standard+",
+        "fallback_tool": "coinglass_orderbook",
+    },
+}
+
+_GENERIC_PLAN_ACCESS = {"required_plan": "standard+", "fallback_tool": "data_binance"}
+
+
+def _tool_envelope(source: str = "coinglass"):
+    """Decorator: catch PlanLimitError, RateLimitError, timeouts, APIError
+    and return proper enveloped error with access metadata / fallback."""
+
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except PlanLimitError as e:
+                access = PLAN_FALLBACK_MAP.get(func.__name__, _GENERIC_PLAN_ACCESS)
+                return make_envelope(
+                    "failed", source, f"**Plan Error:** {e}",
+                    access=access,
+                    fallback_suggestion=f"Try {access['fallback_tool']}")
+            except RateLimitError as e:
+                return make_envelope(
+                    "failed", source, f"**Rate Limited:** {e}",
+                    fallback_suggestion="Rate limited — wait 30s or try data_binance")
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                return make_envelope(
+                    "failed", source,
+                    f"**Timeout:** Request timed out ({e})",
+                    fallback_suggestion="Try data_binance for Binance-only scan")
+            except APIError as e:
+                return make_envelope(
+                    "failed", source, f"**API Error:** {e}")
+        return wrapper
+
+    return decorator
+
+
+def _err(msg: str, source: str = "coinglass", fallback: str = "",
+         access: dict[str, str] | None = None) -> str:
+    """Wrap an error message in standard envelope."""
+    return make_envelope("failed", source, msg,
+                         fallback_suggestion=fallback, access=access)
+
+
 # ─── Register Chart Tool ─────────────────────────────────────────────────────
 import base64
 
@@ -92,6 +153,7 @@ from .chart import get_chart
 
 
 @mcp.tool(output_schema=None)
+@_tool_envelope()
 async def coinglass_chart(
     symbol: str = "BTC",
     interval: str = "5m",
@@ -148,11 +210,6 @@ async def coinglass_chart(
 
 
 # ─── Formatting Helpers ──────────────────────────────────────────────────────
-
-
-def _err(msg: str, source: str = "coinglass", fallback: str = "") -> str:
-    """Wrap an error message in standard envelope."""
-    return make_envelope("failed", source, msg, fallback_suggestion=fallback)
 
 
 def _age_banner(result: FetchResult) -> str:
@@ -1313,6 +1370,7 @@ def _fmt_news(data: list) -> str:
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_spot_cvd(
     symbol: str = "BTC",
     interval: str = "5m",
@@ -1343,6 +1401,7 @@ async def coinglass_spot_cvd(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_futures_cvd(
     symbol: str = "BTC",
     interval: str = "5m",
@@ -1373,6 +1432,7 @@ async def coinglass_futures_cvd(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_funding_rate(symbol: str = "") -> str:
     """Get current Funding Rate for ALL coins across all exchanges.
 
@@ -1424,6 +1484,7 @@ async def coinglass_funding_rate(symbol: str = "") -> str:
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_open_interest(
     symbol: str = "BTC",
     interval: str = "5m",
@@ -1457,6 +1518,7 @@ async def coinglass_open_interest(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_liquidation_map(
     symbol: str = "BTC",
     exchange: str = DEFAULT_EXCHANGE,
@@ -1477,7 +1539,10 @@ async def coinglass_liquidation_map(
         range: Time range (12h, 24h, 3d, 7d, 30d, 90d, 180d, 1y)
     """
     if not config.has_feature("liquidation_heatmap"):
-        return _err(f"Liquidation Heatmap requires Professional or Enterprise plan. Current plan: {config.plan}")
+        return _err(
+            f"Liquidation Heatmap requires Professional or Enterprise plan. Current plan: {config.plan}",
+            access=PLAN_FALLBACK_MAP["coinglass_liquidation_map"],
+            fallback="Try coinglass_liquidation_cat")
     pair = to_pair(symbol)
     result = await client.get("/api/futures/liquidation/heatmap/model1", {
         "exchange": exchange,
@@ -1488,6 +1553,7 @@ async def coinglass_liquidation_map(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_orderbook(
     symbol: str = "BTC",
     exchange: str = DEFAULT_EXCHANGE,
@@ -1527,6 +1593,7 @@ async def coinglass_orderbook(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_price_ohlc(
     symbol: str = "BTC",
     interval: str = "5m",
@@ -1552,6 +1619,7 @@ async def coinglass_price_ohlc(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_liquidation_history(
     symbol: str = "BTC",
     interval: str = "1h",
@@ -1582,6 +1650,7 @@ async def coinglass_liquidation_history(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_long_short_ratio(
     symbol: str = "BTC",
     interval: str = "1h",
@@ -1612,6 +1681,7 @@ async def coinglass_long_short_ratio(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_taker_buysell(
     symbol: str = "BTC",
     interval: str = "5m",
@@ -1642,6 +1712,7 @@ async def coinglass_taker_buysell(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_fr_arbitrage(
     usd: int = 10000,
     exchange: str = "",
@@ -1675,6 +1746,7 @@ async def coinglass_fr_arbitrage(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_coins_markets(
     exchange: str = "",
     page: int = 1,
@@ -1705,6 +1777,7 @@ async def coinglass_coins_markets(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_whale_alert(symbol: str = "") -> str:
     """Get Hyperliquid whale position alerts (~200 most recent, positions > $1M).
 
@@ -1726,6 +1799,7 @@ async def coinglass_whale_alert(symbol: str = "") -> str:
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_fear_greed(symbol: str = "") -> str:
     """Get Fear & Greed Index history.
 
@@ -1748,6 +1822,7 @@ async def coinglass_fear_greed(symbol: str = "") -> str:
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_footprint(
     symbol: str = "BTC",
     interval: str = "5m",
@@ -1834,6 +1909,7 @@ async def coinglass_footprint(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_spot_netflow(
     symbol: str = "BTC",
     exchange: str = "Binance, Bybit, OKX, Bitget, Gate",
@@ -1857,6 +1933,7 @@ async def coinglass_spot_netflow(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_orderbook_heatmap(
     symbol: str = "BTC",
     exchange: str = DEFAULT_EXCHANGE,
@@ -1893,6 +1970,7 @@ async def coinglass_orderbook_heatmap(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_trading_market(
     action: str = "coins_markets",
     symbol: str = "",
@@ -1984,6 +2062,7 @@ async def coinglass_trading_market(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_open_interest_cat(
     action: str = "aggregated_history",
     symbol: str = "BTC",
@@ -2065,6 +2144,7 @@ async def coinglass_open_interest_cat(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_funding_rate_cat(
     action: str = "exchange_list",
     symbol: str = "BTC",
@@ -2172,6 +2252,7 @@ async def coinglass_funding_rate_cat(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_long_short_cat(
     action: str = "global_account",
     symbol: str = "BTC",
@@ -2259,6 +2340,7 @@ async def coinglass_long_short_cat(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_liquidation_cat(
     action: str = "coin_history",
     symbol: str = "BTC",
@@ -2334,6 +2416,7 @@ async def coinglass_liquidation_cat(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_orderbook_cat(
     action: str = "aggregated_bidask",
     symbol: str = "BTC",
@@ -2426,6 +2509,7 @@ async def coinglass_orderbook_cat(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_hyperliquid_cat(
     action: str = "long_short_ratio",
     symbol: str = "BTC",
@@ -2480,6 +2564,7 @@ Args:
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_futures_taker_cat(
     action: str = "coin_taker",
     symbol: str = "BTC",
@@ -2547,6 +2632,7 @@ Args:
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_spot_market_cat(
     action: str = "coins_markets",
     symbol: str = "BTC",
@@ -2601,6 +2687,7 @@ Args:
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_spot_orderbook_cat(
     action: str = "aggregated_bidask",
     symbol: str = "BTC",
@@ -2685,6 +2772,7 @@ Args:
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_indicators_cat(
     action: str = "rsi_list",
     symbol: str = "BTC",
@@ -2805,6 +2893,7 @@ Args:
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_index_news_cat(
     action: str = "altcoin_season",
     symbol: str = "BTC",
@@ -2864,6 +2953,7 @@ Args:
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_smart_screener(
     mode: str = "all",
     top_n: int = 15,
@@ -3676,6 +3766,7 @@ PRECISION_METRICS = {"Whale Alert", "OB Bidask ±1%", "Footprint", "RSI"}
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_full_scan(
     symbol: str = "BTC",
     interval: str = "5m",
@@ -4605,6 +4696,7 @@ ENDPOINT_MAP = {
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_compare(
     symbol: str = "BTC",
     metric: str = "spot_cvd",
@@ -4726,6 +4818,7 @@ async def coinglass_compare(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_trend(
     symbol: str = "BTC",
     metric: str = "spot_cvd",
@@ -4808,6 +4901,7 @@ async def coinglass_trend(
 
 
 @mcp.tool()
+@_tool_envelope()
 async def coinglass_storage_stats(symbol: str = "") -> str:
     """Show storage statistics — how much historical data is stored.
 
@@ -4851,6 +4945,7 @@ async def coinglass_storage_stats(symbol: str = "") -> str:
 
 
 @mcp.tool()
+@_tool_envelope(source="binance")
 async def data_binance(
     symbol: str = "BTC",
     interval: str = "5m",
