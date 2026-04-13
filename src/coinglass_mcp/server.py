@@ -31,11 +31,15 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.auth import AuthProvider, AccessToken
 from mcp.types import ImageContent, TextContent
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from .arkham import register_arkham_tools
 from .backtest import register_backtest_tools
@@ -52,10 +56,26 @@ from .nansen import register_nansen_tools
 
 load_dotenv()
 
+_SERVER_START_TIME = time.time()
+
 # ─── Global State ─────────────────────────────────────────────────────────────
 
 config = Config.from_env()
 client = CoinGlassClient(config)
+
+
+# ─── Bearer Token Auth ────────────────────────────────────────────────────────
+
+_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "")
+
+
+class BearerTokenAuth(AuthProvider):
+    """Simple bearer token auth — validates against MCP_AUTH_TOKEN env var."""
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if token == _AUTH_TOKEN:
+            return AccessToken(token=token, client_id="ricoz", scopes=[])
+        return None
 
 
 @asynccontextmanager
@@ -80,7 +100,26 @@ mcp = FastMCP(
         "Data older than 2 minutes has WARNING. Data older than 5 minutes must NOT be used for entries."
     ),
     lifespan=lifespan,
+    auth=BearerTokenAuth() if _AUTH_TOKEN else None,
 )
+
+
+# ─── Health Check Endpoint ────────────────────────────────────────────────────
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    """Health check — no auth required, used by monitoring cron."""
+    uptime = time.time() - _SERVER_START_TIME
+    return JSONResponse({
+        "status": "ok",
+        "server": "coinglass-mcp",
+        "uptime_seconds": round(uptime),
+        "uptime_human": f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m",
+        "tools": 69,
+        "auth_enabled": bool(_AUTH_TOKEN),
+        "timestamp": int(time.time()),
+    })
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Register All Tools
