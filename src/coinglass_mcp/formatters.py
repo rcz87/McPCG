@@ -328,8 +328,16 @@ def _fmt_num(v: float, prefix: str = "$", signed: bool = False) -> str:
         return f"{sign}{prefix}{av / 1e6:,.2f}M"
     elif av >= 1e3:
         return f"{sign}{prefix}{av / 1e3:,.1f}K"
-    else:
+    elif av >= 1:
         return f"{sign}{prefix}{av:,.2f}"
+    elif av >= 0.01:
+        return f"{sign}{prefix}{av:.4f}"
+    elif av >= 0.0001:
+        return f"{sign}{prefix}{av:.6f}"
+    elif av > 0:
+        return f"{sign}{prefix}{av:.8f}"
+    else:
+        return f"{prefix}0"
 
 
 def _get(d: dict, *keys, default=None):
@@ -547,6 +555,84 @@ def _fmt_scan_ob_delta(data: list) -> str:
     return out
 
 
+def _fmt_fr_ohlc(data: list) -> str:
+    """Format Funding Rate OHLC history — values are percentages, not prices."""
+    if not data:
+        return "**Empty dataset**\n\n"
+
+    show = data[-15:]
+    total = len(data)
+    out = f"*(last {len(show)} of {total})*\n\n"
+    out += "```\n"
+    out += f"{'Time':>6} | {'Open':>10} | {'High':>10} | {'Low':>10} | {'Close':>10}\n"
+    out += f"{'─' * 6} | {'─' * 10} | {'─' * 10} | {'─' * 10} | {'─' * 10}\n"
+
+    closes = []
+    for row in show:
+        if not isinstance(row, dict):
+            continue
+        t = _get(row, "t", "time", "timestamp", "createTime", default=0)
+        o = float(_get(row, "o", "open", default=0))
+        h = float(_get(row, "h", "high", default=0))
+        l = float(_get(row, "l", "low", default=0))
+        c = float(_get(row, "c", "close", default=0))
+        closes.append(c)
+        out += (f"{_ts_wib(t):>6} | {o:>+9.4f}% | {h:>+9.4f}% | "
+                f"{l:>+9.4f}% | {c:>+9.4f}%\n")
+
+    out += "```\n\n"
+
+    if closes:
+        avg = sum(closes) / len(closes)
+        latest = closes[-1]
+        out += f"**Latest:** {latest:+.4f}% | **Avg ({len(closes)} periods):** {avg:+.4f}%\n\n"
+
+    return out
+
+
+def _fmt_fr_cumulative(data: list) -> str:
+    """Format cumulative/accumulated FR by exchange.
+
+    Data: [{symbol, stablecoin_margin_list: [{exchange, funding_rate},...],
+            token_margin_list: [{exchange, funding_rate},...]}]
+    """
+    if not data:
+        return "**Empty dataset**\n\n"
+
+    out = ""
+    for coin in data[:10]:
+        if not isinstance(coin, dict):
+            continue
+        sym = coin.get("symbol", "?")
+        stable = coin.get("stablecoin_margin_list") or []
+        token = coin.get("token_margin_list") or []
+
+        if not stable and not token:
+            continue
+
+        out += f"**{sym}**\n```\n"
+        out += f" {'Exchange':<14} | {'Stable FR':>10} | {'Token FR':>10}\n"
+        out += f" {'─' * 14} | {'─' * 10} | {'─' * 10}\n"
+
+        # Build exchange map
+        stable_map = {e.get("exchange", "").upper(): e.get("funding_rate", 0)
+                      for e in stable if isinstance(e, dict)}
+        token_map = {e.get("exchange", "").upper(): e.get("funding_rate", 0)
+                     for e in token if isinstance(e, dict)}
+        all_exchanges = sorted(set(list(stable_map.keys()) + list(token_map.keys())))
+
+        for ex in all_exchanges:
+            sf = stable_map.get(ex)
+            tf = token_map.get(ex)
+            sf_str = f"{float(sf):>+9.4f}%" if sf is not None else f"{'—':>10}"
+            tf_str = f"{float(tf):>+9.4f}%" if tf is not None else f"{'—':>10}"
+            out += f" {ex:<14} | {sf_str} | {tf_str}\n"
+
+        out += "```\n\n"
+
+    return out
+
+
 def _fmt_scan_price(data: list) -> str:
     """Format Price OHLC time-series as readable table."""
     if not data:
@@ -571,7 +657,7 @@ def _fmt_scan_price(data: list) -> str:
         h = float(_get(row, "h", "high", default=0))
         l = float(_get(row, "l", "low", default=0))
         c = float(_get(row, "c", "close", default=0))
-        v = float(_get(row, "v", "vol", "volume", "quoteVolume", default=0))
+        v = float(_get(row, "volume_usd", "v", "vol", "volume", "quoteVolume", default=0))
         highs.append(h)
         lows.append(l)
         last_close = c
@@ -863,6 +949,78 @@ def _fmt_p2_spot_large_orders(data: list) -> str:
     return out
 
 
+def _fmt_ob_heatmap(data: list) -> str:
+    """Format Orderbook Heatmap — [timestamp, bids[[price,qty],...], asks[[price,qty],...]].
+
+    Shows top bid/ask walls (support/resistance) from the latest snapshot.
+    """
+    if not data:
+        return "**Empty dataset**\n\n"
+
+    # Use latest snapshot
+    latest = data[-1]
+    if not isinstance(latest, list) or len(latest) < 3:
+        return "**Unexpected heatmap format**\n\n"
+
+    ts = latest[0]
+    bids = latest[1] if isinstance(latest[1], list) else []
+    asks = latest[2] if isinstance(latest[2], list) else []
+
+    total_bid_qty = sum(b[1] for b in bids if isinstance(b, list) and len(b) >= 2)
+    total_ask_qty = sum(a[1] for a in asks if isinstance(a, list) and len(a) >= 2)
+
+    # Top walls by quantity
+    top_bids = sorted([b for b in bids if isinstance(b, list) and len(b) >= 2],
+                      key=lambda x: x[1], reverse=True)[:10]
+    top_asks = sorted([a for a in asks if isinstance(a, list) and len(a) >= 2],
+                      key=lambda x: x[1], reverse=True)[:10]
+
+    # Current price ~ highest bid
+    bid_prices = [b[0] for b in bids if isinstance(b, list) and len(b) >= 2]
+    current_price = max(bid_prices) if bid_prices else 0
+
+    # Format timestamp
+    try:
+        t = float(ts)
+        if t > 1e12:
+            t /= 1000
+        time_str = datetime.fromtimestamp(t, tz=WIB).strftime("%Y-%m-%d %H:%M WIB")
+    except (ValueError, OSError):
+        time_str = str(ts)
+
+    out = f"**Snapshot:** {time_str}\n"
+    out += f"**Depth:** {len(bids)} bid levels | {len(asks)} ask levels\n"
+    out += f"**Total:** {total_bid_qty:,.1f} qty bids | {total_ask_qty:,.1f} qty asks"
+    if total_ask_qty > 0:
+        ratio = total_bid_qty / total_ask_qty
+        out += f" | Bid/Ask ratio: {ratio:.2f}"
+    out += "\n\n"
+
+    # Bid walls (support)
+    out += "**BID WALLS (Support)**\n```\n"
+    out += f" {'Price':>12} | {'Quantity':>12} | {'USD Value':>14} | {'Dist%':>6}\n"
+    out += f" {'─' * 12} | {'─' * 12} | {'─' * 14} | {'─' * 6}\n"
+    for b in top_bids:
+        price, qty = b[0], b[1]
+        usd = price * qty
+        dist = ((current_price - price) / current_price * 100) if current_price else 0
+        out += f" {_fmt_num(price):>12} | {qty:>12,.3f} | {_fmt_num(usd):>14} | {dist:>+5.1f}%\n"
+    out += "```\n\n"
+
+    # Ask walls (resistance)
+    out += "**ASK WALLS (Resistance)**\n```\n"
+    out += f" {'Price':>12} | {'Quantity':>12} | {'USD Value':>14} | {'Dist%':>6}\n"
+    out += f" {'─' * 12} | {'─' * 12} | {'─' * 14} | {'─' * 6}\n"
+    for a in top_asks:
+        price, qty = a[0], a[1]
+        usd = price * qty
+        dist = ((price - current_price) / current_price * 100) if current_price else 0
+        out += f" {_fmt_num(price):>12} | {qty:>12,.3f} | {_fmt_num(usd):>14} | {dist:>+5.1f}%\n"
+    out += "```\n\n"
+
+    return out
+
+
 def _fmt_spot_netflow(data) -> str:
     """Format Spot Net Flow multi-timeframe as readable table — factual only."""
     if not data:
@@ -1061,59 +1219,281 @@ def _fmt_funding_rate_all(data: list) -> str:
 
 
 def _fmt_fr_arbitrage(data: list) -> str:
-    """Format FR arbitrage opportunities."""
+    """Format FR arbitrage opportunities.
+
+    v4 format: {symbol, buy: {exchange, funding_rate, ...}, sell: {exchange, funding_rate, ...},
+                apr, funding, fee, spread, next_funding_time}
+    """
     if not data:
         return "**Empty dataset**\n\n"
     out = "```\n"
-    out += f" {'Symbol':<10} | {'FR':>10} | {'APR':>8} | {'Est.Income':>12} | {'Exchange':>10}\n"
-    out += f" {'─' * 10} | {'─' * 10} | {'─' * 8} | {'─' * 12} | {'─' * 10}\n"
+    out += (f" {'Symbol':<8} | {'Buy Exchange':<13} | {'Sell Exchange':<13} | "
+            f"{'Net FR':>9} | {'APR':>10} | {'Fee':>5} | {'Spread':>7}\n")
+    out += (f" {'─' * 8} | {'─' * 13} | {'─' * 13} | "
+            f"{'─' * 9} | {'─' * 10} | {'─' * 5} | {'─' * 7}\n")
     for row in data:
-        sym = _get(row, "symbol", "coin", default="?")
-        fr = float(_get(row, "fundingRate", "funding_rate", "fr", default=0))
-        apr = float(_get(row, "apr", "annualRate", default=0))
-        income = float(_get(row, "income", "estimatedIncome", "est_income", default=0))
-        ex = _get(row, "exchangeName", "exchange", default="?")
-        out += f" {sym:<10} | {fr:>+9.4f}% | {apr:>+7.2f}% | {_fmt_num(income):>12} | {ex:>10}\n"
+        sym = row.get("symbol", "?")
+        buy = row.get("buy") or {}
+        sell = row.get("sell") or {}
+        buy_ex = buy.get("exchange", "?") if isinstance(buy, dict) else "?"
+        sell_ex = sell.get("exchange", "?") if isinstance(sell, dict) else "?"
+        funding = float(row.get("funding", 0))
+        apr = float(row.get("apr", 0))
+        fee = float(row.get("fee", 0))
+        spread = float(row.get("spread", 0))
+        out += (f" {sym:<8} | {buy_ex:<13} | {sell_ex:<13} | "
+                f"{funding:>+8.4f}% | {apr:>+9.1f}% | {fee:>4.2f}% | {spread:>+6.2f}%\n")
     out += "```\n\n"
     return out
 
 
-def _fmt_fear_greed(data: list) -> str:
-    """Format Fear & Greed Index history."""
+def _fmt_fear_greed(data) -> str:
+    """Format Fear & Greed Index history.
+
+    v4 API returns: {"data_list": [...], "price_list": [...], "time_list": [...]}
+    Three parallel arrays — zip them into rows.
+    """
     if not data:
         return "**Empty dataset**\n\n"
-    show = data[-20:] if len(data) > 20 else data
-    out = ""
-    if len(data) > 20:
-        out += f"*(showing last {len(show)} of {len(data)})*\n\n"
+
+    # v4 format: dict with parallel arrays
+    if isinstance(data, dict) and "data_list" in data:
+        values = data.get("data_list", [])
+        prices = data.get("price_list", [])
+        times = data.get("time_list", [])
+        total = len(values)
+        if total == 0:
+            return "**Empty dataset**\n\n"
+        # Show last 20
+        n = min(20, total)
+        out = ""
+        if total > 20:
+            out += f"*(showing last {n} of {total} days)*\n\n"
+        out += "```\n"
+        out += f" {'Date':>12} | {'FG':>4} | {'Sentiment':<14} | {'BTC Price':>12}\n"
+        out += f" {'─' * 12} | {'─' * 4} | {'─' * 14} | {'─' * 12}\n"
+        for i in range(total - n, total):
+            ts = times[i] if i < len(times) else 0
+            val = int(values[i]) if i < len(values) else 0
+            price = prices[i] if i < len(prices) else 0
+            if ts:
+                try:
+                    t = float(ts)
+                    if t > 1e12:
+                        t /= 1000
+                    date_str = datetime.fromtimestamp(t, tz=WIB).strftime("%Y-%m-%d")
+                except (ValueError, OSError):
+                    date_str = "—"
+            else:
+                date_str = "—"
+            label = _fg_label(val)
+            out += f" {date_str:>12} | {val:>4} | {label:<14} | ${price:>11,.0f}\n"
+        out += "```\n\n"
+        # Current summary
+        latest_val = int(values[-1])
+        latest_price = prices[-1] if prices else 0
+        out += f"**Current:** {latest_val} — {_fg_label(latest_val)} (BTC ${latest_price:,.0f})\n\n"
+        return out
+
+    # Legacy fallback: list of dicts [{t, value, classification}, ...]
+    if isinstance(data, list):
+        show = data[-20:] if len(data) > 20 else data
+        out = ""
+        if len(data) > 20:
+            out += f"*(showing last {len(show)} of {len(data)})*\n\n"
+        out += "```\n"
+        out += f" {'Date':>12} | {'Value':>6} | Classification\n"
+        out += f" {'─' * 12} | {'─' * 6} | ──────────────\n"
+        for row in show:
+            if not isinstance(row, dict):
+                continue
+            t = _get(row, "t", "time", "timestamp", "date", default=0)
+            val = _get(row, "value", "v", default=0)
+            cls = _get(row, "classification", "valueClassification",
+                       "value_classification", default="—")
+            if t:
+                try:
+                    ts = float(t)
+                    if ts > 1e12:
+                        ts /= 1000
+                    date_str = datetime.fromtimestamp(ts, tz=WIB).strftime("%Y-%m-%d")
+                except (ValueError, OSError):
+                    date_str = str(t)[:12]
+            else:
+                date_str = "—"
+            out += f" {date_str:>12} | {int(float(val)):>6} | {cls}\n"
+        out += "```\n\n"
+        if show and isinstance(show[-1], dict):
+            v = int(float(_get(show[-1], "value", "v", default=0)))
+            c = _get(show[-1], "classification", "valueClassification",
+                     "value_classification", default="?")
+            out += f"**Current:** {v} — {c}\n\n"
+        return out
+
+    return f"**Unexpected data format:** {str(data)[:200]}\n\n"
+
+
+def _fg_label(val: int) -> str:
+    """Map Fear & Greed value to sentiment label."""
+    if val <= 20:
+        return "Extreme Fear"
+    elif val <= 40:
+        return "Fear"
+    elif val <= 60:
+        return "Neutral"
+    elif val <= 80:
+        return "Greed"
+    else:
+        return "Extreme Greed"
+
+
+def _fmt_large_orders(data: list) -> str:
+    """Format large limit orders (current open + history).
+
+    Fields: price, order_side (1=Sell,2=Buy), order_state (1=Open,2=Filled,3=Cancelled),
+    start_usd_value, current_usd_value, executed_usd_value, start_time, current_time.
+    """
+    if not data:
+        return "**No large orders found.**\n\n"
+
+    side_map = {1: "SELL", 2: "BUY"}
+    state_map = {1: "Open", 2: "Filled", 3: "Cancelled"}
+
+    # Separate buys and sells
+    buys = [o for o in data if isinstance(o, dict) and o.get("order_side") == 2]
+    sells = [o for o in data if isinstance(o, dict) and o.get("order_side") == 1]
+
+    total_buy_usd = sum(float(o.get("current_usd_value") or 0) for o in buys)
+    total_sell_usd = sum(float(o.get("current_usd_value") or 0) for o in sells)
+
+    out = f"**Summary:** {len(buys)} BUY orders (${total_buy_usd:,.0f}) | "
+    out += f"{len(sells)} SELL orders (${total_sell_usd:,.0f})\n\n"
+
+    # Sort by USD value descending, show top 25
+    sorted_orders = sorted(data, key=lambda o: float(o.get("current_usd_value") or o.get("start_usd_value") or 0), reverse=True)
+    show = sorted_orders[:25]
+    if len(data) > 25:
+        out += f"*(showing top {len(show)} of {len(data)} by USD value)*\n\n"
+
     out += "```\n"
-    out += f" {'Date':>12} | {'Value':>6} | Classification\n"
-    out += f" {'─' * 12} | {'─' * 6} | ──────────────\n"
-    for row in show:
-        t = _get(row, "t", "time", "timestamp", "date", default=0)
-        val = _get(row, "value", "v", default=0)
-        cls = _get(row, "classification", "valueClassification",
-                   "value_classification", default="—")
-        if t:
-            try:
-                ts = float(t)
-                if ts > 1e12:
-                    ts /= 1000
-                date_str = datetime.fromtimestamp(ts, tz=WIB).strftime("%Y-%m-%d")
-            except (ValueError, OSError):
-                date_str = str(t)[:12]
-        else:
+    out += f" {'Side':<5} | {'Price':>12} | {'Size USD':>12} | {'Exec USD':>12} | {'Exec%':>6} | {'State':<9} | {'Placed':>12}\n"
+    out += f" {'─' * 5} | {'─' * 12} | {'─' * 12} | {'─' * 12} | {'─' * 6} | {'─' * 9} | {'─' * 12}\n"
+
+    for o in show:
+        side = side_map.get(o.get("order_side"), "?")
+        price = float(o.get("limit_price") or o.get("price") or 0)
+        start_usd = float(o.get("start_usd_value") or 0)
+        cur_usd = float(o.get("current_usd_value") or 0)
+        exec_usd = float(o.get("executed_usd_value") or 0)
+        exec_pct = (exec_usd / start_usd * 100) if start_usd > 0 else 0
+        state = state_map.get(o.get("order_state"), "?")
+
+        t = o.get("start_time") or 0
+        try:
+            ts = float(t)
+            if ts > 1e12:
+                ts /= 1000
+            date_str = datetime.fromtimestamp(ts, tz=WIB).strftime("%m-%d %H:%M")
+        except (ValueError, OSError):
             date_str = "—"
-        out += f" {date_str:>12} | {int(float(val)):>6} | {cls}\n"
+
+        out += (f" {side:<5} | {_fmt_num(price):>12} | {_fmt_num(cur_usd):>12} | "
+                f"{_fmt_num(exec_usd):>12} | {exec_pct:>5.1f}% | {state:<9} | {date_str:>12}\n")
+
     out += "```\n\n"
-    # Latest value summary
-    if show:
-        latest = show[-1]
-        v = int(float(_get(latest, "value", "v", default=0)))
-        c = _get(latest, "classification", "valueClassification",
-                 "value_classification", default="?")
-        out += f"**Current:** {v} — {c}\n\n"
     return out
+
+
+def _fmt_indicator_snapshot(data: dict) -> str:
+    """Format a single-coin indicator snapshot (RSI/MA/EMA/MACD from list endpoint).
+
+    Data is a single dict like {symbol, rsi_15m, price_change_percent_15m, ...}
+    or {symbol, close_price, ma_1m, ma_5m, ...}.
+    """
+    if not data or not isinstance(data, dict):
+        return "**No data.**\n\n"
+
+    sym = data.get("symbol", "?")
+    price = data.get("current_price") or data.get("close_price")
+
+    out = ""
+    if price:
+        out += f"**{sym}** — ${float(price):,.1f}\n\n"
+
+    # Detect indicator type by keys
+    keys = list(data.keys())
+    rsi_keys = sorted([k for k in keys if k.startswith("rsi_")],
+                      key=lambda k: _tf_sort_key(k.replace("rsi_", "")))
+    ma_keys = sorted([k for k in keys if k.startswith("ma_") and not k.startswith("macd")],
+                     key=lambda k: _tf_sort_key(k.replace("ma_", "")))
+    ema_keys = sorted([k for k in keys if k.startswith("ema_")],
+                      key=lambda k: _tf_sort_key(k.replace("ema_", "")))
+    macd_keys = sorted([k for k in keys if k.startswith("macd_")],
+                       key=lambda k: _tf_sort_key(k.replace("macd_", "")))
+    signal_keys = sorted([k for k in keys if k.startswith("signal_")],
+                         key=lambda k: _tf_sort_key(k.replace("signal_", "")))
+
+    out += "```\n"
+    if rsi_keys:
+        pct_keys = {k.replace("rsi_", "price_change_percent_"): k for k in rsi_keys}
+        out += f" {'TF':>5} | {'RSI':>6} | {'Chg%':>7} | Signal\n"
+        out += f" {'─' * 5} | {'─' * 6} | {'─' * 7} | ──────────\n"
+        for k in rsi_keys:
+            tf = k.replace("rsi_", "")
+            v = data.get(k)
+            pct_k = f"price_change_percent_{tf}"
+            pct = data.get(pct_k, 0)
+            if v is not None:
+                signal = "OVERBOUGHT" if v >= 70 else "OVERSOLD" if v <= 30 else "—"
+                out += f" {tf:>5} | {v:>6.1f} | {float(pct or 0):>+6.2f}% | {signal}\n"
+    elif ma_keys:
+        out += f" {'TF':>5} | {'MA':>12} | vs Price\n"
+        out += f" {'─' * 5} | {'─' * 12} | ─────────\n"
+        for k in ma_keys:
+            tf = k.replace("ma_", "")
+            v = data.get(k)
+            if v is not None:
+                diff = ""
+                if price:
+                    d = ((float(price) - float(v)) / float(v)) * 100
+                    diff = f"{d:>+.2f}%"
+                out += f" {tf:>5} | ${float(v):>11,.1f} | {diff}\n"
+    elif ema_keys:
+        out += f" {'TF':>5} | {'EMA':>12} | vs Price\n"
+        out += f" {'─' * 5} | {'─' * 12} | ─────────\n"
+        for k in ema_keys:
+            tf = k.replace("ema_", "")
+            v = data.get(k)
+            if v is not None:
+                diff = ""
+                if price:
+                    d = ((float(price) - float(v)) / float(v)) * 100
+                    diff = f"{d:>+.2f}%"
+                out += f" {tf:>5} | ${float(v):>11,.1f} | {diff}\n"
+    elif macd_keys:
+        out += f" {'TF':>5} | {'MACD':>12} | {'Signal':>12} | {'Hist':>12}\n"
+        out += f" {'─' * 5} | {'─' * 12} | {'─' * 12} | {'─' * 12}\n"
+        for k in macd_keys:
+            tf = k.replace("macd_", "")
+            m = data.get(k)
+            sig_k = f"signal_{tf}"
+            s = data.get(sig_k)
+            if m is not None:
+                s_val = float(s) if s is not None else 0
+                hist = float(m) - s_val
+                s_str = f"{s_val:>12.2f}" if s is not None else f"{'—':>12}"
+                out += (f" {tf:>5} | {float(m):>12.2f} | "
+                        f"{s_str} | {hist:>+12.2f}\n")
+    out += "```\n\n"
+    return out
+
+
+_TF_ORDER = {"1m": 1, "5m": 2, "15m": 3, "30m": 4, "1h": 5, "4h": 6,
+             "12h": 7, "24h": 8, "1d": 9, "1w": 10}
+
+
+def _tf_sort_key(tf: str) -> int:
+    return _TF_ORDER.get(tf, 99)
 
 
 def _fmt_coins_markets(data: list) -> str:
@@ -1213,9 +1593,9 @@ def _fmt_news(data: list) -> str:
         return "**No news articles.**\n\n"
     out = ""
     for i, article in enumerate(data[:20], 1):
-        title = _get(article, "title", "headline", default="Untitled")
-        source = _get(article, "source", "sourceName", default="")
-        t = _get(article, "createTime", "time", "timestamp", "publishedAt", default=0)
+        title = _get(article, "article_title", "title", "headline", default="Untitled")
+        source = _get(article, "source_name", "source", "sourceName", default="")
+        t = _get(article, "article_release_time", "createTime", "time", "timestamp", "publishedAt", default=0)
         date_str = ""
         if t:
             try:

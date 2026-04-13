@@ -38,6 +38,7 @@ from .formatters import (
     _fmt_whale_alert,
     _fmt_fear_greed,
     _fmt_spot_netflow,
+    _fmt_ob_heatmap,
 )
 
 WIB = timezone(timedelta(hours=7))
@@ -639,4 +640,4 @@ def register_coinglass_tools(mcp, client: CoinGlassClient, config: Config):
             "interval": interval,
             "limit": min(limit, 100),
         })
-        return fmt(result, f"Orderbook Heatmap — {normalize_symbol(symbol)}")
+        return fmt_parsed(result, f"Orderbook Heatmap — {normalize_symbol(symbol)}", _fmt_ob_heatmap)

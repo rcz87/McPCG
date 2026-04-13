@@ -34,8 +34,43 @@ from .formatters import (
     _fmt_p2_top_position_ls,
     _fmt_p2_spot_large_orders,
     _fmt_nansen_flows,
+    _fmt_scan_cvd,
+    _fmt_scan_oi,
+    _fmt_scan_ob_delta,
+    _fmt_scan_price,
+    _fmt_scan_taker,
+    _fmt_scan_ls_ratio,
+    _fmt_scan_fr,
+    _fmt_liq_history,
     WIB,
 )
+
+# Map metric names to their formatters for compare/trend tools
+_METRIC_FORMATTERS = {
+    "spot_cvd": lambda data: _fmt_scan_cvd(data, "Spot CVD"),
+    "futures_cvd": lambda data: _fmt_scan_cvd(data, "Futures CVD"),
+    "open_interest": lambda data: _fmt_scan_oi(data),
+    "funding_rate": lambda data: _fmt_scan_fr(data) if isinstance(data, list) and data and isinstance(data[0], dict) and "exchange" in data[0] else json.dumps(data, indent=2, default=str),
+    "orderbook": lambda data: _fmt_scan_ob_delta(data),
+    "price": lambda data: _fmt_scan_price(data),
+    "taker": lambda data: _fmt_scan_taker(data),
+    "long_short": lambda data: _fmt_scan_ls_ratio(data),
+    "liquidation": lambda data: _fmt_liq_history(data),
+}
+
+
+def _format_metric_data(metric: str, data) -> str:
+    """Format metric data using the appropriate formatter, fallback to JSON."""
+    formatter = _METRIC_FORMATTERS.get(metric)
+    if formatter and isinstance(data, (list, dict)) and data:
+        try:
+            return formatter(data)
+        except Exception:
+            pass
+    # Fallback: compact JSON (last 5 items for lists)
+    if isinstance(data, list) and len(data) > 5:
+        return json.dumps(data[-5:], indent=2, default=str) + "\n\n"
+    return json.dumps(data, indent=2, default=str) + "\n\n"
 
 
 def register_coinglass_composite_tools(mcp, client: CoinGlassClient, config: Config):
@@ -1847,11 +1882,7 @@ def register_coinglass_composite_tools(mcp, client: CoinGlassClient, config: Con
         if current is not None:
             output += f"### Current\n"
             output += _age_banner(current)
-            data = current.data
-            if isinstance(data, list) and len(data) > 5:
-                output += json.dumps(data[-5:], indent=2, default=str) + "\n\n"
-            else:
-                output += json.dumps(data, indent=2, default=str) + "\n\n"
+            output += _format_metric_data(metric, current.data)
         else:
             output += f"### Current\n**ERROR fetching live data:** {current_err}\n\n"
 
@@ -1883,10 +1914,7 @@ def register_coinglass_composite_tools(mcp, client: CoinGlassClient, config: Con
                     f"(drift {drift:.0f}min). Interpret with caution.\n\n"
                 )
 
-            if isinstance(hist_data, list) and len(hist_data) > 5:
-                output += json.dumps(hist_data[-5:], indent=2, default=str) + "\n\n"
-            else:
-                output += json.dumps(hist_data, indent=2, default=str) + "\n\n"
+            output += _format_metric_data(metric, hist_data)
         else:
             output += (
                 f"### Historical\n"
@@ -1957,19 +1985,16 @@ def register_coinglass_composite_tools(mcp, client: CoinGlassClient, config: Con
             age = snap["age_minutes"]
             data = snap["data"]
             age_label = f"{age:.0f}min ago"
-            if isinstance(data, list) and len(data) > 0:
-                last = data[-1] if isinstance(data[-1], dict) else data[-1]
-                output += f"**{ts}** ({age_label}) — last: {json.dumps(last, default=str)}\n\n"
-                # Track CVD values for reset detection
+            output += f"### {ts} ({age_label})\n"
+            output += _format_metric_data(metric, data)
+            # Track CVD values for reset detection
+            if isinstance(data, list) and data:
+                last = data[-1]
                 if isinstance(last, dict):
                     for key in ("cum_vol_delta", "cvd", "v", "value"):
                         if key in last:
                             cvd_values.append((ts, float(last[key])))
                             break
-            elif isinstance(data, dict):
-                output += f"**{ts}** ({age_label}) — {json.dumps(data, default=str)[:200]}\n\n"
-            else:
-                output += f"**{ts}** ({age_label}) — {str(data)[:200]}\n\n"
 
         # Detect CVD resets (sudden drops >40% between consecutive snapshots)
         if "cvd" in metric and len(cvd_values) >= 2:

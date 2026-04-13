@@ -40,8 +40,33 @@ from .formatters import (
     _fmt_scan_cvd,
     _fmt_scan_taker,
     _fmt_indicator_ts,
+    _fmt_indicator_snapshot,
     _fmt_news,
+    _fmt_large_orders,
+    _fmt_ob_heatmap,
+    _fmt_fr_ohlc,
+    _fmt_fr_cumulative,
+    make_envelope,
 )
+
+
+def _indicator_by_symbol(result: FetchResult, symbol: str, indicator: str, formatter) -> str:
+    """Extract a single coin from a list-endpoint result and format it."""
+    data = result.data
+    if not isinstance(data, list):
+        return make_envelope("failed", "coinglass",
+                             f"**{indicator}:** unexpected response format.",
+                             data_age_seconds=result.age_seconds)
+    sym_upper = symbol.upper()
+    match = next((d for d in data if isinstance(d, dict)
+                  and d.get("symbol", "").upper() == sym_upper), None)
+    if match is None:
+        return make_envelope("failed", "coinglass",
+                             f"**{indicator}:** symbol '{symbol}' not found in {len(data)} coins.",
+                             data_age_seconds=result.age_seconds)
+    content = f"## {indicator} — {sym_upper}\n\n" + formatter(match)
+    return make_envelope("success", "coinglass", content,
+                         data_age_seconds=result.age_seconds)
 
 
 def register_coinglass_category_tools(mcp, client: CoinGlassClient):
@@ -272,7 +297,7 @@ def register_coinglass_category_tools(mcp, client: CoinGlassClient):
                 "interval": interval,
                 "limit": limit,
             })
-            return fmt_parsed(result, f"FR History OHLC — {pair} ({exchange})", _fmt_scan_price)
+            return fmt_parsed(result, f"FR History OHLC — {pair} ({exchange})", _fmt_fr_ohlc)
 
         elif action == "oi_weight":
             pair = to_pair(symbol)
@@ -326,7 +351,7 @@ def register_coinglass_category_tools(mcp, client: CoinGlassClient):
                         data=filtered, age_seconds=result.age_seconds,
                         is_cached=result.is_cached, fetched_at=result.fetched_at,
                     )
-            return fmt(result, f"Cumulative FR — {sym or 'All Coins'} ({range})")  # auto-table
+            return fmt_parsed(result, f"Cumulative FR — {sym or 'All Coins'} ({range})", _fmt_fr_cumulative)
 
         elif action == "arbitrage":
             params: dict = {"usd": usd}
@@ -572,14 +597,14 @@ def register_coinglass_category_tools(mcp, client: CoinGlassClient):
                 "interval": interval,
                 "limit": min(limit, 100),
             })
-            return fmt(result, f"OB Heatmap — {pair} ({exchange})")
+            return fmt_parsed(result, f"OB Heatmap — {pair} ({exchange})", _fmt_ob_heatmap)
 
         elif action == "large_orders":
             result = await client.get("/api/futures/orderbook/large-limit-order", {
                 "exchange": exchange,
                 "symbol": pair,
             })
-            return fmt(result, f"Large Orders — {pair} ({exchange})")
+            return fmt_parsed(result, f"Large Orders — {pair} ({exchange})", _fmt_large_orders)
 
         elif action == "large_orders_history":
             import time as _time
@@ -594,7 +619,7 @@ def register_coinglass_category_tools(mcp, client: CoinGlassClient):
                 "state": state,
             })
             state_label = {1: "Open", 2: "Filled", 3: "Cancelled"}.get(state, str(state))
-            return fmt(result, f"Large Orders History — {pair} ({exchange}, {state_label})")
+            return fmt_parsed(result, f"Large Orders History — {pair} ({exchange}, {state_label})", _fmt_large_orders)
 
         else:
             return _err(f"Unknown action '{action}'. Available: pair_bidask, aggregated_bidask, heatmap, large_orders, large_orders_history")
@@ -830,7 +855,7 @@ def register_coinglass_category_tools(mcp, client: CoinGlassClient):
                 "/api/spot/orderbook/history",
                 {"exchange": exchange, "symbol": pair, "interval": interval, "limit": hm_limit},
             )
-            return fmt(result, f"Spot OB Heatmap — {pair} ({exchange}, {interval})")
+            return fmt_parsed(result, f"Spot OB Heatmap — {pair} ({exchange}, {interval})", _fmt_ob_heatmap)
 
         elif action == "large_orders":
             result = await client.get(
@@ -872,17 +897,15 @@ def register_coinglass_category_tools(mcp, client: CoinGlassClient):
         slow_window: int = 26,
         signal_window: int = 9,
     ) -> str:
-        """Futures Technical Indicators — 10 endpoints in one tool.
+        """Futures Technical Indicators — 8 endpoints in one tool.
 
-    Actions (per-pair history — need symbol + exchange + interval):
-    - pair_rsi: RSI history for a trading pair (window default 14)
-    - pair_ma: Moving Average history (window default 10)
-    - pair_ema: Exponential MA history (window default 10)
-    - pair_macd: MACD history (fast=12, slow=26, signal=9)
-    - pair_atr: Average True Range history (window default 14)
-    - whale_index: Whale Index history for a pair
+    Actions (per-coin snapshot — uses list endpoint, filtered by symbol):
+    - pair_rsi: RSI for a coin across all timeframes (15m–1w)
+    - pair_ma: Moving Average for a coin across all timeframes
+    - pair_ema: Exponential MA for a coin across all timeframes
+    - pair_macd: MACD for a coin across all timeframes
 
-    Actions (all-coins snapshot — no params needed, Standard+):
+    Actions (all-coins snapshot — no params needed):
     - rsi_list: RSI across all coins & timeframes
     - ma_list: MA across all coins & timeframes
     - ema_list: EMA across all coins & timeframes
@@ -920,58 +943,31 @@ def register_coinglass_category_tools(mcp, client: CoinGlassClient):
             result = await client.get("/api/futures/macd/list", {})
             return fmt(result, "Futures MACD List (all coins)")
 
-        # --- Per-pair history endpoints ---
+        # --- Per-coin snapshot (uses list endpoint + filter by symbol) ---
+        # v4 removed /api/futures/indicators/* per-pair history endpoints.
+        # These now fetch the all-coins list and extract the requested symbol.
         elif action == "pair_rsi":
-            result = await client.get(
-                "/api/futures/indicators/rsi",
-                {"exchange": exchange, "symbol": pair, "interval": interval,
-                 "limit": limit, "window": window, "series_type": series_type},
-            )
-            return fmt_parsed(result, f"RSI — {pair} ({exchange}, {interval}, w{window})", _fmt_indicator_ts)
+            result = await client.get("/api/futures/rsi/list", {})
+            return _indicator_by_symbol(result, sym, "RSI", _fmt_indicator_snapshot)
 
         elif action == "pair_ma":
-            result = await client.get(
-                "/api/futures/indicators/ma",
-                {"exchange": exchange, "symbol": pair, "interval": interval,
-                 "limit": limit, "window": window, "series_type": series_type},
-            )
-            return fmt_parsed(result, f"MA — {pair} ({exchange}, {interval}, w{window})", _fmt_indicator_ts)
+            result = await client.get("/api/futures/ma/list", {})
+            return _indicator_by_symbol(result, sym, "MA", _fmt_indicator_snapshot)
 
         elif action == "pair_ema":
-            result = await client.get(
-                "/api/futures/indicators/ema",
-                {"exchange": exchange, "symbol": pair, "interval": interval,
-                 "limit": limit, "window": window, "series_type": series_type},
-            )
-            return fmt_parsed(result, f"EMA — {pair} ({exchange}, {interval}, w{window})", _fmt_indicator_ts)
+            result = await client.get("/api/futures/ema/list", {})
+            return _indicator_by_symbol(result, sym, "EMA", _fmt_indicator_snapshot)
 
         elif action == "pair_macd":
-            result = await client.get(
-                "/api/futures/indicators/macd",
-                {"exchange": exchange, "symbol": pair, "interval": interval,
-                 "limit": limit, "series_type": series_type,
-                 "fast_window": fast_window, "slow_window": slow_window,
-                 "signal_window": signal_window},
-            )
-            return fmt_parsed(result, f"MACD — {pair} ({exchange}, {interval}, {fast_window}/{slow_window}/{signal_window})", _fmt_indicator_ts)
+            result = await client.get("/api/futures/macd/list", {})
+            return _indicator_by_symbol(result, sym, "MACD", _fmt_indicator_snapshot)
 
-        elif action == "pair_atr":
-            result = await client.get(
-                "/api/futures/indicators/avg-true-range",
-                {"exchange": exchange, "symbol": pair, "interval": interval,
-                 "limit": limit, "window": window},
-            )
-            return fmt_parsed(result, f"ATR — {pair} ({exchange}, {interval}, w{window})", _fmt_indicator_ts)
-
-        elif action == "whale_index":
-            result = await client.get(
-                "/api/futures/whale-index/history",
-                {"exchange": exchange, "symbol": pair, "interval": interval, "limit": limit},
-            )
-            return fmt_parsed(result, f"Whale Index — {pair} ({exchange}, {interval})", _fmt_indicator_ts)
+        elif action in ("pair_atr", "whale_index"):
+            return _err(f"'{action}' is not available in CoinGlass v4 API. "
+                        f"Use rsi_list, ma_list, ema_list, macd_list for indicator snapshots.")
 
         else:
-            return _err(f"Unknown action '{action}'. Available: rsi_list, ma_list, ema_list, macd_list, pair_rsi, pair_ma, pair_ema, pair_macd, pair_atr, whale_index")
+            return _err(f"Unknown action '{action}'. Available: rsi_list, ma_list, ema_list, macd_list, pair_rsi, pair_ma, pair_ema, pair_macd")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # CATEGORY TOOL — Index, News & Other (3 endpoints)
