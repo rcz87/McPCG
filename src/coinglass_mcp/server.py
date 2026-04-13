@@ -100,7 +100,9 @@ mcp = FastMCP(
         "Data older than 2 minutes has WARNING. Data older than 5 minutes must NOT be used for entries."
     ),
     lifespan=lifespan,
-    auth=BearerTokenAuth() if _AUTH_TOKEN else None,
+    # Auth disabled — claude.ai connector only supports OAuth, not Bearer tokens.
+    # Token kept in .env for future use when claude.ai adds header support.
+    # auth=BearerTokenAuth() if _AUTH_TOKEN else None,
 )
 
 
@@ -117,7 +119,7 @@ async def health_check(request: Request) -> JSONResponse:
         "uptime_seconds": round(uptime),
         "uptime_human": f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m",
         "tools": 69,
-        "auth_enabled": bool(_AUTH_TOKEN),
+        "auth_enabled": False,
         "timestamp": int(time.time()),
     })
 
