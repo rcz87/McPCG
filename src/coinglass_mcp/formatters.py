@@ -314,6 +314,42 @@ def _ts_wib(t: Any) -> str:
         return "??:??"
 
 
+def _ts_date_wib(t: Any) -> str:
+    """Convert unix timestamp (seconds or milliseconds) to YYYY-MM-DD WIB."""
+    if t is None or t == 0:
+        return "—"
+    try:
+        ts = float(t)
+        if ts > 1e12:
+            ts /= 1000
+        return datetime.fromtimestamp(ts, tz=WIB).strftime("%Y-%m-%d")
+    except (ValueError, OSError):
+        return "—"
+
+
+def _detect_daily(data: list) -> bool:
+    """Detect if time-series data has daily (or longer) intervals."""
+    if len(data) < 2:
+        return False
+    t0 = _get(data[0], "t", "time", "timestamp", "createTime", default=0) if isinstance(data[0], dict) else 0
+    t1 = _get(data[1], "t", "time", "timestamp", "createTime", default=0) if isinstance(data[1], dict) else 0
+    try:
+        f0, f1 = float(t0), float(t1)
+        # Normalize ms → seconds
+        if f0 > 1e12:
+            f0 /= 1000
+        if f1 > 1e12:
+            f1 /= 1000
+        return abs(f1 - f0) >= 72000  # >= 20 hours
+    except (ValueError, TypeError):
+        return False
+
+
+def _ts_auto(t: Any, is_daily: bool) -> str:
+    """Format timestamp — date for daily data, HH:MM for intraday."""
+    return _ts_date_wib(t) if is_daily else _ts_wib(t)
+
+
 def _fmt_num(v: float, prefix: str = "$", signed: bool = False) -> str:
     """Format number as readable string. $1.23M, $456K, $1,234.
     signed=True adds +/- prefix for delta values."""
@@ -562,10 +598,13 @@ def _fmt_fr_ohlc(data: list) -> str:
 
     show = data[-15:]
     total = len(data)
+    daily = _detect_daily(show)
+    tw = 12 if daily else 6
+    tl = "Date" if daily else "Time"
     out = f"*(last {len(show)} of {total})*\n\n"
     out += "```\n"
-    out += f"{'Time':>6} | {'Open':>10} | {'High':>10} | {'Low':>10} | {'Close':>10}\n"
-    out += f"{'─' * 6} | {'─' * 10} | {'─' * 10} | {'─' * 10} | {'─' * 10}\n"
+    out += f"{tl:>{tw}} | {'Open':>10} | {'High':>10} | {'Low':>10} | {'Close':>10}\n"
+    out += f"{'─' * tw} | {'─' * 10} | {'─' * 10} | {'─' * 10} | {'─' * 10}\n"
 
     closes = []
     for row in show:
@@ -577,7 +616,7 @@ def _fmt_fr_ohlc(data: list) -> str:
         l = float(_get(row, "l", "low", default=0))
         c = float(_get(row, "c", "close", default=0))
         closes.append(c)
-        out += (f"{_ts_wib(t):>6} | {o:>+9.4f}% | {h:>+9.4f}% | "
+        out += (f"{_ts_auto(t, daily):>{tw}} | {o:>+9.4f}% | {h:>+9.4f}% | "
                 f"{l:>+9.4f}% | {c:>+9.4f}%\n")
 
     out += "```\n\n"
@@ -640,10 +679,13 @@ def _fmt_scan_price(data: list) -> str:
 
     show = data[-15:]
     total = len(data)
+    daily = _detect_daily(show)
+    tw = 12 if daily else 6
+    tl = "Date" if daily else "Time"
     out = f"*(last {len(show)} of {total})*\n\n"
     out += "```\n"
-    out += f"{'Time':>6} | {'Open':>12} | {'High':>12} | {'Low':>12} | {'Close':>12} | {'Vol':>10}\n"
-    out += f"{'─'*6} | {'─'*12} | {'─'*12} | {'─'*12} | {'─'*12} | {'─'*10}\n"
+    out += f"{tl:>{tw}} | {'Open':>12} | {'High':>12} | {'Low':>12} | {'Close':>12} | {'Vol':>10}\n"
+    out += f"{'─'*tw} | {'─'*12} | {'─'*12} | {'─'*12} | {'─'*12} | {'─'*10}\n"
 
     highs = []
     lows = []
@@ -661,7 +703,7 @@ def _fmt_scan_price(data: list) -> str:
         highs.append(h)
         lows.append(l)
         last_close = c
-        out += f"{_ts_wib(t):>6} | {_fmt_num(o, '$'):>12} | {_fmt_num(h, '$'):>12} | {_fmt_num(l, '$'):>12} | {_fmt_num(c, '$'):>12} | {_fmt_num(v, '$'):>10}\n"
+        out += f"{_ts_auto(t, daily):>{tw}} | {_fmt_num(o, '$'):>12} | {_fmt_num(h, '$'):>12} | {_fmt_num(l, '$'):>12} | {_fmt_num(c, '$'):>12} | {_fmt_num(v, '$'):>10}\n"
 
     out += "```\n\n"
 
@@ -1550,7 +1592,7 @@ def _fmt_coins_markets(data: list) -> str:
 
 
 def _fmt_indicator_ts(data: list) -> str:
-    """Format indicator time-series (RSI, MA, EMA, MACD, ATR, Whale Index)."""
+    """Format indicator time-series (RSI, MA, EMA, MACD, ATR, Whale Index, Altcoin Season)."""
     if not data:
         return "**Empty dataset**\n\n"
     show = data[-20:] if len(data) > 20 else data
@@ -1562,12 +1604,18 @@ def _fmt_indicator_ts(data: list) -> str:
     val_keys = [k for k in sample.keys()
                 if k not in ("t", "time", "timestamp", "createTime")
                 and not isinstance(sample[k], (list, dict))][:4]
+
+    # Detect daily data: if timestamps differ by >= 20h, use date format
+    is_daily = _detect_daily(show)
+
+    time_w = 12 if is_daily else 6
+    time_label = "Date" if is_daily else "Time"
     out += "```\n"
-    header = f" {'Time':>6}"
+    header = f" {time_label:>{time_w}}"
     for k in val_keys:
         header += f" | {k:>12}"
     out += header + "\n"
-    sep = f" {'─' * 6}"
+    sep = f" {'─' * time_w}"
     for k in val_keys:
         sep += f" | {'─' * 12}"
     out += sep + "\n"
@@ -1575,11 +1623,12 @@ def _fmt_indicator_ts(data: list) -> str:
         if not isinstance(row, dict):
             continue
         t = _get(row, "t", "time", "timestamp", "createTime", default=0)
-        line = f" {_ts_wib(t):>6}"
+        ts_str = _ts_date_wib(t) if is_daily else _ts_wib(t)
+        line = f" {ts_str:>{time_w}}"
         for k in val_keys:
             v = row.get(k)
             if v is not None:
-                line += f" | {_fmt_num(float(v)):>12}"
+                line += f" | {_fmt_num(float(v), prefix=''):>12}"
             else:
                 line += f" | {'—':>12}"
         out += line + "\n"
