@@ -924,6 +924,7 @@ def register_coinglass_category_tools(mcp, client: CoinGlassClient):
         signal_window: MACD signal period (default 9)
         """
         action = action.strip().lower()
+        sym = normalize_symbol(symbol)
         pair = to_pair(symbol)
 
         # --- All-coins list endpoints (no params) ---
