@@ -10,8 +10,8 @@
 #   */5 * * * * bash /home/$USER/coinglass-mcp/deploy/autodeploy.sh >> /home/$USER/coinglass-mcp/logs/autodeploy.log 2>&1
 # ═══════════════════════════════════════════════════════════════════════════════
 
-APP_DIR="/home/${USER:-$(whoami)}/coinglass-mcp"
-BRANCH="claude/divisional-map-cloud-sync-ZYH5I"
+APP_DIR="/root/McPCG"
+BRANCH="Rcz"
 LOCKFILE="/tmp/autodeploy.lock"
 
 # Prevent concurrent runs
@@ -32,12 +32,18 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Compare local vs remote
+# Compare local vs remote — only deploy if remote has NEW commits to pull
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse "origin/$BRANCH")
 
 if [ "$LOCAL" = "$REMOTE" ]; then
     exit 0  # No changes, silent exit
+fi
+
+# Check if remote actually has commits we don't have
+BEHIND=$(git log HEAD.."origin/$BRANCH" --oneline 2>/dev/null | wc -l)
+if [ "$BEHIND" -eq 0 ]; then
+    exit 0  # Local is ahead or diverged, nothing to pull
 fi
 
 # ── New commits detected — deploy! ──
