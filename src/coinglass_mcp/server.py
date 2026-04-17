@@ -51,6 +51,7 @@ from .coinglass_composite_tools import register_coinglass_composite_tools
 from .coinglass_tools import register_coinglass_tools
 from .config import Config
 from .data_binance_tool import register_data_binance_tool
+from .forex import register_forex_tools, start_forex_pollers, stop_forex_pollers
 from .formatters import _tool_envelope, _err
 from .nansen import register_nansen_tools
 
@@ -82,9 +83,11 @@ class BearerTokenAuth(AuthProvider):
 async def lifespan(app):
     """Manage shared httpx client + SQLite storage lifecycle."""
     await client.start()
+    start_forex_pollers()
     try:
         yield
     finally:
+        stop_forex_pollers()
         await client.close()
         await close_binance_client()
 
@@ -118,7 +121,7 @@ async def health_check(request: Request) -> JSONResponse:
         "server": "coinglass-mcp",
         "uptime_seconds": round(uptime),
         "uptime_human": f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m",
-        "tools": 69,
+        "tools": 79,
         "auth_enabled": False,
         "timestamp": int(time.time()),
     })
@@ -147,6 +150,9 @@ register_coinglass_composite_tools(mcp, client, config)
 
 # ─── Data Binance Composite Tool ─────────────────────────────────────────────
 register_data_binance_tool(mcp)
+
+# ─── Forex Tools (MyFXBook + CFTC COT) ───────────────────────────────────────
+register_forex_tools(mcp)
 
 
 # ─── Chart Tool ──────────────────────────────────────────────────────────────
