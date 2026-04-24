@@ -244,6 +244,8 @@ from .binance_futures import (
     binance_futures_cvd,
 )
 
+from .multi_cvd import multi_exchange_cvd_live
+
 # Register Binance Spot tools
 mcp.tool()(binance_spot_price)
 mcp.tool()(binance_spot_depth)
@@ -268,6 +270,7 @@ mcp.tool()(binance_futures_depth)
 mcp.tool()(binance_futures_ticker_24h)
 mcp.tool()(binance_futures_liquidation)
 mcp.tool()(binance_futures_cvd)
+mcp.tool()(multi_exchange_cvd_live)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
