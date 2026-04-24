@@ -37,7 +37,7 @@ def _multi_source_tag(ok: list[str]) -> str:
 
     Preserves canonical order: binance → okx → bybit.
     """
-    order = ["binance", "okx", "bybit"]
+    order = ["binance", "okx", "bybit", "hyperliquid"]
     parts = [e for e in order if e in ok]
     if parts:
         return "+".join(parts)
@@ -191,7 +191,7 @@ async def binance_futures_price(symbol: str = "") -> str:
         "",
         "**By exchange:**",
     ]
-    for ex in ("binance", "okx", "bybit"):
+    for ex in ("binance", "okx", "bybit", "hyperliquid"):
         d = by.get(ex)
         if not d:
             continue
@@ -315,10 +315,12 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
         agg = current["aggregated"]
         by = current["by_exchange"]
         parts = []
-        for ex in ("binance", "okx", "bybit"):
+        for ex in ("binance", "okx", "bybit", "hyperliquid"):
             d = by.get(ex)
             if d:
-                parts.append(f"{ex.capitalize()} {d['funding_rate']*100:+.4f}%")
+                interval_hrs = d.get("funding_interval_hours", 8)
+                suffix = f" (per {interval_hrs}h)" if interval_hrs != 8 else ""
+                parts.append(f"{ex.capitalize()} {d['funding_rate']*100:+.4f}%{suffix}")
         preamble = (
             f"**Current (weighted by OI):** {agg['weighted_funding_rate']*100:+.4f}% | "
             f"{' | '.join(parts)}\n\n"
@@ -405,7 +407,7 @@ async def binance_futures_open_interest(symbol: str) -> str:
         "",
         "**By exchange:**",
     ]
-    for ex in ("binance", "okx", "bybit"):
+    for ex in ("binance", "okx", "bybit", "hyperliquid"):
         d = by.get(ex)
         if not d:
             continue

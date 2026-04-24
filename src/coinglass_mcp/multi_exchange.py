@@ -33,6 +33,7 @@ from typing import Any
 
 from . import okx_client
 from . import bybit_client
+from . import hyperliquid_client
 from .binance_client import binance_futures_request
 
 logger = logging.getLogger("multi-exchange")
@@ -79,6 +80,26 @@ def _status(ok: list[str], failed: dict[str, str]) -> str:
     return "success"
 
 
+def _hl_find_ctx(hl_data: Any, coin: str) -> dict | None:
+    """Pick the assetCtx for a given HL coin name from metaAndAssetCtxs response.
+
+    Returns the ctx dict (with funding, openInterest, markPx, dayNtlVlm, etc)
+    or None if coin not listed / delisted / response malformed.
+    """
+    if not isinstance(hl_data, list) or len(hl_data) < 2:
+        return None
+    meta = hl_data[0]
+    ctxs = hl_data[1]
+    if not isinstance(meta, dict) or not isinstance(ctxs, list):
+        return None
+    universe = meta.get("universe", [])
+    for i, u in enumerate(universe):
+        if u.get("name") == coin and not u.get("isDelisted"):
+            if i < len(ctxs):
+                return ctxs[i]
+    return None
+
+
 # ─── 1. Open Interest — SNAPSHOT ──────────────────────────────────────────────
 
 
@@ -91,15 +112,17 @@ async def aggregate_oi_current(symbol: str) -> dict:
     """
     bnb_sym = symbol.upper()
     okx_sym = okx_client.to_okx_swap(bnb_sym)
+    hl_coin = hyperliquid_client.to_hl_coin(bnb_sym)
 
-    # Parallel fetch from all 3 exchanges
-    bnb_oi, bnb_mark, okx_oi, bybit_tkr = await asyncio.gather(
+    # Parallel fetch from all 4 exchanges
+    bnb_oi, bnb_mark, okx_oi, bybit_tkr, hl_data = await asyncio.gather(
         binance_futures_request("/fapi/v1/openInterest", {"symbol": bnb_sym}, 1),
         binance_futures_request("/fapi/v1/premiumIndex", {"symbol": bnb_sym}, 1),
         okx_client.okx_request("/api/v5/public/open-interest",
                                {"instType": "SWAP", "instId": okx_sym}),
         bybit_client.bybit_request("/v5/market/tickers",
                                    {"category": "linear", "symbol": bnb_sym}),
+        hyperliquid_client.hl_request({"type": "metaAndAssetCtxs"}),
         return_exceptions=True,
     )
 
@@ -158,6 +181,26 @@ async def aggregate_oi_current(symbol: str) -> dict:
         ok.append("bybit")
     else:
         failed["bybit"] = "empty response"
+
+    # Hyperliquid — OI in BASE units, multiply by markPx for USD
+    if isinstance(hl_data, Exception):
+        failed["hyperliquid"] = str(hl_data)
+    elif _is_err(hl_data):
+        failed["hyperliquid"] = _err_msg(hl_data)
+    else:
+        ctx = _hl_find_ctx(hl_data, hl_coin)
+        if ctx:
+            oi_base = _f(ctx.get("openInterest"))
+            mark = _f(ctx.get("markPx"))
+            by_exchange["hyperliquid"] = {
+                "oi_contracts": oi_base,  # base units (BTC/ETH/etc)
+                "oi_usd": oi_base * mark,
+                "mark_price": mark,
+                "ts_ms": 0,
+            }
+            ok.append("hyperliquid")
+        else:
+            failed["hyperliquid"] = f"coin {hl_coin} not listed / delisted on HL"
 
     total_oi_usd = sum(by_exchange[e]["oi_usd"] for e in ok)
 
@@ -500,9 +543,15 @@ async def _okx_ct_val(binance_symbol: str) -> float:
 
 
 async def aggregate_funding_current(symbol: str) -> dict:
-    """Fetch current FR + OI from Binance + OKX + Bybit. Produces OI-weighted FR."""
+    """Fetch current FR + OI from Binance + OKX + Bybit + Hyperliquid.
+
+    Produces OI-weighted FR. Note: HL funding cadence is 1h (not 8h like CEX),
+    so the raw FR magnitude is not directly comparable — it's still directionally
+    useful as crowding signal. Weight by OI = largest OI dominates the weighted avg.
+    """
     bnb_sym = symbol.upper()
     okx_sym = okx_client.to_okx_swap(bnb_sym)
+    hl_coin = hyperliquid_client.to_hl_coin(bnb_sym)
 
     bnb_fr_task = binance_futures_request("/fapi/v1/premiumIndex", {"symbol": bnb_sym}, 1)
     bnb_oi_task = binance_futures_request("/fapi/v1/openInterest", {"symbol": bnb_sym}, 1)
@@ -516,9 +565,11 @@ async def aggregate_funding_current(symbol: str) -> dict:
     bybit_task = bybit_client.bybit_request(
         "/v5/market/tickers", {"category": "linear", "symbol": bnb_sym},
     )
+    # HL metaAndAssetCtxs has funding + OI + mark in one response
+    hl_task = hyperliquid_client.hl_request({"type": "metaAndAssetCtxs"})
 
-    bnb_fr, bnb_oi, okx_fr, okx_oi, bybit_tkr = await asyncio.gather(
-        bnb_fr_task, bnb_oi_task, okx_fr_task, okx_oi_task, bybit_task,
+    bnb_fr, bnb_oi, okx_fr, okx_oi, bybit_tkr, hl_data = await asyncio.gather(
+        bnb_fr_task, bnb_oi_task, okx_fr_task, okx_oi_task, bybit_task, hl_task,
         return_exceptions=True,
     )
 
@@ -581,6 +632,25 @@ async def aggregate_funding_current(symbol: str) -> dict:
         ok.append("bybit")
     else:
         failed["bybit"] = _err_msg(bybit_tkr) if isinstance(bybit_tkr, dict) else str(bybit_tkr)
+
+    # Hyperliquid — funding is 1h cadence (flagged in notes). OI in base units.
+    if not isinstance(hl_data, Exception) and not _is_err(hl_data):
+        ctx = _hl_find_ctx(hl_data, hl_coin)
+        if ctx:
+            mark = _f(ctx.get("markPx"))
+            oi_base = _f(ctx.get("openInterest"))
+            by_exchange["hyperliquid"] = {
+                "funding_rate": _f(ctx.get("funding")),  # 1h interval
+                "mark_price": mark,
+                "oi_usd": oi_base * mark,
+                "next_funding_ts_ms": 0,
+                "funding_interval_hours": 1,
+            }
+            ok.append("hyperliquid")
+        else:
+            failed["hyperliquid"] = f"coin {hl_coin} not listed on HL"
+    else:
+        failed["hyperliquid"] = _err_msg(hl_data) if isinstance(hl_data, dict) else str(hl_data)
 
     # Weighted aggregation across all successful exchanges
     total_oi = sum(by_exchange[e]["oi_usd"] for e in ok)
@@ -753,9 +823,13 @@ async def aggregate_ls_ratio(symbol: str, period: str, limit: int = 100) -> dict
 
 
 async def aggregate_mark_price(symbol: str) -> dict:
-    """Fetch mark + 24h vol from Binance + OKX + Bybit. Produces vol-weighted VWAP."""
+    """Fetch mark + 24h vol from Binance + OKX + Bybit + Hyperliquid.
+
+    Produces vol-weighted VWAP across 4 exchanges.
+    """
     bnb_sym = symbol.upper()
     okx_sym = okx_client.to_okx_swap(bnb_sym)
+    hl_coin = hyperliquid_client.to_hl_coin(bnb_sym)
 
     bnb_mark_task = binance_futures_request("/fapi/v1/premiumIndex", {"symbol": bnb_sym}, 1)
     bnb_ticker_task = binance_futures_request("/fapi/v1/ticker/24hr", {"symbol": bnb_sym}, 1)
@@ -765,9 +839,10 @@ async def aggregate_mark_price(symbol: str) -> dict:
     bybit_task = bybit_client.bybit_request(
         "/v5/market/tickers", {"category": "linear", "symbol": bnb_sym},
     )
+    hl_task = hyperliquid_client.hl_request({"type": "metaAndAssetCtxs"})
 
-    bnb_mark, bnb_ticker, okx_ticker, okx_mark, bybit_tkr = await asyncio.gather(
-        bnb_mark_task, bnb_ticker_task, okx_ticker_task, okx_mark_task, bybit_task,
+    bnb_mark, bnb_ticker, okx_ticker, okx_mark, bybit_tkr, hl_data = await asyncio.gather(
+        bnb_mark_task, bnb_ticker_task, okx_ticker_task, okx_mark_task, bybit_task, hl_task,
         return_exceptions=True,
     )
 
@@ -817,6 +892,23 @@ async def aggregate_mark_price(symbol: str) -> dict:
         ok.append("bybit")
     else:
         failed["bybit"] = _err_msg(bybit_tkr) if isinstance(bybit_tkr, dict) else str(bybit_tkr)
+
+    # Hyperliquid — dayNtlVlm is already in USD
+    if not isinstance(hl_data, Exception) and not _is_err(hl_data):
+        ctx = _hl_find_ctx(hl_data, hl_coin)
+        if ctx:
+            by_exchange["hyperliquid"] = {
+                "mark_price": _f(ctx.get("markPx")),
+                "index_price": _f(ctx.get("oraclePx")),
+                "funding_rate": _f(ctx.get("funding")),  # 1h cadence
+                "last_price": _f(ctx.get("midPx")) or _f(ctx.get("markPx")),
+                "vol_24h_usd": _f(ctx.get("dayNtlVlm")),
+            }
+            ok.append("hyperliquid")
+        else:
+            failed["hyperliquid"] = f"coin {hl_coin} not listed on HL"
+    else:
+        failed["hyperliquid"] = _err_msg(hl_data) if isinstance(hl_data, dict) else str(hl_data)
 
     total_vol = sum(by_exchange[e]["vol_24h_usd"] for e in ok)
     vwap_mark = 0.0
