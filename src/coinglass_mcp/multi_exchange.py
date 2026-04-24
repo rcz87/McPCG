@@ -32,6 +32,7 @@ import logging
 from typing import Any
 
 from . import okx_client
+from . import bybit_client
 from .binance_client import binance_futures_request
 
 logger = logging.getLogger("multi-exchange")
@@ -82,20 +83,23 @@ def _status(ok: list[str], failed: dict[str, str]) -> str:
 
 
 async def aggregate_oi_current(symbol: str) -> dict:
-    """Fetch current OI from Binance + OKX, return SUM and per-exchange.
+    """Fetch current OI from Binance + OKX + Bybit, return SUM and per-exchange.
 
-    Binance returns OI in contracts only (no USD). We enrich with mark price.
+    Binance returns OI in contracts only (enrich with mark price).
     OKX returns oi, oiCcy, oiUsd directly.
+    Bybit ticker returns openInterest + openInterestValue (USD) directly.
     """
     bnb_sym = symbol.upper()
     okx_sym = okx_client.to_okx_swap(bnb_sym)
 
-    # Parallel fetch: Binance OI + Binance mark price + OKX OI (which already has USD)
-    bnb_oi, bnb_mark, okx_oi = await asyncio.gather(
+    # Parallel fetch from all 3 exchanges
+    bnb_oi, bnb_mark, okx_oi, bybit_tkr = await asyncio.gather(
         binance_futures_request("/fapi/v1/openInterest", {"symbol": bnb_sym}, 1),
         binance_futures_request("/fapi/v1/premiumIndex", {"symbol": bnb_sym}, 1),
         okx_client.okx_request("/api/v5/public/open-interest",
                                {"instType": "SWAP", "instId": okx_sym}),
+        bybit_client.bybit_request("/v5/market/tickers",
+                                   {"category": "linear", "symbol": bnb_sym}),
         return_exceptions=True,
     )
 
@@ -103,7 +107,7 @@ async def aggregate_oi_current(symbol: str) -> dict:
     failed: dict[str, str] = {}
     by_exchange: dict[str, dict] = {}
 
-    # Binance parsing
+    # Binance
     if isinstance(bnb_oi, Exception):
         failed["binance"] = str(bnb_oi)
     elif _is_err(bnb_oi):
@@ -113,16 +117,15 @@ async def aggregate_oi_current(symbol: str) -> dict:
         mark_px = 0.0
         if not isinstance(bnb_mark, Exception) and not _is_err(bnb_mark):
             mark_px = _f(bnb_mark.get("markPrice"))
-        oi_usd = oi_contracts * mark_px
         by_exchange["binance"] = {
             "oi_contracts": oi_contracts,
-            "oi_usd": oi_usd,
+            "oi_usd": oi_contracts * mark_px,
             "mark_price": mark_px,
             "ts_ms": int(bnb_oi.get("time", 0)),
         }
         ok.append("binance")
 
-    # OKX parsing — oiUsd already provided
+    # OKX
     if isinstance(okx_oi, Exception):
         failed["okx"] = str(okx_oi)
     elif _is_err(okx_oi):
@@ -131,13 +134,30 @@ async def aggregate_oi_current(symbol: str) -> dict:
         d = okx_oi[0]
         by_exchange["okx"] = {
             "oi_contracts": _f(d.get("oi")),
-            "oi_ccy": _f(d.get("oiCcy")),  # base currency amount
+            "oi_ccy": _f(d.get("oiCcy")),
             "oi_usd": _f(d.get("oiUsd")),
             "ts_ms": int(d.get("ts", 0)),
         }
         ok.append("okx")
     else:
         failed["okx"] = "empty response"
+
+    # Bybit
+    if isinstance(bybit_tkr, Exception):
+        failed["bybit"] = str(bybit_tkr)
+    elif _is_err(bybit_tkr):
+        failed["bybit"] = _err_msg(bybit_tkr)
+    elif isinstance(bybit_tkr, dict) and bybit_tkr.get("list"):
+        d = bybit_tkr["list"][0]
+        by_exchange["bybit"] = {
+            "oi_contracts": _f(d.get("openInterest")),
+            "oi_usd": _f(d.get("openInterestValue")),
+            "mark_price": _f(d.get("markPrice")),
+            "ts_ms": 0,
+        }
+        ok.append("bybit")
+    else:
+        failed["bybit"] = "empty response"
 
     total_oi_usd = sum(by_exchange[e]["oi_usd"] for e in ok)
 
@@ -154,22 +174,26 @@ async def aggregate_oi_current(symbol: str) -> dict:
 
 
 async def aggregate_oi_history(symbol: str, period: str, limit: int = 100) -> dict:
-    """Fetch OI history from Binance + OKX, align by period bucket, SUM.
+    """Fetch OI history from Binance + OKX + Bybit, align by period bucket, SUM.
 
     Binance: /futures/data/openInterestHist → [{timestamp, sumOpenInterest, sumOpenInterestValue}]
     OKX rubik: /api/v5/rubik/stat/contracts/open-interest-volume → [[ts, oi_usd, vol_usd]]
       NOTE: OKX rubik is ccy-aggregated (all BTC contracts), not per-instId.
-            Binance is per-symbol (BTCUSDT perp only). Still useful for total exposure.
+    Bybit: /v5/market/open-interest → [{openInterest, timestamp}] (contracts only,
+      multiplied by Binance mark price for USD; Bybit has no USD in this endpoint).
     """
     bnb_sym = symbol.upper()
     ccy = okx_client.to_okx_ccy(bnb_sym)
     okx_period = okx_client.to_okx_rubik_period(period)
+    bybit_interval = bybit_client.to_bybit_interval(period)
 
     bnb_task = binance_futures_request(
         "/futures/data/openInterestHist",
         {"symbol": bnb_sym, "period": period, "limit": min(limit, 500)},
         1,
     )
+    # Need Binance mark price to USD-ify Bybit's contract-only OI response
+    mark_task = binance_futures_request("/fapi/v1/premiumIndex", {"symbol": bnb_sym}, 1)
     if okx_period:
         okx_task = okx_client.okx_request(
             "/api/v5/rubik/stat/contracts/open-interest-volume",
@@ -177,13 +201,27 @@ async def aggregate_oi_history(symbol: str, period: str, limit: int = 100) -> di
         )
     else:
         okx_task = asyncio.sleep(0, result={"error": f"OKX period {period} unsupported"})
+    if bybit_interval:
+        bybit_task = bybit_client.bybit_request(
+            "/v5/market/open-interest",
+            {"category": "linear", "symbol": bnb_sym,
+             "intervalTime": bybit_interval, "limit": min(limit, 200)},
+        )
+    else:
+        bybit_task = asyncio.sleep(0, result={"error": f"Bybit interval {period} unsupported"})
 
-    bnb_data, okx_data = await asyncio.gather(bnb_task, okx_task, return_exceptions=True)
+    bnb_data, mark_data, okx_data, bybit_data = await asyncio.gather(
+        bnb_task, mark_task, okx_task, bybit_task, return_exceptions=True,
+    )
+
+    mark_px = 0.0
+    if not isinstance(mark_data, Exception) and not _is_err(mark_data):
+        mark_px = _f(mark_data.get("markPrice"))
 
     ok: list[str] = []
     failed: dict[str, str] = {}
 
-    # Binance normalize → {ts_bucket: {oi_contracts, oi_usd}}
+    # Binance
     bnb_series: dict[int, dict] = {}
     if isinstance(bnb_data, Exception):
         failed["binance"] = str(bnb_data)
@@ -200,7 +238,7 @@ async def aggregate_oi_history(symbol: str, period: str, limit: int = 100) -> di
     else:
         failed["binance"] = "unexpected response"
 
-    # OKX normalize → {ts_bucket: {oi_usd, vol_usd}}
+    # OKX
     okx_series: dict[int, dict] = {}
     if okx_period:
         if isinstance(okx_data, Exception):
@@ -222,20 +260,42 @@ async def aggregate_oi_history(symbol: str, period: str, limit: int = 100) -> di
     else:
         failed["okx"] = f"period {period} not supported on OKX rubik"
 
-    # Aligned aggregated series: union of timestamps, SUM oi_usd where present
-    all_ts = sorted(set(bnb_series.keys()) | set(okx_series.keys()))
-    # Trim to last `limit`
+    # Bybit — contracts × mark_px = USD
+    bybit_series: dict[int, dict] = {}
+    if bybit_interval:
+        if isinstance(bybit_data, Exception):
+            failed["bybit"] = str(bybit_data)
+        elif _is_err(bybit_data):
+            failed["bybit"] = _err_msg(bybit_data)
+        elif isinstance(bybit_data, dict) and isinstance(bybit_data.get("list"), list):
+            for d in bybit_data["list"]:
+                ts = _floor_ts(d.get("timestamp", 0), period)
+                oi_c = _f(d.get("openInterest"))
+                bybit_series[ts] = {
+                    "oi_contracts": oi_c,
+                    "oi_usd": oi_c * mark_px,
+                }
+            ok.append("bybit")
+        else:
+            failed["bybit"] = "unexpected response"
+    else:
+        failed["bybit"] = f"period {period} not supported on Bybit"
+
+    # Union timestamps, SUM across all 3 exchanges
+    all_ts = sorted(set(bnb_series.keys()) | set(okx_series.keys()) | set(bybit_series.keys()))
     all_ts = all_ts[-limit:]
     aggregated = []
     for ts in all_ts:
         b = bnb_series.get(ts, {})
         o = okx_series.get(ts, {})
-        total = _f(b.get("oi_usd")) + _f(o.get("oi_usd"))
+        y = bybit_series.get(ts, {})
+        total = _f(b.get("oi_usd")) + _f(o.get("oi_usd")) + _f(y.get("oi_usd"))
         aggregated.append({
             "ts_ms": ts,
             "total_oi_usd": total,
             "binance_oi_usd": _f(b.get("oi_usd")),
             "okx_oi_usd": _f(o.get("oi_usd")),
+            "bybit_oi_usd": _f(y.get("oi_usd")),
         })
 
     return {
@@ -250,6 +310,10 @@ async def aggregate_oi_history(symbol: str, period: str, limit: int = 100) -> di
             )[-limit:],
             "okx": sorted(
                 [{"ts_ms": k, **v} for k, v in okx_series.items()],
+                key=lambda x: x["ts_ms"],
+            )[-limit:],
+            "bybit": sorted(
+                [{"ts_ms": k, **v} for k, v in bybit_series.items()],
                 key=lambda x: x["ts_ms"],
             )[-limit:],
         },
@@ -436,7 +500,7 @@ async def _okx_ct_val(binance_symbol: str) -> float:
 
 
 async def aggregate_funding_current(symbol: str) -> dict:
-    """Fetch current FR + OI from Binance + OKX. Produces OI-weighted FR."""
+    """Fetch current FR + OI from Binance + OKX + Bybit. Produces OI-weighted FR."""
     bnb_sym = symbol.upper()
     okx_sym = okx_client.to_okx_swap(bnb_sym)
 
@@ -448,9 +512,13 @@ async def aggregate_funding_current(symbol: str) -> dict:
     okx_oi_task = okx_client.okx_request(
         "/api/v5/public/open-interest", {"instType": "SWAP", "instId": okx_sym},
     )
+    # Bybit ticker has both FR + OI + mark in one call
+    bybit_task = bybit_client.bybit_request(
+        "/v5/market/tickers", {"category": "linear", "symbol": bnb_sym},
+    )
 
-    bnb_fr, bnb_oi, okx_fr, okx_oi = await asyncio.gather(
-        bnb_fr_task, bnb_oi_task, okx_fr_task, okx_oi_task,
+    bnb_fr, bnb_oi, okx_fr, okx_oi, bybit_tkr = await asyncio.gather(
+        bnb_fr_task, bnb_oi_task, okx_fr_task, okx_oi_task, bybit_task,
         return_exceptions=True,
     )
 
@@ -500,7 +568,21 @@ async def aggregate_funding_current(symbol: str) -> dict:
     else:
         failed["okx"] = "fr or oi missing/error"
 
-    # Weighted aggregation
+    # Bybit — ticker returns FR + OI_USD + mark in one response
+    if (not isinstance(bybit_tkr, Exception) and not _is_err(bybit_tkr)
+            and isinstance(bybit_tkr, dict) and bybit_tkr.get("list")):
+        d = bybit_tkr["list"][0]
+        by_exchange["bybit"] = {
+            "funding_rate": _f(d.get("fundingRate")),
+            "mark_price": _f(d.get("markPrice")),
+            "oi_usd": _f(d.get("openInterestValue")),
+            "next_funding_ts_ms": int(d.get("nextFundingTime", 0)),
+        }
+        ok.append("bybit")
+    else:
+        failed["bybit"] = _err_msg(bybit_tkr) if isinstance(bybit_tkr, dict) else str(bybit_tkr)
+
+    # Weighted aggregation across all successful exchanges
     total_oi = sum(by_exchange[e]["oi_usd"] for e in ok)
     weighted_fr = 0.0
     if total_oi > 0:
@@ -526,14 +608,16 @@ async def aggregate_funding_current(symbol: str) -> dict:
 
 
 async def aggregate_ls_ratio(symbol: str, period: str, limit: int = 100) -> dict:
-    """Fetch L/S account ratio from Binance + OKX.
+    """Fetch L/S account ratio from Binance + OKX + Bybit.
 
     Binance: /futures/data/globalLongShortAccountRatio → {longAccount, shortAccount, longShortRatio}
     OKX rubik: /contracts/long-short-account-ratio-contract → [[ts, ratio]]
+    Bybit: /v5/market/account-ratio → [{buyRatio, sellRatio, timestamp}] (compute ratio=buy/sell)
     """
     bnb_sym = symbol.upper()
     okx_sym = okx_client.to_okx_swap(bnb_sym)
     okx_period = okx_client.to_okx_rubik_period(period)
+    bybit_interval = bybit_client.to_bybit_interval(period)
 
     bnb_task = binance_futures_request(
         "/futures/data/globalLongShortAccountRatio",
@@ -547,8 +631,18 @@ async def aggregate_ls_ratio(symbol: str, period: str, limit: int = 100) -> dict
         )
     else:
         okx_task = asyncio.sleep(0, result={"error": f"OKX period {period} unsupported"})
+    if bybit_interval:
+        bybit_task = bybit_client.bybit_request(
+            "/v5/market/account-ratio",
+            {"category": "linear", "symbol": bnb_sym,
+             "period": bybit_interval, "limit": min(limit, 500)},
+        )
+    else:
+        bybit_task = asyncio.sleep(0, result={"error": f"Bybit interval {period} unsupported"})
 
-    bnb_data, okx_data = await asyncio.gather(bnb_task, okx_task, return_exceptions=True)
+    bnb_data, okx_data, bybit_data = await asyncio.gather(
+        bnb_task, okx_task, bybit_task, return_exceptions=True,
+    )
 
     ok: list[str] = []
     failed: dict[str, str] = {}
@@ -582,8 +676,6 @@ async def aggregate_ls_ratio(symbol: str, period: str, limit: int = 100) -> dict
                     continue
                 ts = _floor_ts(row[0], period)
                 r = _f(row[1])
-                # ratio = long/short → derive long_pct, short_pct from ratio
-                # long_pct = r / (1+r), short_pct = 1 / (1+r)
                 long_pct = (r / (1 + r)) * 100 if r > 0 else 0.0
                 short_pct = 100.0 - long_pct
                 okx_series[ts] = {"ratio": r, "long_pct": long_pct, "short_pct": short_pct}
@@ -593,19 +685,45 @@ async def aggregate_ls_ratio(symbol: str, period: str, limit: int = 100) -> dict
     else:
         failed["okx"] = f"period {period} not supported"
 
-    all_ts = sorted(set(bnb_series.keys()) | set(okx_series.keys()))[-limit:]
-    # Simple unweighted avg ratio (we don't have per-ts OI cheaply). Flag method.
+    bybit_series: dict[int, dict] = {}
+    if bybit_interval:
+        if isinstance(bybit_data, Exception):
+            failed["bybit"] = str(bybit_data)
+        elif _is_err(bybit_data):
+            failed["bybit"] = _err_msg(bybit_data)
+        elif isinstance(bybit_data, dict) and isinstance(bybit_data.get("list"), list):
+            for d in bybit_data["list"]:
+                ts = _floor_ts(d.get("timestamp", 0), period)
+                buy = _f(d.get("buyRatio"))
+                sell = _f(d.get("sellRatio"))
+                r = buy / sell if sell > 0 else 0.0
+                bybit_series[ts] = {
+                    "ratio": r,
+                    "long_pct": buy * 100,
+                    "short_pct": sell * 100,
+                }
+            ok.append("bybit")
+        else:
+            failed["bybit"] = "unexpected response"
+    else:
+        failed["bybit"] = f"interval {period} not supported"
+
+    all_ts = sorted(
+        set(bnb_series.keys()) | set(okx_series.keys()) | set(bybit_series.keys())
+    )[-limit:]
     aggregated = []
     for ts in all_ts:
         b = bnb_series.get(ts)
         o = okx_series.get(ts)
-        parts = [x["ratio"] for x in (b, o) if x is not None and x.get("ratio", 0) > 0]
+        y = bybit_series.get(ts)
+        parts = [x["ratio"] for x in (b, o, y) if x is not None and x.get("ratio", 0) > 0]
         avg = sum(parts) / len(parts) if parts else 0.0
         aggregated.append({
             "ts_ms": ts,
             "avg_ratio": avg,
             "binance_ratio": b["ratio"] if b else None,
             "okx_ratio": o["ratio"] if o else None,
+            "bybit_ratio": y["ratio"] if y else None,
         })
 
     return {
@@ -622,6 +740,10 @@ async def aggregate_ls_ratio(symbol: str, period: str, limit: int = 100) -> dict
                 [{"ts_ms": k, **v} for k, v in okx_series.items()],
                 key=lambda x: x["ts_ms"],
             )[-limit:],
+            "bybit": sorted(
+                [{"ts_ms": k, **v} for k, v in bybit_series.items()],
+                key=lambda x: x["ts_ms"],
+            )[-limit:],
         },
         "notes": {"aggregation": "simple avg (equal weight)"},
     }
@@ -631,7 +753,7 @@ async def aggregate_ls_ratio(symbol: str, period: str, limit: int = 100) -> dict
 
 
 async def aggregate_mark_price(symbol: str) -> dict:
-    """Fetch mark price + 24h volume from Binance + OKX. Produces vol-weighted mark."""
+    """Fetch mark + 24h vol from Binance + OKX + Bybit. Produces vol-weighted VWAP."""
     bnb_sym = symbol.upper()
     okx_sym = okx_client.to_okx_swap(bnb_sym)
 
@@ -640,9 +762,12 @@ async def aggregate_mark_price(symbol: str) -> dict:
     okx_ticker_task = okx_client.okx_request("/api/v5/market/ticker", {"instId": okx_sym})
     okx_mark_task = okx_client.okx_request("/api/v5/public/mark-price",
                                            {"instType": "SWAP", "instId": okx_sym})
+    bybit_task = bybit_client.bybit_request(
+        "/v5/market/tickers", {"category": "linear", "symbol": bnb_sym},
+    )
 
-    bnb_mark, bnb_ticker, okx_ticker, okx_mark = await asyncio.gather(
-        bnb_mark_task, bnb_ticker_task, okx_ticker_task, okx_mark_task,
+    bnb_mark, bnb_ticker, okx_ticker, okx_mark, bybit_tkr = await asyncio.gather(
+        bnb_mark_task, bnb_ticker_task, okx_ticker_task, okx_mark_task, bybit_task,
         return_exceptions=True,
     )
 
@@ -667,7 +792,6 @@ async def aggregate_mark_price(symbol: str) -> dict:
             and isinstance(okx_mark, list) and okx_mark):
         t = okx_ticker[0]
         m = okx_mark[0]
-        # OKX vol24h is in contracts, volCcy24h is in base. Convert to USD via last price.
         last = _f(t.get("last"))
         vol_base = _f(t.get("volCcy24h"))
         by_exchange["okx"] = {
@@ -678,6 +802,21 @@ async def aggregate_mark_price(symbol: str) -> dict:
         ok.append("okx")
     else:
         failed["okx"] = "ticker or mark failed"
+
+    # Bybit — ticker has turnover24h (already in USD) and markPrice + fundingRate
+    if (not isinstance(bybit_tkr, Exception) and not _is_err(bybit_tkr)
+            and isinstance(bybit_tkr, dict) and bybit_tkr.get("list")):
+        d = bybit_tkr["list"][0]
+        by_exchange["bybit"] = {
+            "mark_price": _f(d.get("markPrice")),
+            "index_price": _f(d.get("indexPrice")),
+            "funding_rate": _f(d.get("fundingRate")),
+            "last_price": _f(d.get("lastPrice")),
+            "vol_24h_usd": _f(d.get("turnover24h")),
+        }
+        ok.append("bybit")
+    else:
+        failed["bybit"] = _err_msg(bybit_tkr) if isinstance(bybit_tkr, dict) else str(bybit_tkr)
 
     total_vol = sum(by_exchange[e]["vol_24h_usd"] for e in ok)
     vwap_mark = 0.0

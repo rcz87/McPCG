@@ -33,11 +33,14 @@ def _multi_header(title: str, ok: list[str], failed: dict[str, str]) -> str:
 
 
 def _multi_source_tag(ok: list[str]) -> str:
-    """Envelope source tag. 'binance+okx' if both, else the one that worked."""
-    if len(ok) >= 2:
-        return "binance+okx"
-    if ok:
-        return ok[0]
+    """Envelope source tag. Joins all successful exchanges (e.g. 'binance+okx+bybit').
+
+    Preserves canonical order: binance → okx → bybit.
+    """
+    order = ["binance", "okx", "bybit"]
+    parts = [e for e in order if e in ok]
+    if parts:
+        return "+".join(parts)
     return "binance"  # fallback (even on total failure, we came from binance tool)
 
 
@@ -188,7 +191,7 @@ async def binance_futures_price(symbol: str = "") -> str:
         "",
         "**By exchange:**",
     ]
-    for ex in ("binance", "okx"):
+    for ex in ("binance", "okx", "bybit"):
         d = by.get(ex)
         if not d:
             continue
@@ -229,7 +232,7 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
     sym_upper = symbol.upper()
     limit = min(limit, 1000)
 
-    # Parallel: current aggregate + Binance FR history + OKX FR history
+    # Parallel: current aggregate + Binance FR history + OKX FR history + Bybit FR history
     okx_sym = _mx.okx_client.to_okx_swap(sym_upper)
     current_task = _mx.aggregate_funding_current(sym_upper)
     bnb_hist_task = binance_futures_request(
@@ -241,9 +244,14 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
         "/api/v5/public/funding-rate-history",
         {"instId": okx_sym, "limit": "100"},
     )
+    bybit_hist_task = _mx.bybit_client.bybit_request(
+        "/v5/market/funding/history",
+        {"category": "linear", "symbol": sym_upper, "limit": min(limit, 200)},
+    )
 
-    current, bnb_hist, okx_hist = await asyncio.gather(
-        current_task, bnb_hist_task, okx_hist_task, return_exceptions=True,
+    current, bnb_hist, okx_hist, bybit_hist = await asyncio.gather(
+        current_task, bnb_hist_task, okx_hist_task, bybit_hist_task,
+        return_exceptions=True,
     )
 
     title = f"Funding Rate — {sym_upper}"
@@ -260,6 +268,16 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
         for d in okx_hist:
             ts = _mx._floor_ts(d.get("fundingTime", 0), "8h")
             okx_by_ts[ts] = _f(d.get("fundingRate"))
+
+    # Build Bybit history lookup by fundingRateTimestamp (8h buckets)
+    bybit_by_ts: dict[int, float] = {}
+    if (not isinstance(bybit_hist, Exception)
+            and not _mx._is_err(bybit_hist)
+            and isinstance(bybit_hist, dict)
+            and isinstance(bybit_hist.get("list"), list)):
+        for d in bybit_hist["list"]:
+            ts = _mx._floor_ts(d.get("fundingRateTimestamp", 0), "8h")
+            bybit_by_ts[ts] = _f(d.get("fundingRate"))
 
     # Binance history as authoritative timeline
     if isinstance(bnb_hist, Exception) or _mx._is_err(bnb_hist):
@@ -296,11 +314,14 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
     if isinstance(current, dict) and current.get("status") != "failed":
         agg = current["aggregated"]
         by = current["by_exchange"]
-        bnb_fr = by.get("binance", {}).get("funding_rate", 0) * 100
-        okx_fr = by.get("okx", {}).get("funding_rate", 0) * 100
+        parts = []
+        for ex in ("binance", "okx", "bybit"):
+            d = by.get(ex)
+            if d:
+                parts.append(f"{ex.capitalize()} {d['funding_rate']*100:+.4f}%")
         preamble = (
             f"**Current (weighted by OI):** {agg['weighted_funding_rate']*100:+.4f}% | "
-            f"Binance {bnb_fr:+.4f}% | OKX {okx_fr:+.4f}%\n\n"
+            f"{' | '.join(parts)}\n\n"
         )
 
     if len(items) > 30:
@@ -309,8 +330,8 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
         hdr += f"*(showing last 30 of {total})*\n\n"
 
     table = "```\n"
-    table += f" {'Time':>16} | {'Binance FR':>10} | {'OKX FR':>10} | {'Mark Price':>13}\n"
-    table += f" {'─' * 16} | {'─' * 10} | {'─' * 10} | {'─' * 13}\n"
+    table += f" {'Time':>16} | {'Binance':>9} | {'OKX':>9} | {'Bybit':>9} | {'Mark Price':>13}\n"
+    table += f" {'─' * 16} | {'─' * 9} | {'─' * 9} | {'─' * 9} | {'─' * 13}\n"
     for d in items:
         ts_raw = d.get("fundingTime", 0)
         t = _dt(ts_raw)
@@ -318,8 +339,13 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
         ts_bucket = _mx._floor_ts(ts_raw, "8h")
         okx_fr_val = okx_by_ts.get(ts_bucket)
         okx_str = f"{okx_fr_val*100:+.4f}%" if okx_fr_val is not None else "—"
+        bybit_fr_val = bybit_by_ts.get(ts_bucket)
+        bybit_str = f"{bybit_fr_val*100:+.4f}%" if bybit_fr_val is not None else "—"
         mark = _f(d.get("markPrice"))
-        table += f" {t:>16} | {bnb_fr:>+9.4f}% | {okx_str:>10} | {_price(mark):>13}\n"
+        table += (
+            f" {t:>16} | {bnb_fr:>+8.4f}% | {okx_str:>9} | {bybit_str:>9} | "
+            f"{_price(mark):>13}\n"
+        )
     table += "```\n"
 
     bnb_rates = [_f(d.get("fundingRate")) * 100 for d in items]
@@ -330,12 +356,19 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
         if _mx._floor_ts(d.get("fundingTime", 0), "8h") in okx_by_ts
     ]
     avg_okx = (sum(matched_okx) / len(matched_okx) * 100) if matched_okx else 0
+    matched_bybit = [
+        bybit_by_ts[_mx._floor_ts(d.get("fundingTime", 0), "8h")]
+        for d in items
+        if _mx._floor_ts(d.get("fundingTime", 0), "8h") in bybit_by_ts
+    ]
+    avg_bybit = (sum(matched_bybit) / len(matched_bybit) * 100) if matched_bybit else 0
     table += (
         f"\n**Summary:** Avg Binance {avg_bnb:+.4f}% | "
-        f"Avg OKX {avg_okx:+.4f}% (matched {len(matched_okx)}/{len(items)})"
+        f"Avg OKX {avg_okx:+.4f}% ({len(matched_okx)}/{len(items)}) | "
+        f"Avg Bybit {avg_bybit:+.4f}% ({len(matched_bybit)}/{len(items)})"
     )
 
-    status = "success" if not failed_current and okx_by_ts else "partial"
+    status = "success" if not failed_current and (okx_by_ts or bybit_by_ts) else "partial"
     return make_envelope(status, _multi_source_tag(ok_current or ["binance"]),
                          hdr + preamble + table)
 
@@ -372,7 +405,7 @@ async def binance_futures_open_interest(symbol: str) -> str:
         "",
         "**By exchange:**",
     ]
-    for ex in ("binance", "okx"):
+    for ex in ("binance", "okx", "bybit"):
         d = by.get(ex)
         if not d:
             continue
@@ -423,18 +456,23 @@ async def binance_futures_oi_history(symbol: str, period: str = "5m", limit: int
         hdr += f"*(showing last 30 of {total})*\n\n"
 
     table = "```\n"
-    table += f" {'Time':>16} | {'Total OI':>12} | {'Binance':>12} | {'OKX':>12}\n"
-    table += f" {'─' * 16} | {'─' * 12} | {'─' * 12} | {'─' * 12}\n"
+    table += f" {'Time':>16} | {'Total':>10} | {'Binance':>10} | {'OKX':>10} | {'Bybit':>10}\n"
+    table += f" {'─' * 16} | {'─' * 10} | {'─' * 10} | {'─' * 10} | {'─' * 10}\n"
     for r in rows:
         t = _dt(r["ts_ms"])
         total = _dollar(r["total_oi_usd"])
         bnb = _dollar(r["binance_oi_usd"]) if r["binance_oi_usd"] else "—"
         okx = _dollar(r["okx_oi_usd"]) if r["okx_oi_usd"] else "—"
-        table += f" {t:>16} | {total:>12} | {bnb:>12} | {okx:>12}\n"
+        bybit = _dollar(r.get("bybit_oi_usd", 0)) if r.get("bybit_oi_usd") else "—"
+        table += f" {t:>16} | {total:>10} | {bnb:>10} | {okx:>10} | {bybit:>10}\n"
     table += "```\n"
 
-    # Summary: first vs last complete bucket (both exchanges present)
-    complete = [r for r in rows if r["binance_oi_usd"] > 0 and r["okx_oi_usd"] > 0]
+    # Summary: first vs last bucket where at least 2 sources present
+    def _complete(r):
+        sources_present = sum(1 for k in ("binance_oi_usd", "okx_oi_usd", "bybit_oi_usd")
+                              if r.get(k, 0) > 0)
+        return sources_present >= 2
+    complete = [r for r in rows if _complete(r)]
     if len(complete) >= 2:
         first = complete[0]["total_oi_usd"]
         last = complete[-1]["total_oi_usd"]
@@ -522,14 +560,15 @@ async def binance_futures_long_short_ratio(symbol: str, period: str = "5m", limi
         hdr += f"*(showing last 30 of {total})*\n\n"
 
     table = "```\n"
-    table += f" {'Time':>16} | {'Avg':>7} | {'Binance':>7} | {'OKX':>7}\n"
-    table += f" {'─' * 16} | {'─' * 7} | {'─' * 7} | {'─' * 7}\n"
+    table += f" {'Time':>16} | {'Avg':>7} | {'Binance':>7} | {'OKX':>7} | {'Bybit':>7}\n"
+    table += f" {'─' * 16} | {'─' * 7} | {'─' * 7} | {'─' * 7} | {'─' * 7}\n"
     for r in rows:
         t = _dt(r["ts_ms"])
         avg = r["avg_ratio"]
         bnb = f"{r['binance_ratio']:.3f}" if r["binance_ratio"] else "—"
         okx = f"{r['okx_ratio']:.3f}" if r["okx_ratio"] else "—"
-        table += f" {t:>16} | {avg:>7.3f} | {bnb:>7} | {okx:>7}\n"
+        bybit = f"{r.get('bybit_ratio'):.3f}" if r.get("bybit_ratio") else "—"
+        table += f" {t:>16} | {avg:>7.3f} | {bnb:>7} | {okx:>7} | {bybit:>7}\n"
     table += "```\n"
 
     ratios = [r["avg_ratio"] for r in rows if r["avg_ratio"] > 0]
