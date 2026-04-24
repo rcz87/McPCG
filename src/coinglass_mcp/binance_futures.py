@@ -44,6 +44,28 @@ def _multi_source_tag(ok: list[str]) -> str:
     return "binance"  # fallback (even on total failure, we came from binance tool)
 
 
+def _build_warnings(ok: list[str], failed: dict[str, str], total_possible: int = 4) -> list[str]:
+    """Build informative warnings[] for envelope when some sources fail.
+
+    Downstream consumers (TELEGLAS, dashboards) can use these to decide
+    whether to surface the partial-coverage state to users.
+    """
+    warnings: list[str] = []
+    if failed:
+        failed_names = ", ".join(failed.keys())
+        ok_names = "+".join(ok) if ok else "none"
+        n_ok = len(ok)
+        warnings.append(
+            f"Source(s) failed: {failed_names}. Computed from {n_ok}/{total_possible} "
+            f"exchanges ({ok_names})."
+        )
+        # Per-exchange error detail (useful for debugging transient vs persistent)
+        for name, err in failed.items():
+            short_err = (err[:60] + "…") if len(err) > 60 else err
+            warnings.append(f"{name}: {short_err}")
+    return warnings
+
+
 def _multi_err_check(result: dict, hdr: str) -> str | None:
     """Emit failed-envelope if no exchange responded successfully."""
     if result.get("status") == "failed":
@@ -211,7 +233,10 @@ async def binance_futures_price(symbol: str = "") -> str:
         lines.append(f"⚠️ **Failed:** {', '.join(failed.keys())}")
 
     status = "success" if not failed else "partial"
-    return make_envelope(status, _multi_source_tag(ok), hdr + "\n".join(lines) + "\n")
+    return make_envelope(
+        status, _multi_source_tag(ok), hdr + "\n".join(lines) + "\n",
+        warnings=_build_warnings(ok, failed, total_possible=4),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -371,8 +396,11 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
     )
 
     status = "success" if not failed_current and (okx_by_ts or bybit_by_ts) else "partial"
-    return make_envelope(status, _multi_source_tag(ok_current or ["binance"]),
-                         hdr + preamble + table)
+    return make_envelope(
+        status, _multi_source_tag(ok_current or ["binance"]),
+        hdr + preamble + table,
+        warnings=_build_warnings(ok_current, failed_current, total_possible=4),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -421,7 +449,10 @@ async def binance_futures_open_interest(symbol: str) -> str:
         lines.append(f"⚠️ **Failed sources:** {', '.join(failed.keys())}")
 
     status = "success" if not failed else "partial"
-    return make_envelope(status, _multi_source_tag(ok), hdr + "\n".join(lines) + "\n")
+    return make_envelope(
+        status, _multi_source_tag(ok), hdr + "\n".join(lines) + "\n",
+        warnings=_build_warnings(ok, failed, total_possible=4),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -499,7 +530,10 @@ async def binance_futures_oi_history(symbol: str, period: str = "5m", limit: int
         table += f"\n⚠️ **Failed:** {', '.join(failed.keys())}"
 
     status = "success" if not failed else "partial"
-    return make_envelope(status, _multi_source_tag(ok), hdr + table)
+    return make_envelope(
+        status, _multi_source_tag(ok), hdr + table,
+        warnings=_build_warnings(ok, failed, total_possible=3),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -606,7 +640,10 @@ async def binance_futures_long_short_ratio(symbol: str, period: str = "5m", limi
         table += f"\n⚠️ **Failed:** {', '.join(failed.keys())}"
 
     status = "success" if not failed else "partial"
-    return make_envelope(status, _multi_source_tag(ok), hdr + table)
+    return make_envelope(
+        status, _multi_source_tag(ok), hdr + table,
+        warnings=_build_warnings(ok, failed, total_possible=3),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -699,7 +736,10 @@ async def binance_futures_taker_volume(symbol: str, period: str = "5m", limit: i
         table += f"\n⚠️ **Failed:** {', '.join(failed.keys())}"
 
     status = "success" if not failed else "partial"
-    return make_envelope(status, _multi_source_tag(ok), hdr + table)
+    return make_envelope(
+        status, _multi_source_tag(ok), hdr + table,
+        warnings=_build_warnings(ok, failed, total_possible=2),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
