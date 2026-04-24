@@ -88,6 +88,24 @@ def _ok(content: str) -> str:
     return make_envelope("success", "binance", content)
 
 
+# ─── Spot symbol aliases (Binance quirks: perp != spot listing) ──────────────
+# Some tokens list under a different symbol on Binance spot vs futures.
+# User typically passes the futures/generic name (e.g. HYPEUSDT); we auto-resolve.
+_SPOT_SYMBOL_ALIASES = {
+    "HYPEUSDT": "HYPERUSDT",   # Hyperliquid token — spot listed as HYPER
+}
+
+
+def _resolve_spot_symbol(symbol: str) -> str:
+    """Map user-friendly / futures symbol to actual Binance spot symbol.
+
+    Accepts either the aliased name (HYPEUSDT) or the real name (HYPERUSDT).
+    Returns whatever Binance spot API accepts.
+    """
+    s = symbol.upper().strip()
+    return _SPOT_SYMBOL_ALIASES.get(s, s)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TOOL 1: binance_spot_price
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -566,7 +584,12 @@ async def _compute_cvd(
     venue: str, endpoint: str, symbol: str, interval: str, limit: int,
 ) -> str:
     """Shared CVD compute logic for spot + futures."""
-    sym_upper = symbol.upper()
+    # For spot venue, resolve Binance spot symbol aliases (e.g. HYPE→HYPER).
+    # Futures venue keeps the original symbol.
+    if venue == "spot":
+        sym_upper = _resolve_spot_symbol(symbol)
+    else:
+        sym_upper = symbol.upper()
     # weight map for klines
     if limit <= 100:
         weight = 2
