@@ -11,6 +11,8 @@ from datetime import datetime, timezone, timedelta
 from .binance_client import binance_futures_request, binance_spot_request
 from .config import make_envelope
 from .formatters import _tool_envelope, _fmt_num
+from . import okx_client
+from . import multi_exchange
 
 WIB = timezone(timedelta(hours=7))
 
@@ -92,13 +94,17 @@ def register_data_binance_tool(mcp):
             _capped(binance_futures_request("/fapi/v1/depth", {"symbol": fut_sym, "limit": 100}, weight=10), timeout=10),
             _capped(binance_futures_request("/fapi/v1/klines", {"symbol": fut_sym, "interval": interval, "limit": limit}, weight=5), timeout=10),
             _capped(binance_spot_request("/api/v3/klines", {"symbol": spot_sym, "interval": interval, "limit": limit}, weight=2), timeout=10),
-            _capped(binance_futures_request("/fapi/v1/forceOrders", {"symbol": fut_sym, "limit": 30}, weight=20), timeout=10),
+            # Liquidations: use OKX public endpoint (Binance /forceOrders requires API key since 2022)
+            _capped(okx_client.okx_request(
+                "/api/v5/public/liquidation-orders",
+                {"instType": "SWAP", "uly": f"{sym}-USDT", "state": "filled", "limit": "30"},
+            ), timeout=10),
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         (bn_premium, bn_ticker24h, bn_oi_snap, bn_oi_hist,
          bn_ls, bn_top_ls, bn_taker, bn_depth,
-         bn_fut_klines, bn_spot_klines, bn_liqs) = results
+         bn_fut_klines, bn_spot_klines, okx_liqs) = results
 
         # ═════════════════════════════════════════════════════════════════
         output = f"# DATA BINANCE — {sym} ({interval})\n"
@@ -275,33 +281,46 @@ def register_data_binance_tool(mcp):
             output += f"**Summary:** Bids {_fmt_num(total_bid_val)} vs Asks {_fmt_num(total_ask_val)} → **{dominant}** (ratio {ratio:.2f})\n"
             output += f"**Spread:** ${spread:,.2f} ({spread_pct:.4f}%)\n\n"
 
-        # Liquidations
-        if isinstance(bn_liqs, list) and bn_liqs:
-            show = bn_liqs[-15:]
+        # Liquidations — OKX public endpoint (Binance /forceOrders requires API key)
+        # OKX response shape: {data: [{details: [{bkPx, posSide, sz, ts, ...}]}]}
+        # sz is in CONTRACTS → multiply by ct_val (OKX SWAP) for base units, then × bkPx for USD.
+        okx_liq_details = []
+        if isinstance(okx_liqs, list):
+            for group in okx_liqs:
+                if isinstance(group, dict):
+                    okx_liq_details.extend(group.get("details", []) or [])
+
+        if okx_liq_details:
+            # Newest first → chronological (oldest→newest) for display, take last 15
+            okx_liq_details.sort(key=lambda d: int(d.get("ts", 0)))
+            show = okx_liq_details[-15:]
+            ct_val = await multi_exchange._okx_ct_val(fut_sym)  # base per contract
             total_long = 0.0
             total_short = 0.0
-            output += f"**Recent Forced Liquidations:**\n```\n"
+            output += f"**Recent Forced Liquidations (OKX public):**\n```\n"
             output += f" {'Price':>13} | {'Qty':>10} | {'Value':>10} | {'Side':>5} | Time\n"
             output += f" {'─' * 13} | {'─' * 10} | {'─' * 10} | {'─' * 5} | ─────\n"
             for d in show:
-                price = float(d.get("averagePrice") or d.get("price", 0))
-                qty = float(d.get("executedQty") or d.get("origQty", 0))
-                val = price * qty
-                side = d.get("side", "")
-                liq_side = "LONG" if side == "SELL" else "SHORT"
-                ts = d.get("time", 0)
-                ts_str = datetime.fromtimestamp(int(ts) / 1000, tz=WIB).strftime("%H:%M") if ts else "?"
+                bk_px = float(d.get("bkPx") or 0)
+                sz_contracts = float(d.get("sz") or 0)
+                base_qty = sz_contracts * ct_val
+                val = bk_px * base_qty
+                # OKX posSide = position that got liquidated
+                pos_side = (d.get("posSide") or "").lower()
+                liq_side = "LONG" if pos_side == "long" else "SHORT"
+                ts = int(d.get("ts") or 0)
+                ts_str = datetime.fromtimestamp(ts / 1000, tz=WIB).strftime("%H:%M") if ts else "?"
                 if liq_side == "LONG":
                     total_long += val
                 else:
                     total_short += val
-                output += f" ${price:>12,.2f} | {qty:>10,.4f} | {_fmt_num(val):>10} | {liq_side:>5} | {ts_str}\n"
+                output += f" ${bk_px:>12,.2f} | {base_qty:>10,.4f} | {_fmt_num(val):>10} | {liq_side:>5} | {ts_str}\n"
             output += "```\n"
-            output += f"**Summary:** LONG liq: {_fmt_num(total_long)} | SHORT liq: {_fmt_num(total_short)}\n\n"
-        elif isinstance(bn_liqs, dict) and "error" in bn_liqs:
-            output += f"**Liquidations:** {bn_liqs.get('error', 'not available')} (may require API key)\n\n"
-        elif isinstance(bn_liqs, list) and len(bn_liqs) == 0:
-            output += f"**Liquidations:** No recent forced liquidations for {sym}\n\n"
+            output += f"**Summary:** LONG liq: {_fmt_num(total_long)} | SHORT liq: {_fmt_num(total_short)} (source: OKX)\n\n"
+        elif isinstance(okx_liqs, dict) and "error" in okx_liqs:
+            output += f"**Liquidations:** {okx_liqs.get('error', 'unavailable')} (OKX public)\n\n"
+        else:
+            output += f"**Liquidations:** No recent liquidations for {sym} on OKX\n\n"
 
         # ═════════════════════════════════════════════════════════════════
         # PHASE 4 — SPOT CROSS-CHECK + VWAP
