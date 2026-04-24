@@ -529,3 +529,163 @@ async def binance_spot_avg_price(symbol: str) -> str:
         f"- **Avg Price ({mins}min):** {_price(p)}",
         f"- **Close Time:** {t}",
     ]) + "\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOOL: binance_spot_cvd (Cumulative Volume Delta)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def binance_spot_cvd(symbol: str, interval: str = "5m", limit: int = 100) -> str:
+    """Compute Spot CVD (Cumulative Volume Delta) from Binance spot klines.
+
+    CVD = running sum of (takerBuy − takerSell) per candle, in USD (quote vol).
+    Rising CVD = buyers dominant. Falling CVD = sellers dominant.
+
+    Primary VETO signal for Ricoz scalping framework:
+      - Price ↑ + CVD ↑ → healthy uptrend (confirm long)
+      - Price ↑ + CVD ↓ → bearish divergence (avoid long / short setup)
+      - Price ↓ + CVD ↑ → bullish divergence (avoid short / long setup)
+      - Price ↓ + CVD ↓ → healthy downtrend (confirm short)
+
+    Args:
+        symbol: Spot pair (e.g. BTCUSDT, SOLUSDT)
+        interval: 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M
+        limit: Number of candles to aggregate (default 100, max 1000)
+    """
+    return await _compute_cvd(
+        venue="spot",
+        endpoint="/api/v3/klines",
+        symbol=symbol,
+        interval=interval,
+        limit=limit,
+    )
+
+
+async def _compute_cvd(
+    venue: str, endpoint: str, symbol: str, interval: str, limit: int,
+) -> str:
+    """Shared CVD compute logic for spot + futures."""
+    sym_upper = symbol.upper()
+    # weight map for klines
+    if limit <= 100:
+        weight = 2
+    elif limit <= 500:
+        weight = 5
+    elif limit <= 1000:
+        weight = 10
+    else:
+        weight = 20
+        limit = min(limit, 1000)
+
+    params = {"symbol": sym_upper, "interval": interval, "limit": limit}
+    if venue == "spot":
+        data = await binance_spot_request(endpoint, params, weight)
+    else:
+        from .binance_client import binance_futures_request
+        data = await binance_futures_request(endpoint, params, weight)
+
+    venue_label = "Spot" if venue == "spot" else "Futures"
+    title = f"{venue_label} CVD — {sym_upper} {interval}"
+    hdr = _header(title).replace("Binance Spot", f"Binance {venue_label}")
+
+    e = _err_check(data, hdr)
+    if e:
+        return e
+
+    items = data if isinstance(data, list) else []
+    if not items:
+        return make_envelope("failed", "binance", hdr + "**WARNING: Empty dataset.**")
+
+    # Parse each candle → delta (USD) + cumulative CVD
+    rows = []
+    cvd = 0.0
+    for c in items:
+        ts = c[0]
+        close = _f(c[4])
+        vol_base = _f(c[5])
+        quote_vol = _f(c[7])
+        taker_buy_base = _f(c[9])
+        taker_buy_quote = _f(c[10])
+        # delta in USD = takerBuy - takerSell = 2*takerBuy - total
+        delta_usd = 2 * taker_buy_quote - quote_vol
+        delta_base = 2 * taker_buy_base - vol_base
+        cvd += delta_usd
+        rows.append({
+            "ts": ts,
+            "close": close,
+            "vol_base": vol_base,
+            "quote_vol": quote_vol,
+            "delta_usd": delta_usd,
+            "delta_base": delta_base,
+            "cvd": cvd,
+        })
+
+    # Trim display to last 30 rows
+    display_rows = rows
+    if len(rows) > 30:
+        display_rows = rows[-30:]
+        hdr += f"*(showing last 30 of {len(rows)})*\n\n"
+
+    table = "```\n"
+    table += f" {'Time':>16} | {'Close':>12} | {'Delta':>11} | {'CVD':>11} | Side\n"
+    table += f" {'─' * 16} | {'─' * 12} | {'─' * 11} | {'─' * 11} | ────\n"
+    for r in display_rows:
+        t = _dt(r["ts"])
+        delta = r["delta_usd"]
+        delta_str = f"+{_dollar(delta)}" if delta >= 0 else _dollar(delta)
+        cvd_str = f"+{_dollar(r['cvd'])}" if r["cvd"] >= 0 else _dollar(r["cvd"])
+        side = "BUY" if delta >= 0 else "SELL"
+        table += (
+            f" {t:>16} | {_price(r['close']):>12} | {delta_str:>11} | "
+            f"{cvd_str:>11} | {side:>4}\n"
+        )
+    table += "```\n"
+
+    # Summary metrics over the FULL series (not just displayed slice)
+    first_price = rows[0]["close"]
+    last_price = rows[-1]["close"]
+    price_change_pct = ((last_price - first_price) / first_price * 100) if first_price else 0
+
+    first_cvd = rows[0]["cvd"]
+    last_cvd = rows[-1]["cvd"]
+    cvd_change = last_cvd - first_cvd
+    # Net delta = same as last_cvd - (first_cvd - first_delta) = sum of all deltas
+    net_delta = sum(r["delta_usd"] for r in rows)
+
+    # Trend: compare first third vs last third avg CVD
+    third = max(1, len(rows) // 3)
+    first_third_cvd = sum(r["cvd"] for r in rows[:third]) / third
+    last_third_cvd = sum(r["cvd"] for r in rows[-third:]) / third
+    cvd_direction = "RISING" if last_third_cvd > first_third_cvd else "FALLING"
+
+    # Divergence flag
+    price_up = price_change_pct > 0.1
+    price_dn = price_change_pct < -0.1
+    cvd_up = cvd_direction == "RISING"
+    cvd_dn = cvd_direction == "FALLING"
+    divergence = ""
+    if price_up and cvd_dn:
+        divergence = "⚠️ **BEARISH DIVERGENCE** — price naik tapi CVD turun (buyers menipis)"
+    elif price_dn and cvd_up:
+        divergence = "⚠️ **BULLISH DIVERGENCE** — price turun tapi CVD naik (buyers accumulating)"
+    elif price_up and cvd_up:
+        divergence = "✅ Confirmed uptrend — price + CVD both rising"
+    elif price_dn and cvd_dn:
+        divergence = "✅ Confirmed downtrend — price + CVD both falling"
+    else:
+        divergence = "➖ Neutral — price mostly flat"
+
+    # Buy-dominant candle ratio
+    buy_count = sum(1 for r in rows if r["delta_usd"] > 0)
+
+    summary = "\n".join([
+        f"**Summary over {len(rows)} candles:**",
+        f"- Price: {_price(first_price)} → {_price(last_price)} ({price_change_pct:+.2f}%)",
+        f"- CVD: {_dollar(first_cvd)} → {_dollar(last_cvd)} ({_dollar(cvd_change)})",
+        f"- Net delta: {_dollar(net_delta)} | CVD trend: **{cvd_direction}**",
+        f"- Buy-dominant candles: {buy_count}/{len(rows)} ({buy_count*100//len(rows)}%)",
+        f"- Signal: {divergence}",
+    ])
+
+    return _ok(hdr + table + "\n" + summary)

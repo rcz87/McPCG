@@ -226,6 +226,7 @@ from .binance_spot import (
     binance_spot_ticker_24h,
     binance_spot_book_ticker,
     binance_spot_avg_price,
+    binance_spot_cvd,
 )
 
 from .binance_futures import (
@@ -240,6 +241,7 @@ from .binance_futures import (
     binance_futures_depth,
     binance_futures_ticker_24h,
     binance_futures_liquidation,
+    binance_futures_cvd,
 )
 
 # Register Binance Spot tools
@@ -251,6 +253,7 @@ mcp.tool()(binance_spot_agg_trades)
 mcp.tool()(binance_spot_ticker_24h)
 mcp.tool()(binance_spot_book_ticker)
 mcp.tool()(binance_spot_avg_price)
+mcp.tool()(binance_spot_cvd)
 
 # Register Binance Futures tools
 mcp.tool()(binance_futures_price)
@@ -264,6 +267,7 @@ mcp.tool()(binance_futures_klines)
 mcp.tool()(binance_futures_depth)
 mcp.tool()(binance_futures_ticker_24h)
 mcp.tool()(binance_futures_liquidation)
+mcp.tool()(binance_futures_cvd)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

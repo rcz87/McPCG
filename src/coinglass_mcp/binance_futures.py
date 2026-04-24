@@ -927,3 +927,35 @@ async def binance_futures_liquidation(symbol: str = "", limit: int = 100) -> str
     table += f"\n**Summary:** LONG liq: {_dollar(total_long_val)} | SHORT liq: {_dollar(total_short_val)}"
 
     return _ok(hdr + table)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOOL: binance_futures_cvd (Cumulative Volume Delta — perp market)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def binance_futures_cvd(symbol: str, interval: str = "5m", limit: int = 100) -> str:
+    """Compute Futures CVD (Cumulative Volume Delta) from Binance perp klines.
+
+    CVD = running sum of (takerBuy − takerSell) per candle, in USD (quote vol).
+    Futures CVD = aggressive futures taker flow (perp orderflow).
+
+    Use alongside binance_spot_cvd:
+      - Both rising → strong buyer conviction across spot + perp
+      - Spot CVD rising + Futures CVD falling → spot-led pump (stronger signal)
+      - Futures CVD rising + Spot CVD falling → leveraged-only pump (fragile)
+
+    Args:
+        symbol: Futures pair (e.g. BTCUSDT, SOLUSDT)
+        interval: 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M
+        limit: Number of candles (default 100, max 1500)
+    """
+    from .binance_spot import _compute_cvd
+    # Binance futures klines: max limit is 1500
+    return await _compute_cvd(
+        venue="futures",
+        endpoint="/fapi/v1/klines",
+        symbol=symbol,
+        interval=interval,
+        limit=min(limit, 1500),
+    )
