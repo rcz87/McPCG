@@ -7,13 +7,51 @@ All PUBLIC endpoints — no API key required.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from .binance_client import binance_futures_request
 from .config import make_envelope
+from . import multi_exchange as _mx
 
 WIB = timezone(timedelta(hours=7))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MULTI-EXCHANGE HELPERS (Binance + OKX aggregation)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _multi_header(title: str, ok: list[str], failed: dict[str, str]) -> str:
+    """Header for multi-exchange aggregated output."""
+    src = "+".join(ok) if ok else "none"
+    tag = f"Source: {src}"
+    if failed:
+        tag += f" | Failed: {', '.join(failed.keys())}"
+    return f"## {title}\n\nData: LIVE | {tag} | {_ts()}\n\n"
+
+
+def _multi_source_tag(ok: list[str]) -> str:
+    """Envelope source tag. 'binance+okx' if both, else the one that worked."""
+    if len(ok) >= 2:
+        return "binance+okx"
+    if ok:
+        return ok[0]
+    return "binance"  # fallback (even on total failure, we came from binance tool)
+
+
+def _multi_err_check(result: dict, hdr: str) -> str | None:
+    """Emit failed-envelope if no exchange responded successfully."""
+    if result.get("status") == "failed":
+        fe = result.get("exchanges_failed", {})
+        detail = "; ".join(f"{k}: {v}" for k, v in fe.items())
+        return make_envelope(
+            "failed", _multi_source_tag(result.get("exchanges_ok", [])),
+            hdr + f"**ERROR:** {detail}",
+            fallback_suggestion="Try coinglass equivalent tool",
+        )
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -94,68 +132,83 @@ def _ok(content: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def binance_futures_price(symbol: str = "") -> str:
-    """Get futures mark price + live funding rate from Binance.
+    """Get futures mark price + FR aggregated across Binance + OKX.
 
-    Without symbol, returns ALL perpetual contracts.
-
-    Response includes: symbol, markPrice, indexPrice,
-    lastFundingRate, nextFundingTime, interestRate.
+    With symbol: vol-weighted mark price + per-exchange breakdown.
+    Without symbol: all Binance perps (OKX multi-symbol aggregation not supported — single-source).
 
     Args:
-        symbol: Futures pair (e.g. SOLUSDT). Leave empty for all.
+        symbol: Futures pair (e.g. SOLUSDT). Leave empty for all (Binance-only).
     """
-    params = {}
-    weight = 10
-    if symbol:
-        params["symbol"] = symbol.upper()
-        weight = 1
-    data = await binance_futures_request("/fapi/v1/premiumIndex", params, weight)
-    label = f"Futures Price — {symbol.upper()}" if symbol else "Futures Prices (all)"
+    # Multi-symbol path: OKX doesn't support bulk ticker the same way — keep Binance-only
+    if not symbol:
+        params: dict = {}
+        data = await binance_futures_request("/fapi/v1/premiumIndex", params, 10)
+        label = "Futures Prices (all, Binance only)"
+        hdr = _header(label)
+        e = _err_check(data, hdr)
+        if e:
+            return e
+        items = data if isinstance(data, list) else [data]
+        if len(items) > 30:
+            total = len(items)
+            items = items[:30]
+            hdr += f"*(showing first 30 of {total})*\n\n"
+        table = "```\n"
+        table += f" {'Symbol':<14} | {'Mark Price':>13} | {'FR':>9} | Next\n"
+        table += f" {'─' * 14} | {'─' * 13} | {'─' * 9} | ─────\n"
+        for d in items:
+            sym = d.get("symbol", "")
+            mark = _f(d.get("markPrice"))
+            fr = _f(d.get("lastFundingRate")) * 100
+            next_t = _dt(d.get("nextFundingTime", 0))
+            table += f" {sym:<14} | {_price(mark):>13} | {fr:>+8.4f}% | {next_t}\n"
+        table += "```\n"
+        return _ok(hdr + table)
 
-    hdr = _header(label)
-    e = _err_check(data, hdr)
+    # Single symbol: aggregate from Binance + OKX
+    sym_upper = symbol.upper()
+    result = await _mx.aggregate_mark_price(sym_upper)
+    title = f"Futures Price (agg) — {sym_upper}"
+    ok = result["exchanges_ok"]
+    failed = result["exchanges_failed"]
+
+    hdr = _multi_header(title, ok, failed)
+    e = _multi_err_check(result, hdr)
     if e:
         return e
 
-    items = data if isinstance(data, list) else [data]
+    agg = result["aggregated"]
+    by = result["by_exchange"]
 
-    # Single symbol — detailed view
-    if len(items) == 1:
-        d = items[0]
-        mark = _f(d.get("markPrice"))
-        index = _f(d.get("indexPrice"))
-        settle = _f(d.get("estimatedSettlePrice"))
-        fr = _f(d.get("lastFundingRate")) * 100
-        interest = _f(d.get("interestRate")) * 100
-        next_t = _dt(d.get("nextFundingTime", 0))
-        fr_tag = "NEGATIF (shorts pay)" if fr < 0 else "POSITIF (longs pay)" if fr > 0 else "NEUTRAL"
+    lines = [
+        f"- **VWAP Mark Price:** {_price(agg['vwap_mark_price'])} "
+        f"(weighted by 24h vol)",
+        f"- **Total 24h Volume:** {_dollar(agg['total_vol_24h_usd'])}",
+        "",
+        "**By exchange:**",
+    ]
+    for ex in ("binance", "okx"):
+        d = by.get(ex)
+        if not d:
+            continue
+        pct = (d["vol_24h_usd"] / agg["total_vol_24h_usd"] * 100) if agg["total_vol_24h_usd"] else 0
+        fr_str = ""
+        if "funding_rate" in d:
+            fr_pct = d["funding_rate"] * 100
+            fr_tag = "negatif" if fr_pct < 0 else "positif" if fr_pct > 0 else "neutral"
+            fr_str = f" | FR {fr_pct:+.4f}% ({fr_tag})"
+        lines.append(
+            f"- **{ex.capitalize()}:** mark {_price(d['mark_price'])} | "
+            f"vol24h {_dollar(d['vol_24h_usd'])} ({pct:.1f}%){fr_str}"
+        )
 
-        return _ok(hdr + "\n".join([
-            f"- **Mark Price:** {_price(mark)}",
-            f"- **Index Price:** {_price(index)}",
-            f"- **Est. Settle Price:** {_price(settle)}",
-            f"- **Funding Rate:** {fr:+.4f}% — {fr_tag}",
-            f"- **Interest Rate:** {interest:.4f}%",
-            f"- **Next Funding:** {next_t}",
-        ]) + "\n")
+    if failed:
+        lines.append("")
+        lines.append(f"⚠️ **Failed:** {', '.join(failed.keys())}")
 
-    # Multiple symbols — table view
-    if len(items) > 30:
-        total = len(items)
-        items = items[:30]
-        hdr += f"*(showing first 30 of {total})*\n\n"
-
-    table = "```\n"
-    table += f" {'Symbol':<14} | {'Mark Price':>13} | {'FR':>9} | Next\n"
-    table += f" {'─' * 14} | {'─' * 13} | {'─' * 9} | ─────\n"
-    for d in items:
-        sym = d.get("symbol", "")
-        mark = _f(d.get("markPrice"))
-        fr = _f(d.get("lastFundingRate")) * 100
-        next_t = _dt(d.get("nextFundingTime", 0))
-        table += f" {sym:<14} | {_price(mark):>13} | {fr:>+8.4f}% | {next_t}\n"
-    table += "```\n"
-    return _ok(hdr + table)
+    status = "success" if not failed else "partial"
+    return make_envelope(status, _multi_source_tag(ok), hdr + "\n".join(lines) + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -163,44 +216,128 @@ async def binance_futures_price(symbol: str = "") -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
-    """Get funding rate history from Binance.
+    """Get funding rate from Binance + OKX.
 
-    Cross-check with CoinGlass funding rate data.
+    Shows current OI-weighted FR (primary signal) + Binance FR history (8h periods).
+    OKX FR history is side-by-side when timestamps align; Binance is authoritative timeline
+    because its FR epoch is the standard 8h tick.
 
     Args:
         symbol: Futures pair (e.g. SOLUSDT)
-        limit: Number of records (default 100, max 1000)
+        limit: Number of Binance history records (default 100, max 1000)
     """
-    params = {"symbol": symbol.upper(), "limit": min(limit, 1000)}
-    data = await binance_futures_request("/fapi/v1/fundingRate", params, 1)
-    title = f"Funding Rate History — {symbol.upper()}"
+    sym_upper = symbol.upper()
+    limit = min(limit, 1000)
 
-    hdr = _header(title)
-    e = _err_check(data, hdr)
-    if e:
-        return e
+    # Parallel: current aggregate + Binance FR history + OKX FR history
+    okx_sym = _mx.okx_client.to_okx_swap(sym_upper)
+    current_task = _mx.aggregate_funding_current(sym_upper)
+    bnb_hist_task = binance_futures_request(
+        "/fapi/v1/fundingRate",
+        {"symbol": sym_upper, "limit": limit},
+        1,
+    )
+    okx_hist_task = _mx.okx_client.okx_request(
+        "/api/v5/public/funding-rate-history",
+        {"instId": okx_sym, "limit": "100"},
+    )
 
-    items = data if isinstance(data, list) else [data]
+    current, bnb_hist, okx_hist = await asyncio.gather(
+        current_task, bnb_hist_task, okx_hist_task, return_exceptions=True,
+    )
+
+    title = f"Funding Rate — {sym_upper}"
+    ok_current = current["exchanges_ok"] if isinstance(current, dict) else []
+    failed_current = current["exchanges_failed"] if isinstance(current, dict) else {}
+
+    hdr = _multi_header(title, ok_current, failed_current)
+
+    # Build OKX history lookup by fundingTime bucket (8h buckets)
+    okx_by_ts: dict[int, float] = {}
+    if (not isinstance(okx_hist, Exception)
+            and not _mx._is_err(okx_hist)
+            and isinstance(okx_hist, list)):
+        for d in okx_hist:
+            ts = _mx._floor_ts(d.get("fundingTime", 0), "8h")
+            okx_by_ts[ts] = _f(d.get("fundingRate"))
+
+    # Binance history as authoritative timeline
+    if isinstance(bnb_hist, Exception) or _mx._is_err(bnb_hist):
+        # No history — fallback to current only
+        if isinstance(current, dict) and current.get("status") != "failed":
+            agg = current["aggregated"]
+            by = current["by_exchange"]
+            lines = [
+                f"- **Weighted FR (current):** {agg['weighted_funding_rate']*100:+.4f}%",
+                f"- **Total OI:** {_dollar(agg['total_oi_usd'])}",
+                "",
+                "**By exchange:**",
+            ]
+            for ex in ("binance", "okx"):
+                d = by.get(ex)
+                if not d:
+                    continue
+                lines.append(
+                    f"- **{ex.capitalize()}:** FR {d['funding_rate']*100:+.4f}% | "
+                    f"OI {_dollar(d['oi_usd'])}"
+                )
+            lines.append("")
+            lines.append("⚠️ Binance FR history unavailable; showing current snapshot only.")
+            return make_envelope("partial", _multi_source_tag(ok_current),
+                                 hdr + "\n".join(lines) + "\n")
+        err = _mx._err_msg(bnb_hist) if isinstance(bnb_hist, dict) else str(bnb_hist)
+        return make_envelope("failed", "binance",
+                             hdr + f"**ERROR:** Binance FR history failed: {err}")
+
+    items = bnb_hist if isinstance(bnb_hist, list) else [bnb_hist]
+
+    # Current weighted FR header block
+    preamble = ""
+    if isinstance(current, dict) and current.get("status") != "failed":
+        agg = current["aggregated"]
+        by = current["by_exchange"]
+        bnb_fr = by.get("binance", {}).get("funding_rate", 0) * 100
+        okx_fr = by.get("okx", {}).get("funding_rate", 0) * 100
+        preamble = (
+            f"**Current (weighted by OI):** {agg['weighted_funding_rate']*100:+.4f}% | "
+            f"Binance {bnb_fr:+.4f}% | OKX {okx_fr:+.4f}%\n\n"
+        )
+
     if len(items) > 30:
         total = len(items)
         items = items[-30:]
         hdr += f"*(showing last 30 of {total})*\n\n"
 
     table = "```\n"
-    table += f" {'Time':>16} | {'FR':>9} | {'Mark Price':>13}\n"
-    table += f" {'─' * 16} | {'─' * 9} | {'─' * 13}\n"
+    table += f" {'Time':>16} | {'Binance FR':>10} | {'OKX FR':>10} | {'Mark Price':>13}\n"
+    table += f" {'─' * 16} | {'─' * 10} | {'─' * 10} | {'─' * 13}\n"
     for d in items:
-        t = _dt(d.get("fundingTime", 0))
-        fr = _f(d.get("fundingRate")) * 100
+        ts_raw = d.get("fundingTime", 0)
+        t = _dt(ts_raw)
+        bnb_fr = _f(d.get("fundingRate")) * 100
+        ts_bucket = _mx._floor_ts(ts_raw, "8h")
+        okx_fr_val = okx_by_ts.get(ts_bucket)
+        okx_str = f"{okx_fr_val*100:+.4f}%" if okx_fr_val is not None else "—"
         mark = _f(d.get("markPrice"))
-        table += f" {t:>16} | {fr:>+8.4f}% | {_price(mark):>13}\n"
+        table += f" {t:>16} | {bnb_fr:>+9.4f}% | {okx_str:>10} | {_price(mark):>13}\n"
     table += "```\n"
 
-    rates = [_f(d.get("fundingRate")) * 100 for d in items]
-    avg_fr = sum(rates) / len(rates) if rates else 0
-    table += f"\n**Summary:** Avg FR: {avg_fr:+.4f}% over {len(items)} periods"
+    bnb_rates = [_f(d.get("fundingRate")) * 100 for d in items]
+    avg_bnb = sum(bnb_rates) / len(bnb_rates) if bnb_rates else 0
+    matched_okx = [
+        okx_by_ts[_mx._floor_ts(d.get("fundingTime", 0), "8h")]
+        for d in items
+        if _mx._floor_ts(d.get("fundingTime", 0), "8h") in okx_by_ts
+    ]
+    avg_okx = (sum(matched_okx) / len(matched_okx) * 100) if matched_okx else 0
+    table += (
+        f"\n**Summary:** Avg Binance {avg_bnb:+.4f}% | "
+        f"Avg OKX {avg_okx:+.4f}% (matched {len(matched_okx)}/{len(items)})"
+    )
 
-    return _ok(hdr + table)
+    status = "success" if not failed_current and okx_by_ts else "partial"
+    return make_envelope(status, _multi_source_tag(ok_current or ["binance"]),
+                         hdr + preamble + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -208,32 +345,48 @@ async def binance_futures_funding_rate(symbol: str, limit: int = 100) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def binance_futures_open_interest(symbol: str) -> str:
-    """Get current Open Interest (total open contracts) from Binance.
+    """Get current Open Interest aggregated across Binance + OKX.
 
-    Realtime single snapshot.
+    Returns total OI (USD), plus per-exchange breakdown.
+    Aggregation: SUM across exchanges (cross-exchange perp exposure).
 
     Args:
-        symbol: Futures pair (e.g. SOLUSDT)
+        symbol: Futures pair (e.g. SOLUSDT, BTCUSDT)
     """
-    params = {"symbol": symbol.upper()}
-    data = await binance_futures_request("/fapi/v1/openInterest", params, 1)
-    title = f"Open Interest — {symbol.upper()}"
+    sym_upper = symbol.upper()
+    result = await _mx.aggregate_oi_current(sym_upper)
+    title = f"Open Interest — {sym_upper}"
+    ok = result["exchanges_ok"]
+    failed = result["exchanges_failed"]
 
-    hdr = _header(title)
-    e = _err_check(data, hdr)
+    hdr = _multi_header(title, ok, failed)
+    e = _multi_err_check(result, hdr)
     if e:
         return e
 
-    d = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else {})
-    oi = _f(d.get("openInterest"))
-    sym = d.get("symbol", symbol.upper())
-    t = _dt(d.get("time", 0))
+    agg = result["aggregated"]
+    by = result["by_exchange"]
 
-    return _ok(hdr + "\n".join([
-        f"- **Symbol:** {sym}",
-        f"- **Open Interest:** {oi:,.3f} contracts",
-        f"- **Time:** {t}",
-    ]) + "\n")
+    lines = [
+        f"- **Total OI (aggregated):** {_dollar(agg['total_oi_usd'])}",
+        "",
+        "**By exchange:**",
+    ]
+    for ex in ("binance", "okx"):
+        d = by.get(ex)
+        if not d:
+            continue
+        pct = (d["oi_usd"] / agg["total_oi_usd"] * 100) if agg["total_oi_usd"] else 0
+        lines.append(
+            f"- **{ex.capitalize()}:** {_dollar(d['oi_usd'])} ({pct:.1f}%) — "
+            f"{d['oi_contracts']:,.3f} contracts"
+        )
+    if failed:
+        lines.append("")
+        lines.append(f"⚠️ **Failed sources:** {', '.join(failed.keys())}")
+
+    status = "success" if not failed else "partial"
+    return make_envelope(status, _multi_source_tag(ok), hdr + "\n".join(lines) + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -241,48 +394,63 @@ async def binance_futures_open_interest(symbol: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def binance_futures_oi_history(symbol: str, period: str = "5m", limit: int = 100) -> str:
-    """Get Open Interest history from Binance.
+    """Get OI history aggregated across Binance + OKX.
 
-    Cross-check with CoinGlass OI aggregate.
+    Binance: per-symbol (BTCUSDT perp only).
+    OKX rubik: ccy-aggregated (all BTC contracts) — broader scope but useful for total.
+    Aggregation: SUM per timestamp bucket.
 
     Args:
-        symbol: Futures pair (e.g. SOLUSDT)
+        symbol: Futures pair (e.g. SOLUSDT, BTCUSDT)
         period: 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d
         limit: Number of records (default 100, max 500)
     """
-    params = {"symbol": symbol.upper(), "period": period, "limit": min(limit, 500)}
-    data = await binance_futures_request("/futures/data/openInterestHist", params, 1)
-    title = f"OI History — {symbol.upper()} {period}"
+    sym_upper = symbol.upper()
+    result = await _mx.aggregate_oi_history(sym_upper, period, min(limit, 500))
+    title = f"OI History — {sym_upper} {period}"
+    ok = result["exchanges_ok"]
+    failed = result["exchanges_failed"]
 
-    hdr = _header(title)
-    e = _err_check(data, hdr)
+    hdr = _multi_header(title, ok, failed)
+    e = _multi_err_check(result, hdr)
     if e:
         return e
 
-    items = data if isinstance(data, list) else [data]
-    if len(items) > 30:
-        total = len(items)
-        items = items[-30:]
+    rows = result["aggregated"]
+    if len(rows) > 30:
+        total = len(rows)
+        rows = rows[-30:]
         hdr += f"*(showing last 30 of {total})*\n\n"
 
     table = "```\n"
-    table += f" {'Time':>16} | {'OI (contracts)':>14} | {'OI (USD)':>12}\n"
-    table += f" {'─' * 16} | {'─' * 14} | {'─' * 12}\n"
-    for d in items:
-        t = _dt(d.get("timestamp", 0))
-        oi = _f(d.get("sumOpenInterest"))
-        oi_val = _f(d.get("sumOpenInterestValue"))
-        table += f" {t:>16} | {oi:>14,.2f} | {_dollar(oi_val):>12}\n"
+    table += f" {'Time':>16} | {'Total OI':>12} | {'Binance':>12} | {'OKX':>12}\n"
+    table += f" {'─' * 16} | {'─' * 12} | {'─' * 12} | {'─' * 12}\n"
+    for r in rows:
+        t = _dt(r["ts_ms"])
+        total = _dollar(r["total_oi_usd"])
+        bnb = _dollar(r["binance_oi_usd"]) if r["binance_oi_usd"] else "—"
+        okx = _dollar(r["okx_oi_usd"]) if r["okx_oi_usd"] else "—"
+        table += f" {t:>16} | {total:>12} | {bnb:>12} | {okx:>12}\n"
     table += "```\n"
 
-    if len(items) >= 2:
-        first_val = _f(items[0].get("sumOpenInterestValue"))
-        last_val = _f(items[-1].get("sumOpenInterestValue"))
-        change = last_val - first_val
-        pct = (change / first_val * 100) if first_val else 0
-        table += f"\n**Summary:** {_dollar(first_val)} → {_dollar(last_val)} (change: {_dollar(change)}, {pct:+.2f}%)"
+    # Summary: first vs last complete bucket (both exchanges present)
+    complete = [r for r in rows if r["binance_oi_usd"] > 0 and r["okx_oi_usd"] > 0]
+    if len(complete) >= 2:
+        first = complete[0]["total_oi_usd"]
+        last = complete[-1]["total_oi_usd"]
+        change = last - first
+        pct = (change / first * 100) if first else 0
+        table += f"\n**Summary:** {_dollar(first)} → {_dollar(last)} (change: {_dollar(change)}, {pct:+.2f}%)"
 
-    return _ok(hdr + table)
+    notes = result.get("notes", {})
+    if notes.get("okx_scope"):
+        table += f"\n**Note:** OKX data is {notes['okx_scope']}; Binance is per-symbol."
+
+    if failed:
+        table += f"\n⚠️ **Failed:** {', '.join(failed.keys())}"
+
+    status = "success" if not failed else "partial"
+    return make_envelope(status, _multi_source_tag(ok), hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -326,19 +494,61 @@ def _fmt_ls(data: Any, title: str) -> str:
 
 
 async def binance_futures_long_short_ratio(symbol: str, period: str = "5m", limit: int = 100) -> str:
-    """Get global long/short ACCOUNT ratio from Binance.
+    """Get global long/short ACCOUNT ratio aggregated across Binance + OKX.
 
     Ratio > 1 = more accounts are long.
-    Ratio < 1 = more accounts are short.
+    Aggregation: simple average of per-exchange ratios (equal weight).
 
     Args:
         symbol: Futures pair (e.g. SOLUSDT)
         period: 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d
         limit: Number of records (default 100, max 500)
     """
-    params = {"symbol": symbol.upper(), "period": period, "limit": min(limit, 500)}
-    data = await binance_futures_request("/futures/data/globalLongShortAccountRatio", params, 1)
-    return _fmt_ls(data, f"Global L/S Account Ratio — {symbol.upper()} {period}")
+    sym_upper = symbol.upper()
+    result = await _mx.aggregate_ls_ratio(sym_upper, period, min(limit, 500))
+    title = f"Global L/S Account Ratio (agg) — {sym_upper} {period}"
+    ok = result["exchanges_ok"]
+    failed = result["exchanges_failed"]
+
+    hdr = _multi_header(title, ok, failed)
+    e = _multi_err_check(result, hdr)
+    if e:
+        return e
+
+    rows = result["aggregated"]
+    if len(rows) > 30:
+        total = len(rows)
+        rows = rows[-30:]
+        hdr += f"*(showing last 30 of {total})*\n\n"
+
+    table = "```\n"
+    table += f" {'Time':>16} | {'Avg':>7} | {'Binance':>7} | {'OKX':>7}\n"
+    table += f" {'─' * 16} | {'─' * 7} | {'─' * 7} | {'─' * 7}\n"
+    for r in rows:
+        t = _dt(r["ts_ms"])
+        avg = r["avg_ratio"]
+        bnb = f"{r['binance_ratio']:.3f}" if r["binance_ratio"] else "—"
+        okx = f"{r['okx_ratio']:.3f}" if r["okx_ratio"] else "—"
+        table += f" {t:>16} | {avg:>7.3f} | {bnb:>7} | {okx:>7}\n"
+    table += "```\n"
+
+    ratios = [r["avg_ratio"] for r in rows if r["avg_ratio"] > 0]
+    avg_all = sum(ratios) / len(ratios) if ratios else 0
+    if len(ratios) >= 2:
+        shift = ratios[-1] - ratios[0]
+        direction = "more long" if shift > 0 else "more short"
+        table += (
+            f"\n**Summary:** Avg ratio: {avg_all:.3f}, range {min(ratios):.3f}-{max(ratios):.3f} | "
+            f"Shift: {shift:+.3f} ({direction})"
+        )
+    else:
+        table += f"\n**Summary:** Ratio: {avg_all:.3f}"
+
+    if failed:
+        table += f"\n⚠️ **Failed:** {', '.join(failed.keys())}"
+
+    status = "success" if not failed else "partial"
+    return make_envelope(status, _multi_source_tag(ok), hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -365,54 +575,62 @@ async def binance_futures_top_ls_ratio(symbol: str, period: str = "5m", limit: i
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def binance_futures_taker_volume(symbol: str, period: str = "5m", limit: int = 100) -> str:
-    """Get futures taker buy/sell volume ratio from Binance.
+    """Get taker buy/sell volume aggregated across Binance + OKX.
 
-    buySellRatio > 1 = buyers dominant (bullish taker flow).
-    buySellRatio < 1 = sellers dominant (bearish taker flow).
+    Aggregation: SUM buy / SUM sell per timestamp bucket (both converted to USD).
     Cross-check with CoinGlass FutCVD.
 
     Args:
-        symbol: Futures pair (e.g. SOLUSDT)
+        symbol: Futures pair (e.g. SOLUSDT, BTCUSDT)
         period: 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d
         limit: Number of records (default 100, max 500)
     """
-    params = {"symbol": symbol.upper(), "period": period, "limit": min(limit, 500)}
-    data = await binance_futures_request("/futures/data/takerlongshortRatio", params, 1)
-    title = f"Futures Taker Buy/Sell — {symbol.upper()} {period}"
+    sym_upper = symbol.upper()
+    result = await _mx.aggregate_taker_volume(sym_upper, period, min(limit, 500))
+    title = f"Taker Buy/Sell (agg) — {sym_upper} {period}"
+    ok = result["exchanges_ok"]
+    failed = result["exchanges_failed"]
 
-    hdr = _header(title)
-    e = _err_check(data, hdr)
+    hdr = _multi_header(title, ok, failed)
+    e = _multi_err_check(result, hdr)
     if e:
         return e
 
-    items = data if isinstance(data, list) else [data]
-    if len(items) > 30:
-        total = len(items)
-        items = items[-30:]
+    rows = result["aggregated"]
+    if len(rows) > 30:
+        total = len(rows)
+        rows = rows[-30:]
         hdr += f"*(showing last 30 of {total})*\n\n"
 
     table = "```\n"
-    table += f" {'Time':>16} | {'Buy Vol':>10} | {'Sell Vol':>10} | {'Net':>10} | {'Ratio':>6} | Side\n"
+    table += f" {'Time':>16} | {'Buy $':>10} | {'Sell $':>10} | {'Net':>10} | {'Ratio':>6} | Side\n"
     table += f" {'─' * 16} | {'─' * 10} | {'─' * 10} | {'─' * 10} | {'─' * 6} | ────\n"
-    for d in items:
-        t = _dt(d.get("timestamp", 0))
-        buy = _f(d.get("buyVol"))
-        sell = _f(d.get("sellVol"))
-        net = buy - sell
-        ratio = _f(d.get("buySellRatio"))
+    for r in rows:
+        t = _dt(r["ts_ms"])
+        buy = r["total_buy_usd"]
+        sell = r["total_sell_usd"]
+        net = r["net_usd"]
+        ratio = r["buy_sell_ratio"]
         side = "BUY" if ratio >= 1 else "SELL"
         net_str = f"+{_dollar(net)}" if net >= 0 else _dollar(net)
         table += f" {t:>16} | {_dollar(buy):>10} | {_dollar(sell):>10} | {net_str:>10} | {ratio:>6.3f} | {side:>4}\n"
     table += "```\n"
 
-    buy_count = sum(1 for d in items if _f(d.get("buySellRatio")) >= 1)
-    total_buy = sum(_f(d.get("buyVol")) for d in items)
-    total_sell = sum(_f(d.get("sellVol")) for d in items)
+    buy_count = sum(1 for r in rows if r["buy_sell_ratio"] >= 1)
+    total_buy = sum(r["total_buy_usd"] for r in rows)
+    total_sell = sum(r["total_sell_usd"] for r in rows)
     total_net = total_buy - total_sell
     net_str = f"+{_dollar(total_net)}" if total_net >= 0 else _dollar(total_net)
-    table += f"\n**Summary:** {buy_count}/{len(items)} buy-dominant | Buy {_dollar(total_buy)} vs Sell {_dollar(total_sell)} | Net {net_str}"
+    table += (
+        f"\n**Summary:** {buy_count}/{len(rows)} buy-dominant | "
+        f"Buy {_dollar(total_buy)} vs Sell {_dollar(total_sell)} | Net {net_str}"
+    )
 
-    return _ok(hdr + table)
+    if failed:
+        table += f"\n⚠️ **Failed:** {', '.join(failed.keys())}"
+
+    status = "success" if not failed else "partial"
+    return make_envelope(status, _multi_source_tag(ok), hdr + table)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
