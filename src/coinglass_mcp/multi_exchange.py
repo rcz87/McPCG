@@ -327,18 +327,27 @@ async def aggregate_oi_history(symbol: str, period: str, limit: int = 100) -> di
     # Union timestamps, SUM across all 3 exchanges
     all_ts = sorted(set(bnb_series.keys()) | set(okx_series.keys()) | set(bybit_series.keys()))
     all_ts = all_ts[-limit:]
+    # Total active sources = number of exchanges that responded successfully
+    active_sources = len(ok)
     aggregated = []
     for ts in all_ts:
         b = bnb_series.get(ts, {})
         o = okx_series.get(ts, {})
         y = bybit_series.get(ts, {})
-        total = _f(b.get("oi_usd")) + _f(o.get("oi_usd")) + _f(y.get("oi_usd"))
+        b_val = _f(b.get("oi_usd"))
+        o_val = _f(o.get("oi_usd"))
+        y_val = _f(y.get("oi_usd"))
+        source_count = sum(1 for v in (b_val, o_val, y_val) if v > 0)
+        # "partial" = fewer sources than maximum ANY bucket has (i.e., bucket is stale/flushing)
+        partial = source_count < active_sources and source_count > 0
         aggregated.append({
             "ts_ms": ts,
-            "total_oi_usd": total,
-            "binance_oi_usd": _f(b.get("oi_usd")),
-            "okx_oi_usd": _f(o.get("oi_usd")),
-            "bybit_oi_usd": _f(y.get("oi_usd")),
+            "total_oi_usd": b_val + o_val + y_val,
+            "binance_oi_usd": b_val,
+            "okx_oi_usd": o_val,
+            "bybit_oi_usd": y_val,
+            "source_count": source_count,
+            "partial": partial,
         })
 
     return {
@@ -465,6 +474,7 @@ async def aggregate_taker_volume(symbol: str, period: str, limit: int = 100) -> 
         failed["okx"] = f"period {period} not supported on OKX rubik"
 
     all_ts = sorted(set(bnb_series.keys()) | set(okx_series.keys()))[-limit:]
+    active_sources = len(ok)
     aggregated = []
     for ts in all_ts:
         b = bnb_series.get(ts, {})
@@ -472,12 +482,16 @@ async def aggregate_taker_volume(symbol: str, period: str, limit: int = 100) -> 
         total_buy = _f(b.get("buy_usd")) + _f(o.get("buy_usd"))
         total_sell = _f(b.get("sell_usd")) + _f(o.get("sell_usd"))
         ratio = total_buy / total_sell if total_sell > 0 else 0.0
+        source_count = sum(1 for s in (b, o) if s.get("buy_usd", 0) > 0 or s.get("sell_usd", 0) > 0)
+        partial = source_count < active_sources and source_count > 0
         aggregated.append({
             "ts_ms": ts,
             "total_buy_usd": total_buy,
             "total_sell_usd": total_sell,
             "net_usd": total_buy - total_sell,
             "buy_sell_ratio": ratio,
+            "source_count": source_count,
+            "partial": partial,
         })
 
     return {
@@ -781,6 +795,7 @@ async def aggregate_ls_ratio(symbol: str, period: str, limit: int = 100) -> dict
     all_ts = sorted(
         set(bnb_series.keys()) | set(okx_series.keys()) | set(bybit_series.keys())
     )[-limit:]
+    active_sources = len(ok)
     aggregated = []
     for ts in all_ts:
         b = bnb_series.get(ts)
@@ -788,12 +803,16 @@ async def aggregate_ls_ratio(symbol: str, period: str, limit: int = 100) -> dict
         y = bybit_series.get(ts)
         parts = [x["ratio"] for x in (b, o, y) if x is not None and x.get("ratio", 0) > 0]
         avg = sum(parts) / len(parts) if parts else 0.0
+        source_count = len(parts)
+        partial = source_count < active_sources and source_count > 0
         aggregated.append({
             "ts_ms": ts,
             "avg_ratio": avg,
             "binance_ratio": b["ratio"] if b else None,
             "okx_ratio": o["ratio"] if o else None,
             "bybit_ratio": y["ratio"] if y else None,
+            "source_count": source_count,
+            "partial": partial,
         })
 
     return {

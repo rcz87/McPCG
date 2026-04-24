@@ -458,33 +458,42 @@ async def binance_futures_oi_history(symbol: str, period: str = "5m", limit: int
         hdr += f"*(showing last 30 of {total})*\n\n"
 
     table = "```\n"
-    table += f" {'Time':>16} | {'Total':>10} | {'Binance':>10} | {'OKX':>10} | {'Bybit':>10}\n"
-    table += f" {'─' * 16} | {'─' * 10} | {'─' * 10} | {'─' * 10} | {'─' * 10}\n"
+    table += f" {'Time':>16} | {'Total':>10} | {'Binance':>10} | {'OKX':>10} | {'Bybit':>10} | src\n"
+    table += f" {'─' * 16} | {'─' * 10} | {'─' * 10} | {'─' * 10} | {'─' * 10} | ───\n"
     for r in rows:
         t = _dt(r["ts_ms"])
-        total = _dollar(r["total_oi_usd"])
+        # Mark partial bucket: suppress Total (misleading SUM) + tag "partial"
+        if r.get("partial"):
+            total_display = f"(partial)"
+        else:
+            total_display = _dollar(r["total_oi_usd"])
         bnb = _dollar(r["binance_oi_usd"]) if r["binance_oi_usd"] else "—"
         okx = _dollar(r["okx_oi_usd"]) if r["okx_oi_usd"] else "—"
         bybit = _dollar(r.get("bybit_oi_usd", 0)) if r.get("bybit_oi_usd") else "—"
-        table += f" {t:>16} | {total:>10} | {bnb:>10} | {okx:>10} | {bybit:>10}\n"
+        src_cnt = r.get("source_count", 0)
+        table += f" {t:>16} | {total_display:>10} | {bnb:>10} | {okx:>10} | {bybit:>10} | {src_cnt}/3\n"
     table += "```\n"
 
-    # Summary: first vs last bucket where at least 2 sources present
-    def _complete(r):
-        sources_present = sum(1 for k in ("binance_oi_usd", "okx_oi_usd", "bybit_oi_usd")
-                              if r.get(k, 0) > 0)
-        return sources_present >= 2
-    complete = [r for r in rows if _complete(r)]
+    # Summary excludes partial buckets — avoids contaminated stats
+    complete = [r for r in rows if not r.get("partial") and r.get("source_count", 0) >= 2]
     if len(complete) >= 2:
         first = complete[0]["total_oi_usd"]
         last = complete[-1]["total_oi_usd"]
         change = last - first
         pct = (change / first * 100) if first else 0
-        table += f"\n**Summary:** {_dollar(first)} → {_dollar(last)} (change: {_dollar(change)}, {pct:+.2f}%)"
+        table += (
+            f"\n**Summary** (excluding partial buckets): {_dollar(first)} → {_dollar(last)} "
+            f"(change: {_dollar(change)}, {pct:+.2f}%)"
+        )
 
+    # Scope disclaimer — prevent cross-tool comparison misread
     notes = result.get("notes", {})
     if notes.get("okx_scope"):
-        table += f"\n**Note:** OKX data is {notes['okx_scope']}; Binance is per-symbol."
+        table += (
+            f"\n**Scope note:** OKX = {notes['okx_scope']}; Binance/Bybit per-symbol. "
+            f"HL excluded (no OI history endpoint). "
+            f"Totals here NOT directly comparable to `binance_futures_open_interest` (4-way current snapshot)."
+        )
 
     if failed:
         table += f"\n⚠️ **Failed:** {', '.join(failed.keys())}"
@@ -562,28 +571,36 @@ async def binance_futures_long_short_ratio(symbol: str, period: str = "5m", limi
         hdr += f"*(showing last 30 of {total})*\n\n"
 
     table = "```\n"
-    table += f" {'Time':>16} | {'Avg':>7} | {'Binance':>7} | {'OKX':>7} | {'Bybit':>7}\n"
-    table += f" {'─' * 16} | {'─' * 7} | {'─' * 7} | {'─' * 7} | {'─' * 7}\n"
+    table += f" {'Time':>16} | {'Avg':>7} | {'Binance':>7} | {'OKX':>7} | {'Bybit':>7} | src\n"
+    table += f" {'─' * 16} | {'─' * 7} | {'─' * 7} | {'─' * 7} | {'─' * 7} | ───\n"
     for r in rows:
         t = _dt(r["ts_ms"])
-        avg = r["avg_ratio"]
+        # Partial bucket: Avg is noisy (only 1 source), suppress display
+        avg_display = "(partial)" if r.get("partial") else f"{r['avg_ratio']:.3f}"
         bnb = f"{r['binance_ratio']:.3f}" if r["binance_ratio"] else "—"
         okx = f"{r['okx_ratio']:.3f}" if r["okx_ratio"] else "—"
         bybit = f"{r.get('bybit_ratio'):.3f}" if r.get("bybit_ratio") else "—"
-        table += f" {t:>16} | {avg:>7.3f} | {bnb:>7} | {okx:>7} | {bybit:>7}\n"
+        src_cnt = r.get("source_count", 0)
+        table += f" {t:>16} | {avg_display:>7} | {bnb:>7} | {okx:>7} | {bybit:>7} | {src_cnt}/3\n"
     table += "```\n"
 
-    ratios = [r["avg_ratio"] for r in rows if r["avg_ratio"] > 0]
-    avg_all = sum(ratios) / len(ratios) if ratios else 0
+    # Summary stats exclude partial buckets to avoid contamination from
+    # stale tail bucket (e.g., only Bybit has reported while Binance/OKX lag).
+    complete = [r for r in rows if not r.get("partial") and r.get("avg_ratio", 0) > 0]
+    ratios = [r["avg_ratio"] for r in complete]
     if len(ratios) >= 2:
         shift = ratios[-1] - ratios[0]
-        direction = "more long" if shift > 0 else "more short"
+        direction = "more long" if shift > 0 else "more short" if shift < 0 else "flat"
+        avg_all = sum(ratios) / len(ratios)
         table += (
-            f"\n**Summary:** Avg ratio: {avg_all:.3f}, range {min(ratios):.3f}-{max(ratios):.3f} | "
+            f"\n**Summary** (excluding partial buckets): Avg {avg_all:.3f}, "
+            f"range {min(ratios):.3f}-{max(ratios):.3f} | "
             f"Shift: {shift:+.3f} ({direction})"
         )
+    elif ratios:
+        table += f"\n**Summary:** Ratio: {ratios[0]:.3f} (single complete bucket)"
     else:
-        table += f"\n**Summary:** Ratio: {avg_all:.3f}"
+        table += "\n**Summary:** No complete buckets yet — all rows partial, wait for next flush"
 
     if failed:
         table += f"\n⚠️ **Failed:** {', '.join(failed.keys())}"
@@ -644,8 +661,8 @@ async def binance_futures_taker_volume(symbol: str, period: str = "5m", limit: i
         hdr += f"*(showing last 30 of {total})*\n\n"
 
     table = "```\n"
-    table += f" {'Time':>16} | {'Buy $':>10} | {'Sell $':>10} | {'Net':>10} | {'Ratio':>6} | Side\n"
-    table += f" {'─' * 16} | {'─' * 10} | {'─' * 10} | {'─' * 10} | {'─' * 6} | ────\n"
+    table += f" {'Time':>16} | {'Buy $':>10} | {'Sell $':>10} | {'Net':>10} | {'Ratio':>6} | Side | src\n"
+    table += f" {'─' * 16} | {'─' * 10} | {'─' * 10} | {'─' * 10} | {'─' * 6} | ──── | ───\n"
     for r in rows:
         t = _dt(r["ts_ms"])
         buy = r["total_buy_usd"]
@@ -654,16 +671,27 @@ async def binance_futures_taker_volume(symbol: str, period: str = "5m", limit: i
         ratio = r["buy_sell_ratio"]
         side = "BUY" if ratio >= 1 else "SELL"
         net_str = f"+{_dollar(net)}" if net >= 0 else _dollar(net)
-        table += f" {t:>16} | {_dollar(buy):>10} | {_dollar(sell):>10} | {net_str:>10} | {ratio:>6.3f} | {side:>4}\n"
+        src_cnt = r.get("source_count", 0)
+        # Mark partial bucket (SUM is incomplete)
+        tag = "*" if r.get("partial") else " "
+        table += (
+            f" {t:>16} | {_dollar(buy):>10} | {_dollar(sell):>10} | {net_str:>10} | "
+            f"{ratio:>6.3f} | {side:>4}{tag}| {src_cnt}/2\n"
+        )
     table += "```\n"
+    if any(r.get("partial") for r in rows):
+        table += "*= partial bucket (some exchanges haven't reported yet — SUM understated)\n"
 
-    buy_count = sum(1 for r in rows if r["buy_sell_ratio"] >= 1)
-    total_buy = sum(r["total_buy_usd"] for r in rows)
-    total_sell = sum(r["total_sell_usd"] for r in rows)
+    # Exclude partial buckets from aggregate summary to avoid understated totals
+    complete = [r for r in rows if not r.get("partial")]
+    buy_count = sum(1 for r in complete if r["buy_sell_ratio"] >= 1)
+    total_buy = sum(r["total_buy_usd"] for r in complete)
+    total_sell = sum(r["total_sell_usd"] for r in complete)
     total_net = total_buy - total_sell
     net_str = f"+{_dollar(total_net)}" if total_net >= 0 else _dollar(total_net)
+    excl_note = f" (excluded {len(rows) - len(complete)} partial)" if len(complete) < len(rows) else ""
     table += (
-        f"\n**Summary:** {buy_count}/{len(rows)} buy-dominant | "
+        f"\n**Summary:** {buy_count}/{len(complete)} buy-dominant{excl_note} | "
         f"Buy {_dollar(total_buy)} vs Sell {_dollar(total_sell)} | Net {net_str}"
     )
 
