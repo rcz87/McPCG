@@ -169,6 +169,49 @@ async def test_envelope_no_warning_when_coverage_sufficient():
 
 
 @pytest.mark.asyncio
+async def test_envelope_includes_data_struct():
+    """Structured payload mirrors markdown — for programmatic use."""
+    now = _now_ms()
+    bnb = [{"ts_ms": now - 60_000, "delta_usd": 1000.0}]
+    okx = [{"ts_ms": now - 30_000, "delta_usd": -500.0}]
+    bybit = [{"ts_ms": now - 90_000, "delta_usd": 200.0}]
+    hl = [{"ts_ms": now - 20_000, "delta_usd": 50.0}]
+
+    async def _bnb(_): return bnb
+    async def _okx(_): return okx
+    async def _byb(_): return bybit
+    async def _hl(_): return hl
+
+    with patch.object(multi_cvd, "_fetch_binance_trades", _bnb), \
+         patch.object(multi_cvd, "_fetch_okx_trades", _okx), \
+         patch.object(multi_cvd, "_fetch_bybit_trades", _byb), \
+         patch.object(multi_cvd, "_fetch_hl_trades", _hl):
+        result = await multi_cvd.multi_exchange_cvd_live(
+            "BTCUSDT", interval_min=1, window_min=2,
+        )
+
+    env = json.loads(result)
+    assert "data_struct" in env
+    ds = env["data_struct"]
+    assert ds["symbol"] == "BTCUSDT"
+    assert ds["interval_min"] == 1
+    assert ds["window_min"] == 2
+    assert set(ds["active_exchanges"]) == {"binance", "okx", "bybit", "hyperliquid"}
+    assert ds["failed_exchanges"] == []
+    assert isinstance(ds["buckets"], list) and len(ds["buckets"]) > 0
+    # Each bucket should have ts_ms, time, delta, cvd
+    bucket = ds["buckets"][0]
+    assert "ts_ms" in bucket and "time" in bucket
+    assert "delta" in bucket and "cvd" in bucket
+    assert {"binance", "okx", "bybit", "hyperliquid", "total"} <= set(bucket["delta"].keys())
+    # Totals + direction
+    assert "totals" in ds
+    assert ds["net_direction"] in ("buy", "sell", "flat")
+    # Coverage embedded
+    assert ds["coverage"]["binance"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
 async def test_envelope_all_empty_emits_warning():
     """All exchanges return [] → failed status with 'all empty' warning."""
     async def _empty(_): return []

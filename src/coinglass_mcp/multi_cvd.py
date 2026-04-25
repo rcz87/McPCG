@@ -47,10 +47,6 @@ def _f(v) -> float:
         return 0.0
 
 
-def _ts_now() -> str:
-    return datetime.now(WIB).strftime("%H:%M:%S WIB")
-
-
 def _dt(ts_ms: int) -> str:
     """HH:MM smart format."""
     if not ts_ms:
@@ -309,9 +305,11 @@ async def multi_exchange_cvd_live(
 
     title = f"Multi-Exchange CVD (live) — {sym_upper} (last {window_min}min, {interval_min}m buckets)"
     src_tag = "+".join(ok) if ok else "none"
+    # Note: timestamp is canonical via envelope.timestamp — markdown stays format-only
     hdr = (
         f"## {title}\n\n"
-        f"Data: LIVE | Source: {src_tag} | {_ts_now()}\n\n"
+        f"Data: LIVE | Source: {src_tag}\n\n"
+        f"{coverage_section}\n\n"
     )
 
     if not ok:
@@ -319,8 +317,7 @@ async def multi_exchange_cvd_live(
         return make_envelope(
             "failed", "binance",
             hdr + "**ERROR:** All exchanges failed\n" +
-            "\n".join(f"- {k}: {v}" for k, v in failed.items()) +
-            "\n\n" + coverage_section,
+            "\n".join(f"- {k}: {v}" for k, v in failed.items()),
             warnings=warns,
         )
 
@@ -332,8 +329,7 @@ async def multi_exchange_cvd_live(
         warns = [cov_warning] if cov_warning else []
         return make_envelope(
             "failed", src_tag,
-            hdr + "**WARNING:** No trades in window (try larger window_min)\n\n" +
-            coverage_section,
+            hdr + "**WARNING:** No trades in window (try larger window_min)",
             warnings=warns,
         )
 
@@ -360,9 +356,9 @@ async def multi_exchange_cvd_live(
             "cvd": dict(run),
         })
 
-    # Delta table
+    # Delta table — Time left-aligned, numeric columns right-aligned
     table = "**Delta per bucket (taker buy − sell, USD):**\n```\n"
-    table += f" {'Time':>8} | {'Binance':>9} | {'OKX':>9} | {'Bybit':>9} | {'HL':>9} | {'Total':>10}\n"
+    table += f" {'Time':<8} | {'Binance':>9} | {'OKX':>9} | {'Bybit':>9} | {'HL':>9} | {'Total':>10}\n"
     table += f" {'─'*8} | {'─'*9} | {'─'*9} | {'─'*9} | {'─'*9} | {'─'*10}\n"
     for r in rows:
         t = _dt(r["ts_ms"])
@@ -370,7 +366,7 @@ async def multi_exchange_cvd_live(
         def _s(v):
             return f"+{_dollar(v)}" if v > 0 else _dollar(v) if v < 0 else "—"
         table += (
-            f" {t:>8} | {_s(d['binance']):>9} | {_s(d['okx']):>9} | "
+            f" {t:<8} | {_s(d['binance']):>9} | {_s(d['okx']):>9} | "
             f"{_s(d['bybit']):>9} | {_s(d['hyperliquid']):>9} | {_s(d['total']):>10}\n"
         )
     table += "```\n\n"
@@ -408,14 +404,34 @@ async def multi_exchange_cvd_live(
         summary_lines.append("")
         summary_lines.append(f"⚠️ Failed sources: {', '.join(failed.keys())}")
 
-    summary_lines.append("")
-    summary_lines.append(coverage_section)
-
     warns: list[str] = []
     if cov_warning:
         warns.append(cov_warning)
 
+    # Structured payload for programmatic / analytical use
+    data_struct = {
+        "symbol": sym_upper,
+        "interval_min": interval_min,
+        "window_min": window_min,
+        "active_exchanges": ok,
+        "failed_exchanges": list(failed.keys()),
+        "buckets": [
+            {
+                "ts_ms": r["ts_ms"],
+                "time": _dt(r["ts_ms"]),
+                "delta": r["delta"],
+                "cvd": r["cvd"],
+            }
+            for r in rows
+        ],
+        "totals": {ex: last["cvd"][ex] for ex in ("binance", "okx", "bybit", "hyperliquid", "total")},
+        "net_direction": "buy" if total > 0 else "sell" if total < 0 else "flat",
+        "divergence_outliers": outliers,
+        "coverage": coverage,
+    }
+
     status = "success" if not failed else "partial"
     return make_envelope(
-        status, src_tag, hdr + table + "\n".join(summary_lines), warnings=warns,
+        status, src_tag, hdr + table + "\n".join(summary_lines),
+        warnings=warns, data_struct=data_struct,
     )

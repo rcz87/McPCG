@@ -216,18 +216,22 @@ def make_envelope(
     failed_endpoints: list[str] | None = None,
     fallback_suggestion: str = "",
     access: dict[str, str] | None = None,
+    data_struct: dict | None = None,
 ) -> str:
     """Wrap tool output in standard response envelope.
 
     Args:
         status: "success" | "partial" | "failed"
         source: "coinglass" | "binance" | "arkham" | "nansen"
-        data: The formatted content (markdown text)
+        data: The formatted content (markdown text — for human display)
         data_age_seconds: How old the data is (0 = live)
         warnings: List of warning messages
         failed_endpoints: For partial failures — which endpoints failed
         fallback_suggestion: Suggested alternative tool on failure
         access: Plan-gated metadata {required_plan, fallback_tool}
+        data_struct: Optional structured payload (for programmatic / analytical use).
+                     Mirror of `data` content but as typed dict — Claude can read this
+                     directly for compare/diff/aggregate tasks instead of parsing markdown.
     """
     envelope: dict = {
         "status": status,
@@ -237,6 +241,8 @@ def make_envelope(
         "warnings": warnings or [],
         "data": data,
     }
+    if data_struct is not None:
+        envelope["data_struct"] = data_struct
     if failed_endpoints:
         envelope["failed_endpoints"] = failed_endpoints
     if fallback_suggestion:
