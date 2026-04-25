@@ -179,6 +179,68 @@ def _bucket_delta(
     return out
 
 
+# ─── Coverage transparency ──────────────────────────────────────────────────
+
+
+def _compute_coverage(
+    raw_trades_by_exchange: dict[str, list[dict]], now_ms: int,
+) -> dict[str, dict]:
+    """Coverage per exchange = (now − oldest trade ts) in minutes.
+
+    Computed from raw REST response BEFORE since_ms filter, so it reflects
+    the actual reach of the REST endpoint regardless of requested window.
+    Empty exchange (failed or zero trades) → minutes=0.0, status="empty".
+    """
+    coverage: dict[str, dict] = {}
+    for exch, trades in raw_trades_by_exchange.items():
+        if not trades:
+            coverage[exch] = {"minutes": 0.0, "trade_count": 0, "status": "empty"}
+            continue
+        oldest_ts = min(t["ts_ms"] for t in trades if t.get("ts_ms"))
+        coverage_min = round((now_ms - oldest_ts) / 60000, 1) if oldest_ts else 0.0
+        coverage[exch] = {
+            "minutes": max(coverage_min, 0.0),
+            "trade_count": len(trades),
+            "status": "ok",
+        }
+    return coverage
+
+
+def _build_coverage_warning(coverage: dict[str, dict], window_min: int) -> str | None:
+    """Emit a warning when min coverage across active exchanges < 50% of requested.
+
+    Returns None when coverage is sufficient.
+    """
+    valid = [c["minutes"] for c in coverage.values() if c["status"] == "ok"]
+    if not valid:
+        return "All exchanges returned empty trades. Check symbol or API status."
+    min_cov = min(valid)
+    if min_cov < window_min * 0.5:
+        return (
+            f"Requested window={window_min}min but actual REST coverage ~{min_cov}min "
+            f"(limited by exchange trade history caps). "
+            f"For deeper history use binance_spot_cvd / binance_futures_cvd "
+            f"(kline-based, supports hours/days)."
+        )
+    return None
+
+
+def _format_coverage_section(coverage: dict[str, dict], window_min: int) -> str:
+    """Render coverage as a markdown block appended to the response data."""
+    lines = ["**REST coverage (per exchange):**"]
+    for exch in ("binance", "okx", "bybit", "hyperliquid"):
+        c = coverage.get(exch, {"minutes": 0.0, "trade_count": 0, "status": "empty"})
+        if c["status"] == "ok":
+            lines.append(
+                f"- {exch.capitalize():<12}: {c['minutes']:>5.1f} min "
+                f"({c['trade_count']} trades)"
+            )
+        else:
+            lines.append(f"- {exch.capitalize():<12}: — (empty / failed)")
+    lines.append(f"- Requested window: {window_min} min")
+    return "\n".join(lines)
+
+
 # ─── Main tool ──────────────────────────────────────────────────────────────
 
 
@@ -233,6 +295,18 @@ async def multi_exchange_cvd_live(
     bybit = _process("bybit", bybit_raw)
     hl = _process("hyperliquid", hl_raw)
 
+    # Coverage transparency: compute from raw trades BEFORE since_ms filter
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    raw_lists = {
+        "binance": bnb_raw if isinstance(bnb_raw, list) else [],
+        "okx": okx_raw if isinstance(okx_raw, list) else [],
+        "bybit": bybit_raw if isinstance(bybit_raw, list) else [],
+        "hyperliquid": hl_raw if isinstance(hl_raw, list) else [],
+    }
+    coverage = _compute_coverage(raw_lists, now_ms)
+    cov_warning = _build_coverage_warning(coverage, window_min)
+    coverage_section = _format_coverage_section(coverage, window_min)
+
     title = f"Multi-Exchange CVD (live) — {sym_upper} (last {window_min}min, {interval_min}m buckets)"
     src_tag = "+".join(ok) if ok else "none"
     hdr = (
@@ -241,10 +315,13 @@ async def multi_exchange_cvd_live(
     )
 
     if not ok:
+        warns = [cov_warning] if cov_warning else []
         return make_envelope(
             "failed", "binance",
             hdr + "**ERROR:** All exchanges failed\n" +
-            "\n".join(f"- {k}: {v}" for k, v in failed.items()),
+            "\n".join(f"- {k}: {v}" for k, v in failed.items()) +
+            "\n\n" + coverage_section,
+            warnings=warns,
         )
 
     # All buckets present across any exchange
@@ -252,9 +329,12 @@ async def multi_exchange_cvd_live(
         set(bnb.keys()) | set(okx.keys()) | set(bybit.keys()) | set(hl.keys())
     )
     if not all_buckets:
+        warns = [cov_warning] if cov_warning else []
         return make_envelope(
             "failed", src_tag,
-            hdr + "**WARNING:** No trades in window (try larger window_min)",
+            hdr + "**WARNING:** No trades in window (try larger window_min)\n\n" +
+            coverage_section,
+            warnings=warns,
         )
 
     # Per-exchange running CVD (cumulative sum over time)
@@ -328,5 +408,14 @@ async def multi_exchange_cvd_live(
         summary_lines.append("")
         summary_lines.append(f"⚠️ Failed sources: {', '.join(failed.keys())}")
 
+    summary_lines.append("")
+    summary_lines.append(coverage_section)
+
+    warns: list[str] = []
+    if cov_warning:
+        warns.append(cov_warning)
+
     status = "success" if not failed else "partial"
-    return make_envelope(status, src_tag, hdr + table + "\n".join(summary_lines))
+    return make_envelope(
+        status, src_tag, hdr + table + "\n".join(summary_lines), warnings=warns,
+    )
